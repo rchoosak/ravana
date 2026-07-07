@@ -204,10 +204,67 @@ async def start_run(
     return run_id
 
 
+def _join_arrivals(con: sqlite3.Connection, run_id: str, node_id: str) -> set[str]:
+    """§3.8: the set of source nodes that have ROUTEd into `node_id` since its
+    last dispatch. Derived entirely from state_transition_log — no in-memory
+    bookkeeping — so it survives a HITL pause/resume across processes for
+    free, the same way _edge_fire_count already does. "Since its last
+    dispatch" is anchored on the node's own last COMMIT event: every
+    successful dispatch commits at least once (§3.1 step 4), which is what
+    consumes the arrivals that triggered it."""
+    last_commit = con.execute(
+        """SELECT COALESCE(MAX(sequence), 0) AS s FROM state_transition_log
+           WHERE run_id = ? AND event_type = 'COMMIT' AND from_node = ?""",
+        (run_id, node_id),
+    ).fetchone()["s"]
+    rows = con.execute(
+        """SELECT DISTINCT from_node FROM state_transition_log
+           WHERE run_id = ? AND event_type = 'ROUTE' AND to_node = ? AND sequence > ?""",
+        (run_id, node_id, last_commit),
+    ).fetchall()
+    return {r["from_node"] for r in rows}
+
+
+def _pending_joins(ctx: _RunCtx) -> list[tuple[str, set[str]]]:
+    """Join nodes with at least one unconsumed arrival, excluding any already
+    sitting in the queue."""
+    pending = []
+    for node_id in ctx.graph.join_all_nodes():
+        if node_id in ctx.queue:
+            continue
+        arrivals = _join_arrivals(ctx.con, ctx.run_id, node_id)
+        if arrivals:
+            pending.append((node_id, arrivals))
+    return pending
+
+
+def _has_pending_hitl(ctx: _RunCtx) -> bool:
+    return (
+        ctx.con.execute(
+            "SELECT 1 FROM hitl_request WHERE run_id = ? AND status = 'PENDING' LIMIT 1", (ctx.run_id,)
+        ).fetchone()
+        is not None
+    )
+
+
 async def _drain_queue(ctx: _RunCtx) -> None:
-    while ctx.queue and not ctx.failed:
-        node_id = ctx.queue.pop(0)
-        await _dispatch(ctx, node_id)
+    while not ctx.failed:
+        if ctx.queue:
+            node_id = ctx.queue.pop(0)
+            await _dispatch(ctx, node_id)
+            continue
+        # Queue is empty — quiescence check for held joins (§3.8): a join
+        # node with partial arrivals fires now, because nothing is left that
+        # could deliver the missing ones. But a PENDING HITL means answering
+        # it may resume work that still delivers — so with HITL outstanding,
+        # arrivals stay held and the resume's own drain re-evaluates them.
+        if _has_pending_hitl(ctx):
+            break
+        stragglers = _pending_joins(ctx)
+        if not stragglers:
+            break
+        for node_id, _arrivals in stragglers:
+            ctx.queue.append(node_id)
     _finalize_status(ctx)
 
 
@@ -410,6 +467,16 @@ def _fire_edge(ctx: _RunCtx, from_node: str, edge, node_execution_id: str) -> No
         _log_event(con, ctx.run_id, node_execution_id, "ROUTE", from_node=from_node, to_node=target, condition_evaluated=edge.condition, result=True)
         if target == TERMINAL:
             ctx.terminal_reached = True
+        elif ctx.graph.node(target).join == "all":
+            # §3.8: the ROUTE event above *is* the recorded arrival — dispatch
+            # is deferred until arrivals cover every inbound source. Complete
+            # joins promote immediately; partial ones wait for the remaining
+            # sources or for quiescence (_drain_queue).
+            con.commit()
+            arrivals = _join_arrivals(con, ctx.run_id, target)
+            required = ctx.graph.inbound_sources.get(target, set())
+            if arrivals >= required and target not in ctx.queue:
+                ctx.queue.append(target)
         else:
             ctx.queue.append(target)
     con.commit()

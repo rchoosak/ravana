@@ -25,6 +25,25 @@ def validate(graph: CompiledGraph) -> list[Issue]:
     issues.extend(_unreachable_nodes(graph))
     issues.extend(_missing_safety_net(graph))
     issues.extend(_broadcast_merge_conflicts(graph))
+    issues.extend(_join_sanity(graph))
+    return issues
+
+
+def _join_sanity(graph: CompiledGraph) -> list[Issue]:
+    """§3.8: `join: all` only means something on a node with 2+ distinct
+    inbound sources; and the entry node is queued directly at trigger time,
+    bypassing join gating entirely, so declaring it there is misleading."""
+    issues = []
+    for node_id in graph.join_all_nodes():
+        if node_id == graph.entry:
+            issues.append(
+                Issue("warning", f"entry node '{node_id}' declares join: all, but the entry dispatch bypasses join gating — the declaration has no effect on the first activation")
+            )
+        sources = graph.inbound_sources.get(node_id, set())
+        if len(sources) < 2:
+            issues.append(
+                Issue("warning", f"node '{node_id}' declares join: all but has {len(sources)} inbound source(s) — a join needs at least 2 to ever hold anything back")
+            )
     return issues
 
 

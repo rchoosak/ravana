@@ -81,13 +81,14 @@ def persist_workflow(con: sqlite3.Connection, graph: CompiledGraph, org_id: str,
 
     for node in doc.spec.graph.nodes:
         con.execute(
-            """INSERT INTO workflow_node (id, workflow_id, agent_id, sub_workflow_id, on_enter, hitl_config)
-               VALUES (?,?,?,?,?,?)""",
+            """INSERT INTO workflow_node (id, workflow_id, agent_id, sub_workflow_id, on_enter, join_policy, hitl_config)
+               VALUES (?,?,?,?,?,?,?)""",
             (
                 node.id, workflow_id,
                 agent_db_ids.get(node.agent) if node.agent else None,
                 None,  # sub_workflow_id: not resolvable without a workflow name->id registry; out of scope for 0a
                 node.on_enter,
+                node.join,
                 dumps(_agent_hitl_config(doc, node.agent)),
             ),
         )

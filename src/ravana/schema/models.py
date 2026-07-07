@@ -90,6 +90,10 @@ class GraphNode(BaseModel):
     agent: str | None = None
     sub_workflow: str | None = None
     on_enter: str | None = None
+    # §3.8: "any" (default) — every arriving edge dispatches this node
+    # independently; "all" — arrivals accumulate and the node dispatches once
+    # per wave, when every inbound source has delivered (or at quiescence).
+    join: Literal["any", "all"] = "any"
 
     @model_validator(mode="after")
     def _exactly_one_backing(self) -> "GraphNode":
