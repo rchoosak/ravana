@@ -1,0 +1,25 @@
+# Scripted mock responses for examples/workflows/software-development-team.yaml
+# (ravana.runtime.mock.MockAgentRuntime). Each node's list is consumed in
+# order per dispatch, clamped to the last entry once exhausted.
+responses:
+  pm_intake:
+    - structured_payload: { requirement_clarity: "LOW" }
+    - structured_payload: { requirement_clarity: "HIGH", milestone_plan: { items: ["build the thing"] } }
+
+  sa_design:
+    - structured_payload: { system_spec: { stack: "python" } }
+
+  dev_code:
+    - structured_payload: {}
+
+  # qa_test is dispatched both by sa_design's broadcast AND by dev_code's own
+  # edge (§4's graph) — a known double-dispatch quirk with no join/barrier
+  # primitive yet, so this list is written to reach PASS regardless of exact
+  # call count rather than asserting a precise sequence.
+  qa_test:
+    - structured_payload: { qa_status: "FAIL", qa_report: { defects: ["off-by-one"] } }
+    - structured_payload: { qa_status: "FAIL", qa_report: { defects: ["off-by-one"] } }
+    - structured_payload: { qa_status: "PASS", qa_report: {} }
+
+  pm_final_review:
+    - structured_payload: { pm_verdict: "COMPLETE" }

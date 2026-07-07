@@ -1,0 +1,188 @@
+apiVersion: ravana/v1
+kind: Workflow
+metadata:
+  name: software-development-team
+  description: "PM -> SA -> Dev/QA loop -> PM validation"
+  version: 1
+
+spec:
+  concurrency:
+    group: "repo:${input.repository}"
+    strategy: queue
+
+  state:
+    schema:
+      requirement:          { type: string,  merge: overwrite, pii: true }
+      requirement_clarity:  { type: string,  merge: overwrite }
+      milestone_plan:       { type: object,  merge: overwrite }
+      system_spec:          { type: object,  merge: overwrite }
+      qa_status:            { type: string,  merge: overwrite }
+      qa_report:            { type: object,  merge: merge-object }
+      pm_verdict:           { type: string,  merge: overwrite }
+      iteration_count:      { type: integer, merge: overwrite }
+    initial:
+      requirement_clarity: "LOW"
+      qa_status: "PENDING"
+      iteration_count: 0
+
+  toolkits:
+    - id: web_search
+      type: web_search
+      config: { provider: tavily }
+
+    - id: code_interpreter
+      type: code_interpreter
+      config: { runtime: python3.11, sandbox: docker }
+
+    - id: git_connector
+      type: api_connector
+      config: { base_url: https://api.github.com }
+      auth_ref: secrets://github_pat
+
+    - id: test_runner
+      type: code_interpreter
+      config: { runtime: node20, sandbox: docker }
+
+    - id: github_mcp
+      type: mcp_server
+      config:
+        transport: stdio
+        command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+        allowed_tools: [list_issues, get_file_contents]
+      auth_ref: secrets://github_pat
+
+  skills:
+    - id: conventional_commits
+      description: "How to format a commit message for this repo"
+      instructions: |
+        Use Conventional Commits (feat:/fix:/refactor:/test:), one logical
+        change per commit, reference the milestone_plan item being addressed.
+    - id: secure_coding_checklist
+      description: "Baseline security checks before submitting code for QA"
+      instructions: |
+        Validate all external input, parameterize DB queries, never log
+        secrets or PII, check dependency versions against known CVEs.
+
+  agents:
+    - id: pm
+      name: "Project Manager"
+      llm: { provider: anthropic, model: claude-sonnet-5, temperature: 0.3 }
+      system_prompt: |
+        You are the Project Manager. Clarify requirements, produce a
+        milestone plan, and give the final go/no-go verdict against the
+        original requirement. Set requirement_clarity to HIGH only once
+        the ask is unambiguous.
+      toolkits: [web_search]
+      hitl:
+        enabled: true
+        trigger_condition: "state.requirement_clarity == 'LOW'"
+        prompt_template: "PM needs clarification: {{question}}"
+        assignee: "role:operator"
+
+    - id: sa
+      name: "System Analyst"
+      llm: { provider: anthropic, model: claude-sonnet-5, temperature: 0.2 }
+      system_prompt: |
+        You are the System Analyst. Translate the milestone plan into
+        architecture, tech stack, and sequence diagrams. Write system_spec
+        to shared state for Dev and QA to consume.
+      toolkits: [web_search, github_mcp]
+
+    - id: dev
+      name: "Developer"
+      llm:
+        provider: local
+        model: qwen2.5-coder:32b
+        endpoint: http://ollama.internal:11434/v1
+        temperature: 0.2
+        fallback:
+          - { provider: anthropic, model: claude-sonnet-5 }
+      system_prompt: |
+        You are the Developer. Implement code per system_spec. If
+        qa_report is present, fix the reported defects before resubmitting.
+      toolkits: [code_interpreter, git_connector]
+      skills: [conventional_commits, secure_coding_checklist]
+
+    - id: qa
+      name: "QA Tester"
+      llm: { provider: openai, model: gpt-4o-mini, temperature: 0.1 }
+      system_prompt: |
+        You are the QA Tester. Derive test cases from system_spec and
+        execute them against Dev's code. Set qa_status to PASS or FAIL and
+        attach a detailed qa_report on failure.
+      toolkits: [test_runner]
+      output_schema:
+        type: object
+        required: [qa_status, qa_report]
+        properties:
+          qa_status: { type: string, enum: [PASS, FAIL] }
+          qa_report:
+            type: object
+            properties:
+              defects: { type: array, items: { type: string } }
+              notes: { type: string }
+
+  graph:
+    entry: pm_intake
+
+    nodes:
+      - id: pm_intake
+        agent: pm
+      - id: sa_design
+        agent: sa
+      - id: dev_code
+        agent: dev
+      - id: qa_test
+        agent: qa
+        on_enter: "state.iteration_count += 1"
+      - id: pm_final_review
+        agent: pm
+
+    edges:
+      - from: pm_intake
+        to: [sa_design]
+        condition: "state.requirement_clarity == 'HIGH'"
+
+      - from: sa_design
+        to: [dev_code, qa_test]
+        mode: broadcast
+
+      - from: dev_code
+        to: [qa_test]
+
+      - from: qa_test
+        to: [dev_code]
+        condition: "state.qa_status == 'FAIL' && state.iteration_count < 5"
+        label: "bugfix loop"
+
+      - from: qa_test
+        to: [pm_final_review]
+        condition: "state.qa_status == 'PASS'"
+
+      - from: qa_test
+        to: [pm_final_review]
+        is_default: true
+
+      - from: pm_final_review
+        to: [sa_design]
+        condition: "state.pm_verdict == 'INCOMPLETE'"
+
+      - from: pm_final_review
+        to: [__terminal__]
+        condition: "state.pm_verdict == 'COMPLETE'"
+
+    guards:
+      max_total_steps: 50
+      max_loop_iterations:
+        qa_test_to_dev_code: 5
+      max_tool_calls_per_turn: 10
+      max_output_repairs: 2
+      max_retries_per_node: 3
+      max_tokens_total: 2000000
+
+  definition_of_done:
+    evaluated_by: pm
+    criteria:
+      - "All acceptance criteria in the original requirement are met"
+      - "state.qa_status == 'PASS'"
+      - "No open defects in state.qa_report"
