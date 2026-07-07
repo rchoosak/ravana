@@ -11,45 +11,53 @@ Phase 0 is broken down to the task level since it's what's actionable now — an
 Goal: prove the graph engine — routing, HITL, loops, concurrency, guards — is correct against **scripted mock agent responses**, before spending any effort on real LLM/tool integration. This is where bugs like the `qa_test` dead-end and the HITL-resume semantics fix are cheap to catch; they'd be expensive and confusing to debug for the first time through a flaky real LLM call.
 
 ### Data layer
-- [ ] Translate §2.2's Postgres DDL to SQLite (JSONB → JSON columns, UUID → TEXT, `UUID[]`/`TEXT[]` → JSON arrays) — all 12 tables (`agent`, `toolkit`, `skill`, `workflow`, `workflow_node`, `workflow_edge`, `run`, `node_execution`, `message`, `artifact`, `state_transition_log`, `hitl_request`, `audit_log`), including the `workflow_node_backing_xor` CHECK and `workflow_edge`'s `source_node_id` FK / non-empty-targets CHECK
-- [ ] `ravana init`: scaffold `.ravana/` (`config.yaml`, `workflows/`, `state.db`, `runs/`, `.gitignore`) per §10.1's directory layout
-- [ ] Bootstrap script for `state.db` schema creation (no migration history needed yet — single-user, single-version)
+- [x] Translate §2.2's Postgres DDL to SQLite (JSONB → JSON columns, UUID → TEXT, `UUID[]`/`TEXT[]` → JSON arrays) — all 12 tables (`agent`, `toolkit`, `skill`, `workflow`, `workflow_node`, `workflow_edge`, `run`, `node_execution`, `message`, `artifact`, `state_transition_log`, `hitl_request`, `audit_log`), including the `workflow_node_backing_xor` CHECK and `workflow_edge`'s `source_node_id` FK / non-empty-targets CHECK
+- [x] `ravana init`: scaffold `.ravana/` (`config.yaml`, `workflows/`, `state.db`, `runs/`, `.gitignore`) per §10.1's directory layout
+- [x] Bootstrap script for `state.db` schema creation (no migration history needed yet — single-user, single-version)
 
 ### Workflow compiler
-- [ ] Pydantic models for the full YAML schema (§4): `state.schema` (with `merge`/`pii` per key), `toolkits`, `skills`, `agents` (with `llm`/`llm.fallback`/`output_schema`/`hitl`), `graph.nodes`/`graph.edges` (with `is_default`), `guards`, `concurrency`, `definition_of_done`
-- [ ] YAML → internal graph compiler (resolve node/edge/agent/toolkit/skill references by id)
-- [ ] `ravana workflow validate`: entry-node exists, no unreachable nodes, merge-policy conflicts on broadcast branches (§3.5), non-terminal nodes missing both `is_default` and `hitl_config` (§3.3) flagged as a warning, edge targets resolve to a real node id or `__terminal__` (the DB layer deliberately can't check this, §2.2 — the compiler is where it's actually enforced)
+- [x] Pydantic models for the full YAML schema (§4): `state.schema` (with `merge`/`pii` per key), `toolkits`, `skills`, `agents` (with `llm`/`llm.fallback`/`output_schema`/`hitl`), `graph.nodes`/`graph.edges` (with `is_default`), `guards`, `concurrency`, `definition_of_done`
+- [x] YAML → internal graph compiler (resolve node/edge/agent/toolkit/skill references by id)
+- [x] `ravana workflow validate`: entry-node exists, no unreachable nodes, merge-policy conflicts on broadcast branches (§3.5), non-terminal nodes missing both `is_default` and `hitl_config` (§3.3) flagged as a warning, edge targets resolve to a real node id or `__terminal__` (the DB layer deliberately can't check this, §2.2 — the compiler is where it's actually enforced)
 
 ### Orchestrator (single-process — no lease/CAS needed at this tier, §10.1)
-- [ ] Engine loop per the corrected §3.1 sequence: dispatch → agent turn → commit (state_version CAS + `state_transition_log` sequence/event_type/node_execution_id, §2.2) → **route-or-pause-or-fail** (conditional edges → HITL check → default edge → fail-fast dead-end) → **resume as a new `node_execution` attempt** (not a bare re-route — §3.1's corrected semantics) → terminate
-- [ ] `guards` enforcement: `max_total_steps`, `max_loop_iterations` (per-edge), `max_tool_calls_per_turn`, `max_output_repairs`, `max_retries_per_node`, `max_tokens_total`
-- [ ] `workflow.concurrency` group check at Trigger (§3.7) — even single-process, still needs to queue a second local run against the same `repository` group
-- [ ] Keep `state_version` bookkeeping even though nothing contends for it yet — keeps the schema forward-compatible with Phase 1's real CAS path
+- [x] Engine loop per the corrected §3.1 sequence: dispatch → agent turn → commit (state_version CAS + `state_transition_log` sequence/event_type/node_execution_id, §2.2) → **route-or-pause-or-fail** (conditional edges → HITL check → default edge → fail-fast dead-end) → **resume as a new `node_execution` attempt** (not a bare re-route — §3.1's corrected semantics) → terminate
+- [x] `guards` enforcement: `max_total_steps`, `max_loop_iterations` (per-edge), `max_tool_calls_per_turn`, `max_output_repairs`, `max_retries_per_node`, `max_tokens_total`
+- [x] `workflow.concurrency` group check at Trigger (§3.7) — even single-process, still needs to queue a second local run against the same `repository` group
+- [x] Keep `state_version` bookkeeping even though nothing contends for it yet — keeps the schema forward-compatible with Phase 1's real CAS path
 
 ### Mock Agent Runtime
-- [ ] A pluggable "mock" backend: instead of calling a real LLM, returns a pre-scripted `structured_payload` per node per turn from a test fixture — this is the primary way 0a gets built and tested, not a testing afterthought bolted on at the end
-- [ ] Fixture format that can script a full run including HITL-triggering responses (e.g. "on turn 1, PM emits `requirement_clarity: LOW`; after human response, PM emits `HIGH`") so the corrected Resume mechanic (§3.1) is exercisable without a real model
+- [x] A pluggable "mock" backend: instead of calling a real LLM, returns a pre-scripted `structured_payload` per node per turn from a test fixture — this is the primary way 0a gets built and tested, not a testing afterthought bolted on at the end
+- [x] Fixture format that can script a full run including HITL-triggering responses (e.g. "on turn 1, PM emits `requirement_clarity: LOW`; after human response, PM emits `HIGH`") so the corrected Resume mechanic (§3.1) is exercisable without a real model
 
 ### HITL
-- [ ] `hitl_request` create/resolve, `assignee` field populated even though it's just "the local user" at this tier
-- [ ] Blocking terminal prompt in `ravana run watch`
+- [x] `hitl_request` create/resolve, `assignee` field populated even though it's just "the local user" at this tier
+- [x] Blocking terminal prompt in `ravana run watch`
 
 ### CLI
-- [ ] `ravana init`
-- [ ] `ravana workflow validate`
-- [ ] `ravana run start`
-- [ ] `ravana run watch` (tails `message`/`state_transition_log`, prompts on HITL)
-- [ ] `ravana run hitl respond`
+- [x] `ravana init`
+- [x] `ravana workflow validate`
+- [x] `ravana run start`
+- [x] `ravana run watch` (tails `message`/`state_transition_log`, prompts on HITL)
+- [x] `ravana run hitl respond`
 
 ### Observability (minimal, per §9)
-- [ ] `audit_log` writes on every `DRAFT` save / `publish` / manual action, from day one
-- [ ] Structured JSON log lines to stdout/file, tagged with `run_id`/`node_execution_id` (full Loki + correlation dashboards are Phase 2, but the tagging convention should exist from the start so nothing needs retrofitting)
+- [x] `audit_log` writes on every `DRAFT` save / `publish` / manual action, from day one
+- [x] Structured JSON log lines to stdout/file, tagged with `run_id`/`node_execution_id` (full Loki + correlation dashboards are Phase 2, but the tagging convention should exist from the start so nothing needs retrofitting)
 
 ### Testing
-- [ ] Unit tests for the routing fix specifically: condition coverage, `is_default` firing, HITL-before-fail-fast ordering, the exact dead-end case (`qa_status == FAIL && iteration_count >= 5`) found in §4's own example
-- [ ] Unit tests for the Resume fix: a HITL response produces a *new* `node_execution` attempt for the same node, not just a re-route of stale output
-- [ ] Unit test for the corrected idempotency key (§3.6): same tool name + same arguments across two attempts ⇒ same key; different arguments ⇒ different key
-- [ ] End-to-end: run the full SDLC example workflow with the mock backend from `pm_intake` to `COMPLETE`, including at least one HITL round-trip and one loop iteration
+- [x] Unit tests for the routing fix specifically: condition coverage, `is_default` firing, HITL-before-fail-fast ordering, the exact dead-end case (`qa_status == FAIL && iteration_count >= 5`) found in §4's own example
+- [x] Unit tests for the Resume fix: a HITL response produces a *new* `node_execution` attempt for the same node, not just a re-route of stale output
+- [x] Unit test for the corrected idempotency key (§3.6): same tool name + same arguments across two attempts ⇒ same key; different arguments ⇒ different key
+- [x] End-to-end: run the full SDLC example workflow with the mock backend from `pm_intake` to `COMPLETE`, including at least one HITL round-trip and one loop iteration
+
+### Added during/after implementation (review findings — all shipped)
+- [x] `run watch` actually blocks and interactively prompts on HITL (was print-once-and-exit despite the checklist item above)
+- [x] Enforce `max_tool_calls_per_turn` / `max_output_repairs` / `max_tokens_total` (existed on the Pydantic model, never checked in the engine)
+- [x] Wire the content-addressed idempotency key into `message.tool_calls` at persistence time (function was correct but had zero call sites)
+- [x] Implicit-terminal nodes (zero outgoing edges) complete the run instead of leaving it stuck `RUNNING`
+- [x] Tests for `workflow.concurrency` `queue`/`cancel_previous` strategies
+- [x] **Join primitive (§3.8)**: per-node `join: any|all` — closes the fan-in design gap found during implementation (`qa_test` double-dispatch); quiescence firing for cyclic re-entry, arrivals derived from `state_transition_log`, validator warnings, 5 dedicated tests
 
 ---
 
@@ -76,6 +84,10 @@ Goal: swap the mock backend for real providers and real tool execution, on a gra
 ### CLI / UX
 - [ ] `ravana studio` (localhost dev-server UI reading `state.db` directly — can slip to Phase 1 if it doesn't fit the timebox)
 
+### Definition of Done (found missing in the v0.16 design review — was parsed and persisted but never evaluated, and no task tracked it)
+- [ ] Design the DoD evaluator: expression criteria (e.g. `state.qa_status == 'PASS'`) evaluate rule-based via the existing condition engine; prose criteria (e.g. "all acceptance criteria met") need an agent turn by `evaluated_by` — decide whether that's a synthetic final node or a check inside Terminate (§3.1 step 7)
+- [ ] Real exponential backoff on transient-failure retries (§3.6 — 0a retries immediately, acceptable only while failures are scripted mocks)
+
 ### Testing
 - [ ] Replace the SDLC E2E's mock fixtures with real-LLM smoke tests, one per provider adapter
 - [ ] Verify structured-output strategy selection (§3.4) actually resolves to the expected mechanism per provider (guided decoding for the local model, native tool-calling for Anthropic)
@@ -89,6 +101,8 @@ Goal: `docker compose up` gives a team the Ravana Console with all three UI surf
 
 - [ ] **Data layer**: Postgres DDL from §2.2 (the real thing, not the SQLite translation); Alembic migrations from here on; one-time import path from a Phase-0 `.ravana/state.db` so early local runs aren't stranded
 - [ ] **Orchestrator scaling**: `node_execution` lease claiming (`UPDATE ... WHERE status='QUEUED'` / `FOR UPDATE SKIP LOCKED`); `state_version` CAS commit with merge-policy-aware retry (§3.5) now actually exercised; broadcast-edge parallel dispatch; Redis Streams as the lease/HITL transport
+- [ ] **Scheduler tick to unblock `queue`d concurrency runs** (§3.7 — 0a strands them `PENDING`; the Phase 1 scheduler owns dispatching a queued run when its group's active run reaches a terminal status). Also re-verify §3.8's join quiescence rule under multi-worker dispatch — "queue empty" needs a distributed equivalent (no leasable/leased node_executions for the run)
+- [ ] **Maintain `run.current_nodes`** (§2.2 — reserved-but-unmaintained in 0a; the Operator view needs it)
 - [ ] **Control-plane API**: FastAPI implementing the full §7 contract (agents/toolkits/workflows/runs/hitl/audit-log), SSE `/runs/{id}/stream`, `DRAFT`→`PUBLISHED` lifecycle + `/publish`, full `/validate`
 - [ ] **Ravana Console**: React Flow graph editor (Design), generated intake form (Runs → New Run), operator/monitoring view with live stream + HITL respond (Runs → [a run]), version-history tab off `/audit-log`
 - [ ] **Sandbox**: `code_interpreter` optionally routes to a managed provider (E2B/Modal) — config-driven per Toolkit, not yet the default

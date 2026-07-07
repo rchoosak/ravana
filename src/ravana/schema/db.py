@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS workflow_node (
     agent_id        TEXT REFERENCES agent(id),
     sub_workflow_id TEXT REFERENCES workflow(id),
     on_enter        TEXT,
+    join_policy     TEXT NOT NULL DEFAULT 'any',
     hitl_config     TEXT,
     PRIMARY KEY (workflow_id, id),
     CONSTRAINT workflow_node_backing_xor CHECK (

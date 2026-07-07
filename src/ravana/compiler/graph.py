@@ -31,10 +31,16 @@ class CompiledGraph:
     # priority: conditional edges are tried first, the default edge last.
     conditional_edges_by_source: dict[str, list[GraphEdge]] = field(default_factory=dict)
     default_edge_by_source: dict[str, GraphEdge] = field(default_factory=dict)
+    # Per target node: the distinct set of source nodes with any edge into it.
+    # This is what a `join: all` node's arrival set is checked against (§3.8).
+    inbound_sources: dict[str, set[str]] = field(default_factory=dict)
 
     @property
     def entry(self) -> str:
         return self.doc.spec.graph.entry
+
+    def join_all_nodes(self) -> list[str]:
+        return [n.id for n in self.doc.spec.graph.nodes if n.join == "all"]
 
     def node(self, node_id: str) -> GraphNode:
         return self.nodes_by_id[node_id]
@@ -73,12 +79,15 @@ def compile_workflow(doc: WorkflowDoc) -> CompiledGraph:
     conditional_edges_by_source: dict[str, list[GraphEdge]] = {}
     default_edge_by_source: dict[str, GraphEdge] = {}
 
+    inbound_sources: dict[str, set[str]] = {}
     for edge in spec.graph.edges:
         if edge.from_ not in nodes_by_id:
             raise CompileError(f"edge references unknown source node '{edge.from_}'")
         for target in edge.to:
             if target != TERMINAL and target not in nodes_by_id:
                 raise CompileError(f"edge from '{edge.from_}' targets unknown node '{target}'")
+            if target != TERMINAL:
+                inbound_sources.setdefault(target, set()).add(edge.from_)
 
         if edge.is_default:
             if edge.from_ in default_edge_by_source:
@@ -110,4 +119,5 @@ def compile_workflow(doc: WorkflowDoc) -> CompiledGraph:
         skills_by_id=skills_by_id,
         conditional_edges_by_source=conditional_edges_by_source,
         default_edge_by_source=default_edge_by_source,
+        inbound_sources=inbound_sources,
     )

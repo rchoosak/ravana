@@ -12,12 +12,10 @@ responses:
   dev_code:
     - structured_payload: {}
 
-  # qa_test is dispatched both by sa_design's broadcast AND by dev_code's own
-  # edge (§4's graph) — a known double-dispatch quirk with no join/barrier
-  # primitive yet, so this list is written to reach PASS regardless of exact
-  # call count rather than asserting a precise sequence.
+  # qa_test declares join: all (§3.8), so sa_design's broadcast arrival and
+  # dev_code's arrival produce ONE dispatch per cycle, not two — call counts
+  # here are exact: first run FAILs (drives one bugfix loop), second PASSes.
   qa_test:
-    - structured_payload: { qa_status: "FAIL", qa_report: { defects: ["off-by-one"] } }
     - structured_payload: { qa_status: "FAIL", qa_report: { defects: ["off-by-one"] } }
     - structured_payload: { qa_status: "PASS", qa_report: {} }
 
