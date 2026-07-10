@@ -73,6 +73,7 @@ class _DeferredHandler:
     and specifically rather than mystifyingly."""
 
     input_schema: dict = {"type": "object", "additionalProperties": True}
+    executable = False  # registered so a workflow compiles, but never surfaced/run
 
     def __init__(self, toolkit_id: str, toolkit_type: str, reason: str | None = None):
         self._toolkit_id = toolkit_id

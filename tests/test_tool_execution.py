@@ -151,19 +151,26 @@ def test_read_only_handler_is_not_deduped(con, graph):
     assert con.execute("SELECT COUNT(*) c FROM tool_invocation").fetchone()["c"] == 0  # ledger untouched
 
 
-def test_tools_for_surfaces_specs_for_agent_toolkits(graph):
+def test_tools_for_surfaces_specs_for_executable_toolkits(graph):
     # The gateway asks the executor to describe an agent's toolkits as callable
     # tools (name = toolkit id, plus description + input_schema).
     resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
     handlers = build_registry(graph, resolver, clients={"git_connector": FakeHttpClient()})
     executor = RavanaToolExecutor(None, handlers)  # con unused for describing tools
-    specs = executor.tools_for(["git_connector", "web_search"])
+    specs = executor.tools_for(["git_connector"])
     by_name = {t.name: t for t in specs}
-    assert set(by_name) == {"git_connector", "web_search"}
+    assert set(by_name) == {"git_connector"}
     assert by_name["git_connector"].input_schema["required"] == ["path"]
     assert by_name["git_connector"].description  # non-empty, model-facing
-    # a deferred toolkit is still surfaced (its description says it's deferred)
-    assert "not executable" in by_name["web_search"].description
+
+
+def test_tools_for_refuses_to_advertise_a_deferred_toolkit(graph):
+    # web_search is a deferred (non-executable) type — surfacing it would only
+    # invite the model to call a tool guaranteed to fail, so tools_for raises.
+    resolver = EnvSecretResolver({})
+    executor = RavanaToolExecutor(None, build_registry(graph, resolver))
+    with pytest.raises(ToolkitError, match="not executable in this build"):
+        executor.tools_for(["web_search"])
 
 
 def test_tools_for_raises_on_unregistered_toolkit(graph):

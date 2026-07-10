@@ -262,6 +262,9 @@ class LLMGateway:
             input_schema=output_schema,
         )
         offered_tools = [*agent_tools, submit_tool]
+        # The set the model is actually permitted to *execute* this turn (not
+        # submit_result, which terminates the turn and is handled separately).
+        allowed_tool_names = {t.name for t in agent_tools}
         messages: list[Message] = [
             UserMessage(text="Complete your task, then call submit_result with your structured output.")
         ]
@@ -336,16 +339,41 @@ class LLMGateway:
             # the results — real providers reject a tool result with no
             # preceding assistant tool_calls message. Then execute each tool,
             # computing its content-addressed idempotency key (§3.6) BEFORE the
-            # call so a side-effecting connector can dedupe a retry.
+            # call so a side-effecting connector can dedupe a retry. Every
+            # tool_call gets a matching tool_result (real or error) so the
+            # transcript stays balanced for the next turn.
             messages.append(AssistantMessage(tool_calls=response.tool_calls, text=response.text))
             for tc in response.tool_calls:
                 tool_call_count += 1
+                # §8 per-node tool boundary (ARCHITECTURE §916): an agent may
+                # only run the tools it was granted, even if the provider names
+                # another tool that happens to be registered for the run. The
+                # offered-tools list is a prompt-level hint; THIS is the
+                # enforcement point. A prompt-injected call to a tool the agent
+                # doesn't hold is refused, not executed.
+                if tc.tool not in allowed_tool_names:
+                    messages.append(_error_result(tc, f"tool '{tc.tool}' is not available to this agent"))
+                    continue
+                # §3.4.4 guard: a single response can carry several tool calls,
+                # so bound side effects WITHIN the batch too — otherwise a
+                # multi-call response could fire past max_tool_calls_per_turn
+                # before the next iteration's force-submit ever kicks in.
+                if tool_call_count > guards.max_tool_calls_per_turn:
+                    messages.append(_error_result(tc, "per-turn tool-call budget exhausted — call submit_result now"))
+                    continue
                 key = compute_idempotency_key(run_id, node_id, tc.tool, tc.arguments)
                 result = await self._tools.execute(
                     run_id=run_id, node_id=node_id, tool=tc.tool, arguments=tc.arguments, idempotency_key=key
                 )
                 recorded_tool_calls.append({"tool": tc.tool, "arguments": tc.arguments, "idempotency_key": key})
                 messages.append(ToolResultMessage(tool_call_id=tc.id, tool=tc.tool, content=result))
+
+
+def _error_result(tc, message: str) -> ToolResultMessage:
+    """A tool_result carrying an error string back to the model — used when a
+    tool call is refused (not granted / over budget) rather than executed, so
+    the model can adjust or submit instead of the turn crashing."""
+    return ToolResultMessage(tool_call_id=tc.id, tool=tc.tool, content=f"error: {message}")
 
 
 def _fallback_to_llm(entry: LLMFallbackEntry) -> LLMConfig:

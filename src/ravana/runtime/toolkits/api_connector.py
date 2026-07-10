@@ -42,6 +42,7 @@ _ALLOWED_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", 
 
 class ApiConnectorHandler:
     input_schema = INPUT_SCHEMA
+    executable = True
 
     def __init__(
         self,

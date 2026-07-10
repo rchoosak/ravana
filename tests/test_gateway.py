@@ -244,6 +244,51 @@ def test_toolkit_id_colliding_with_submit_result_is_rejected(graph):
         _run(gateway, "pm")
 
 
+def test_tool_not_granted_to_agent_is_refused_not_executed(graph):
+    # §8/§916 per-node boundary: pm's toolkits are [web_search]. If the provider
+    # calls git_connector (a tool registered for the run but NOT granted to pm),
+    # the gateway must refuse it — never dispatch — and feed the model an error.
+    executed: list[str] = []
+
+    class RecordingExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            executed.append(tool)
+            return "ran"
+
+    adapter = FakeAdapter(
+        responses=[
+            ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="tc1", tool="git_connector", arguments={})]),
+            _submit({"requirement_clarity": "HIGH"}),
+        ]
+    )
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=RecordingExec())
+    _run(gateway, "pm")
+    assert executed == []  # the ungranted tool was never executed
+    tool_result = next(m for m in adapter.requests[1].messages if m.role == "tool_result")
+    assert "not available to this agent" in tool_result.content
+
+
+def test_multi_call_response_is_capped_at_the_per_turn_budget(graph):
+    # A single response carrying more tool calls than max_tool_calls_per_turn
+    # must not fire side effects past the budget (P1b).
+    cap = graph.doc.spec.graph.guards.max_tool_calls_per_turn
+    executed: list[str] = []
+
+    class RecordingExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            executed.append(tool)
+            return "ran"
+
+    many = ProviderResponse(
+        text=None,
+        tool_calls=[NormalizedToolCall(id=f"tc{i}", tool="web_search", arguments={"i": i}) for i in range(cap + 2)],
+    )
+    adapter = FakeAdapter(responses=[many, _submit({"requirement_clarity": "HIGH"})])
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=RecordingExec())
+    _run(gateway, "pm")
+    assert len(executed) == cap  # exactly the budget fired; the surplus was refused
+
+
 def test_non_compliant_provider_that_never_submits_is_bounded(graph):
     # A provider that keeps answering with text and never submits (ignoring the
     # forced submit_result) must NOT loop forever — the gateway bounds total
@@ -409,6 +454,61 @@ def test_openai_adapter_caches_client_per_endpoint():
     # Two distinct endpoints -> two clients; the repeat of endpoint a reuses.
     assert len(made) == 2
     assert {m["base_url"] for m in made} == {"http://a:11434/v1", "http://b:11434/v1"}
+
+
+def test_hosted_openai_omits_api_key_so_sdk_reads_env():
+    # P1c: hosted OpenAI (no endpoint, no api_key_ref) must NOT get a dummy key
+    # — passing one blocks the SDK's OPENAI_API_KEY fallback and misauthenticates.
+    from ravana.runtime.providers.base import UserMessage
+    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+
+    made: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            made.append(kwargs)
+
+    import openai
+
+    orig = openai.AsyncOpenAI
+    openai.AsyncOpenAI = FakeClient
+    try:
+        adapter = OpenAICompatibleAdapter(name="openai")
+        adapter._resolve_client(ProviderRequest(model="gpt-4o", system="", messages=[UserMessage(text="x")]))
+    finally:
+        openai.AsyncOpenAI = orig
+
+    assert len(made) == 1
+    assert "api_key" not in made[0]  # SDK falls back to OPENAI_API_KEY
+    assert "base_url" not in made[0]  # hosted default, no override
+
+
+def test_local_runtime_without_key_gets_placeholder():
+    # A local endpoint with no api_key_ref still needs a nonempty key for the
+    # SDK; the placeholder is supplied only in that case (contrast P1c).
+    from ravana.runtime.providers.base import UserMessage
+    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+
+    made: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            made.append(kwargs)
+
+    import openai
+
+    orig = openai.AsyncOpenAI
+    openai.AsyncOpenAI = FakeClient
+    try:
+        adapter = OpenAICompatibleAdapter(name="local")
+        adapter._resolve_client(
+            ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://localhost:11434/v1")
+        )
+    finally:
+        openai.AsyncOpenAI = orig
+
+    assert made[0]["base_url"] == "http://localhost:11434/v1"
+    assert made[0]["api_key"] == "not-needed-for-local"
 
 
 def test_temperature_dropped_for_no_sampling_param_models():
