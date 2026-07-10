@@ -221,6 +221,23 @@ CREATE TABLE IF NOT EXISTS audit_log (
     metadata      TEXT,
     created_at    TEXT NOT NULL
 );
+
+-- Idempotency ledger (§3.6/§8): one row per logical tool call, keyed by the
+-- content-addressed idempotency_key the gateway computes. A retry that
+-- reissues the same call (same run/node/tool/args -> same key) finds the
+-- prior SUCCEEDED row and returns its stored result instead of executing the
+-- side effect again — this is what makes "connectors MUST dedupe" real. The
+-- key is the PRIMARY KEY so the dedup check is a point lookup.
+CREATE TABLE IF NOT EXISTS tool_invocation (
+    idempotency_key TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL REFERENCES run(id),
+    node_id         TEXT NOT NULL,
+    tool            TEXT NOT NULL,
+    status          TEXT NOT NULL,                 -- SUCCEEDED | FAILED
+    result          TEXT,
+    error           TEXT,
+    created_at      TEXT NOT NULL
+);
 """
 
 

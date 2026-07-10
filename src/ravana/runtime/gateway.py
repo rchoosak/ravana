@@ -30,6 +30,7 @@ from ravana.compiler.graph import CompiledGraph
 from ravana.runtime.base import AgentTurnResult, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
+from ravana.runtime.schema_validate import validate_json
 from ravana.runtime.providers.base import (
     AssistantMessage,
     Capability,
@@ -103,21 +104,7 @@ def _select_strategy(adapter: ProviderAdapter, model: str) -> _Strategy:
 
 
 def _validate(payload: Any, output_schema: dict[str, Any] | None) -> str | None:
-    """Returns an error string if payload violates the (shallow) schema, else
-    None. Deliberately minimal for Phase 0a/0b — checks type, required keys,
-    and top-level enums, which is what the §4 example's schemas use. A full
-    JSON Schema validator (jsonschema) is a drop-in upgrade later."""
-    if output_schema is None:
-        return None if isinstance(payload, dict) else "expected a JSON object"
-    if output_schema.get("type") == "object" and not isinstance(payload, dict):
-        return "expected a JSON object"
-    for key in output_schema.get("required", []):
-        if key not in payload:
-            return f"missing required field '{key}'"
-    for key, spec in output_schema.get("properties", {}).items():
-        if key in payload and "enum" in spec and payload[key] not in spec["enum"]:
-            return f"field '{key}' must be one of {spec['enum']}, got {payload[key]!r}"
-    return None
+    return validate_json(payload, output_schema)
 
 
 def _parse_json(text: str | None) -> tuple[Any, str | None]:
