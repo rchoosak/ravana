@@ -19,9 +19,21 @@ class ToolkitError(Exception):
 class ToolkitHandler(Protocol):
     # §8(a): every connector declares its input JSON schema. The result is a
     # plain string fed back to the model, so there is no separate output
-    # schema. Surfaced to the gateway when it exposes toolkits as callable
-    # tools (that wiring lands in the sandbox slice).
+    # schema. Both this and `description` are what the gateway needs to surface
+    # the toolkit to the model as a callable tool (name = toolkit id).
     input_schema: dict[str, Any]
+
+    # A human/model-readable line telling the model what this tool does and
+    # when to reach for it. Author-provided descriptions in the manifest are a
+    # later enhancement; for now each handler supplies a sensible default.
+    description: str
+
+    # Whether this handler can actually run in the current build. A deferred
+    # toolkit type (code_interpreter/mcp_server/web_search — the sandbox slice)
+    # is registered so a workflow still compiles, but it is NOT executable and
+    # must not be surfaced to the model as a callable tool (it would only ever
+    # fail). tools_for refuses to advertise a non-executable handler.
+    executable: bool
 
     def is_side_effecting(self, arguments: dict[str, Any]) -> bool:
         """Whether THIS call (given its arguments) has external side effects —

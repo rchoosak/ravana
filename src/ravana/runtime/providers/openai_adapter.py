@@ -56,13 +56,21 @@ class OpenAICompatibleAdapter:
         if key not in self._clients:
             from openai import AsyncOpenAI
 
-            # For a local runtime the api_key is often a placeholder; the
-            # endpoint (base_url) routes to Ollama/vLLM. Real secrets
-            # resolution (§8) would turn api_key_ref into a key — stubbed as
-            # the ref here until secrets-manager wiring lands.
-            self._clients[key] = AsyncOpenAI(
-                base_url=request.endpoint, api_key=request.api_key_ref or "not-needed-for-local"
-            )
+            kwargs: dict[str, Any] = {}
+            if request.endpoint:
+                kwargs["base_url"] = request.endpoint  # routes to Ollama/vLLM/etc.
+            if request.api_key_ref:
+                # Stubbed pass-through until secrets-manager wiring turns the
+                # ref into a real key (§8, tracked follow-up).
+                kwargs["api_key"] = request.api_key_ref
+            elif request.endpoint:
+                # A local runtime usually requires a nonempty key but ignores
+                # its value — supply a placeholder so the SDK doesn't error.
+                kwargs["api_key"] = "not-needed-for-local"
+            # else: hosted OpenAI with no ref — pass no api_key so the SDK falls
+            # back to OPENAI_API_KEY from the environment. (Passing a dummy key
+            # here would defeat that fallback and misauthenticate — P1c.)
+            self._clients[key] = AsyncOpenAI(**kwargs)
         return self._clients[key]
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:

@@ -151,6 +151,35 @@ def test_read_only_handler_is_not_deduped(con, graph):
     assert con.execute("SELECT COUNT(*) c FROM tool_invocation").fetchone()["c"] == 0  # ledger untouched
 
 
+def test_tools_for_surfaces_specs_for_executable_toolkits(graph):
+    # The gateway asks the executor to describe an agent's toolkits as callable
+    # tools (name = toolkit id, plus description + input_schema).
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": FakeHttpClient()})
+    executor = RavanaToolExecutor(None, handlers)  # con unused for describing tools
+    specs = executor.tools_for(["git_connector"])
+    by_name = {t.name: t for t in specs}
+    assert set(by_name) == {"git_connector"}
+    assert by_name["git_connector"].input_schema["required"] == ["path"]
+    assert by_name["git_connector"].description  # non-empty, model-facing
+
+
+def test_tools_for_refuses_to_advertise_a_deferred_toolkit(graph):
+    # web_search is a deferred (non-executable) type — surfacing it would only
+    # invite the model to call a tool guaranteed to fail, so tools_for raises.
+    resolver = EnvSecretResolver({})
+    executor = RavanaToolExecutor(None, build_registry(graph, resolver))
+    with pytest.raises(ToolkitError, match="not executable in this build"):
+        executor.tools_for(["web_search"])
+
+
+def test_tools_for_raises_on_unregistered_toolkit(graph):
+    resolver = EnvSecretResolver({})
+    executor = RavanaToolExecutor(None, build_registry(graph, resolver))
+    with pytest.raises(ToolkitError, match="no registered handler"):
+        executor.tools_for(["does_not_exist"])
+
+
 def test_api_connector_declares_input_schema(graph):
     # §8(a): every connector declares an input JSON schema.
     resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})

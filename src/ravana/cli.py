@@ -1,8 +1,11 @@
-"""§1.5's CLI surface, Phase 0a scope: `ravana init`, `ravana workflow
-validate`, `ravana run start`, `ravana run watch`, `ravana run hitl respond`.
-No real LLM runtime exists yet (that's Phase 0b) — `run start`/`run watch`
-take a `--mock-fixture` because MockAgentRuntime is the only backend Phase 0a
-has.
+"""§1.5's CLI surface: `ravana init`, `ravana workflow validate`, `ravana run
+start`, `ravana run watch`, `ravana run hitl respond`.
+
+The run commands take `--backend [mock|llm]`. `mock` drives the Phase-0a
+MockAgentRuntime from a scripted `--mock-fixture` (no LLM). `llm` drives the
+real LLM Gateway (§1.1) with the compiled graph's toolkits wired through
+RavanaToolExecutor and provider adapters selected per the agents' `llm.provider`
+— a run against real models/APIs, so it reads credentials from the environment.
 """
 
 from __future__ import annotations
@@ -18,7 +21,15 @@ from ravana.compiler.graph import CompiledGraph, compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.compiler.validate import validate
 from ravana.engine.loop import resume_hitl, start_run
+from ravana.runtime.base import AgentRuntime
+from ravana.runtime.gateway import LLMGateway
 from ravana.runtime.mock import MockAgentRuntime
+from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
+from ravana.runtime.providers.base import ProviderAdapter
+from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+from ravana.runtime.secrets import EnvSecretResolver
+from ravana.runtime.tool_executor import RavanaToolExecutor
+from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.db import init_db
 from ravana.schema.loader import load_workflow_yaml
 
@@ -54,6 +65,56 @@ def _find_workflow_file_for_run(con: sqlite3.Connection, run_row: sqlite3.Row) -
 
 def _compiled_graph_for_run(con: sqlite3.Connection, run_row: sqlite3.Row) -> CompiledGraph:
     return compile_workflow(load_workflow_yaml(_find_workflow_file_for_run(con, run_row)))
+
+
+def _providers_in_graph(graph: CompiledGraph) -> set[str]:
+    """Every distinct provider an agent (or one of its fallbacks) names — so we
+    build exactly the adapters the run needs and no more (constructing an
+    Anthropic client, say, only when an agent actually uses Anthropic)."""
+    providers: set[str] = set()
+    for agent in graph.agents_by_id.values():
+        providers.add(agent.llm.provider)
+        providers.update(fb.provider for fb in agent.llm.fallback)
+    return providers
+
+
+def _make_adapter(provider: str) -> ProviderAdapter:
+    """Map a provider name to its adapter. Anthropic has its own SDK; every
+    other provider (openai, and local OpenAI-compatible runtimes like Ollama /
+    vLLM reached via `llm.endpoint`) goes through the OpenAI-compatible adapter.
+    guided_decoding stays off by default — not every OpenAI-compatible runtime
+    honors guided_json, so the safe default is the forced-tool path; enabling
+    it per-provider is a follow-up."""
+    if provider == "anthropic":
+        return AnthropicAdapter()
+    return OpenAICompatibleAdapter(name=provider)
+
+
+def _adapters_for_graph(graph: CompiledGraph) -> dict[str, ProviderAdapter]:
+    return {provider: _make_adapter(provider) for provider in _providers_in_graph(graph)}
+
+
+def _build_llm_gateway(con: sqlite3.Connection, graph: CompiledGraph) -> LLMGateway:
+    # Toolkit auth_refs resolve from the environment (§8c, EnvSecretResolver);
+    # the registry injects lazy credential providers, so a secret is only read
+    # if its toolkit is actually called. LLM provider credentials, by contrast,
+    # still come from each provider SDK's own env var (ANTHROPIC_API_KEY, etc.)
+    # / the api_key_ref pass-through in the adapters — resolving llm.api_key_ref
+    # through EnvSecretResolver too is a tracked follow-up.
+    resolver = EnvSecretResolver()
+    handlers = build_registry(graph, resolver)
+    executor = RavanaToolExecutor(con, handlers)
+    return LLMGateway(graph, _adapters_for_graph(graph), tool_executor=executor)
+
+
+def _build_runtime(
+    con: sqlite3.Connection, graph: CompiledGraph, backend: str, mock_fixture: str | None
+) -> AgentRuntime:
+    if backend == "llm":
+        return _build_llm_gateway(con, graph)
+    if not mock_fixture:
+        raise click.ClickException("--backend mock requires --mock-fixture")
+    return MockAgentRuntime.from_yaml(mock_fixture)
 
 
 @click.group()
@@ -107,14 +168,15 @@ def run() -> None:
 @click.argument("file", type=click.Path(exists=True, dir_okay=False))
 @click.option("--input", "input_json", default="{}", help="JSON input payload")
 @click.option("--org", default="local", help="org_id (Phase 0a: no real multi-tenancy)")
-@click.option("--mock-fixture", required=True, type=click.Path(exists=True, dir_okay=False), help="Phase 0a has no real LLM runtime yet — a scripted response fixture is required")
-def run_start(file: str, input_json: str, org: str, mock_fixture: str) -> None:
+@click.option("--backend", type=click.Choice(["mock", "llm"]), default="mock", help="mock = scripted --mock-fixture; llm = real LLM Gateway (§1.1) with wired toolkits")
+@click.option("--mock-fixture", type=click.Path(exists=True, dir_okay=False), help="required for --backend mock: a scripted response fixture")
+def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: str | None) -> None:
     """Persist FILE's workflow and start a Run against it."""
     con = _connect()
     doc = load_workflow_yaml(file)
     graph = compile_workflow(doc)
     workflow_id = get_or_create_workflow(con, graph, org_id=org, created_by="cli-user")
-    runtime = MockAgentRuntime.from_yaml(mock_fixture)
+    runtime = _build_runtime(con, graph, backend, mock_fixture)
 
     run_id = asyncio.run(
         start_run(con, graph, runtime, org_id=org, workflow_id=workflow_id, triggered_by="cli-user", input_payload=json.loads(input_json))
@@ -124,19 +186,21 @@ def run_start(file: str, input_json: str, org: str, mock_fixture: str) -> None:
 
 @run.command("watch")
 @click.argument("run_id")
+@click.option("--backend", type=click.Choice(["mock", "llm"]), default="mock", help="runtime used to resume HITL pauses: mock (--mock-fixture) or llm (real Gateway)")
 @click.option(
     "--mock-fixture", type=click.Path(exists=True, dir_okay=False),
-    help="if given, blocks and interactively resolves HITL pauses instead of just printing status once and exiting",
+    help="with --backend mock, blocks and interactively resolves HITL pauses instead of just printing status once and exiting",
 )
-def run_watch(run_id: str, mock_fixture: str | None) -> None:
-    """Print RUN_ID's message trail. Without --mock-fixture, prints once and
-    exits (the old behavior). With it, this is the "blocking terminal
-    prompt" TASKS.md's Phase 0a asks for: it blocks, prompts interactively
-    for each HITL pause, resumes, and keeps going until the run reaches a
-    terminal status."""
+def run_watch(run_id: str, backend: str, mock_fixture: str | None) -> None:
+    """Print RUN_ID's message trail. In a non-interactive setup (--backend mock
+    with no --mock-fixture), prints once and exits. With --backend llm, or
+    --backend mock plus a fixture, this blocks: it prompts interactively for
+    each HITL pause, resumes via the chosen runtime, and keeps going until the
+    run reaches a terminal status."""
     con = _connect()
     printed_message_ids: set[str] = set()
-    runtime = MockAgentRuntime.from_yaml(mock_fixture) if mock_fixture else None
+    interactive = backend == "llm" or bool(mock_fixture)
+    runtime: AgentRuntime | None = None
     graph: CompiledGraph | None = None
 
     while True:
@@ -169,13 +233,15 @@ def run_watch(run_id: str, mock_fixture: str | None) -> None:
 
         for hitl in pending:
             click.echo(f"\nPENDING HITL [{hitl['id']}] on node '{hitl['node_id']}': {hitl['question']}")
-            if runtime is None:
+            if not interactive:
                 click.echo(f"  respond with: ravana run hitl respond {run_id} {hitl['id']} '<json response>'")
-                click.echo("  (or re-run 'run watch' with --mock-fixture to answer interactively here)")
+                click.echo("  (or re-run 'run watch' with --backend llm / --mock-fixture to answer interactively here)")
                 return
             answer = click.prompt("  your answer")
             if graph is None:
                 graph = _compiled_graph_for_run(con, row)
+            if runtime is None:
+                runtime = _build_runtime(con, graph, backend, mock_fixture)
             asyncio.run(resume_hitl(con, graph, runtime, run_id, hitl["id"], {"answer": answer}))
         # loop again: the resume may have produced new messages, completed
         # the run, or raised another HITL pause elsewhere.
@@ -190,8 +256,9 @@ def run_hitl() -> None:
 @click.argument("run_id")
 @click.argument("hitl_id")
 @click.argument("response_json")
-@click.option("--mock-fixture", required=True, type=click.Path(exists=True, dir_okay=False))
-def run_hitl_respond(run_id: str, hitl_id: str, response_json: str, mock_fixture: str) -> None:
+@click.option("--backend", type=click.Choice(["mock", "llm"]), default="mock", help="runtime used to resume the paused node")
+@click.option("--mock-fixture", type=click.Path(exists=True, dir_okay=False), help="required for --backend mock")
+def run_hitl_respond(run_id: str, hitl_id: str, response_json: str, backend: str, mock_fixture: str | None) -> None:
     """Answer a pending HITL request non-interactively, resuming that node
     (§3.1's corrected Resume). Kept alongside `run watch`'s interactive mode
     for scripting/automation."""
@@ -200,7 +267,7 @@ def run_hitl_respond(run_id: str, hitl_id: str, response_json: str, mock_fixture
     if run_row is None:
         raise click.ClickException(f"run '{run_id}' not found")
     graph = _compiled_graph_for_run(con, run_row)
-    runtime = MockAgentRuntime.from_yaml(mock_fixture)
+    runtime = _build_runtime(con, graph, backend, mock_fixture)
 
     asyncio.run(resume_hitl(con, graph, runtime, run_id, hitl_id, json.loads(response_json)))
     _print_run_status(con, run_id)

@@ -73,10 +73,12 @@ class _DeferredHandler:
     and specifically rather than mystifyingly."""
 
     input_schema: dict = {"type": "object", "additionalProperties": True}
+    executable = False  # registered so a workflow compiles, but never surfaced/run
 
     def __init__(self, toolkit_id: str, toolkit_type: str, reason: str | None = None):
         self._toolkit_id = toolkit_id
         self._reason = reason or _DEFERRED.get(toolkit_type, "unimplemented")
+        self.description = f"[{toolkit_type}] not executable in this slice: {self._reason}"
 
     def is_side_effecting(self, arguments) -> bool:  # never reached — call() always raises
         return False

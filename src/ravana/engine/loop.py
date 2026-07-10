@@ -339,6 +339,16 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
         con.commit()
         ctx.queue.insert(0, node_id)  # retried immediately; _consecutive_failures bounds this via max_retries_per_node
         return
+    except Exception as exc:  # noqa: BLE001
+        # Any NON-transient turn failure (a deferred/unknown toolkit surfaced by
+        # the gateway, a submit_result-id collision, a genuinely unexpected bug)
+        # is terminal for the run — but it must still land as a clean FAILED
+        # state, never a process crash that leaves this node_execution stuck in
+        # RUNNING. _fail_run flips the current attempt to FAILED and the run to
+        # FAILED. (Recoverable tool failures don't reach here: the gateway feeds
+        # those back into the turn as tool errors.)
+        _fail_run(ctx, node_id, f"node '{node_id}' failed: {exc}")
+        return
 
     con.execute(
         """UPDATE node_execution SET status = 'SUCCEEDED', finished_at = ?, input_tokens = ?, output_tokens = ?,
