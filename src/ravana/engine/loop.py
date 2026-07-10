@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ravana.compiler.graph import TERMINAL, CompiledGraph
+from ravana.engine.dod import evaluate_dod
 from ravana.engine.expr import apply_on_enter, eval_condition
 from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
@@ -278,16 +279,40 @@ def _finalize_status(ctx: _RunCtx) -> None:
     if pending_hitl:
         new_status = "WAITING_HUMAN"
     elif ctx.terminal_reached:
-        new_status = "COMPLETED"
+        # §3.1 step 7: reaching a terminal is necessary but not sufficient — the
+        # run only COMPLETES if its definition_of_done is met, else it FAILs.
+        new_status = _dod_gate(ctx)
     else:
         # The queue drained with nothing pending and no __terminal__/implicit-terminal edge
         # ever fired — shouldn't happen given §3.1's fail-fast rule, but leave status as-is
         # rather than guess, so a genuine gap here is visible (stuck RUNNING) instead of
         # silently reported as either outcome.
         new_status = run["status"]
-    ended_at = now_iso() if new_status in ("COMPLETED",) else run["ended_at"]
+    ended_at = now_iso() if new_status in ("COMPLETED", "FAILED") else run["ended_at"]
     ctx.con.execute("UPDATE run SET status = ?, ended_at = ? WHERE id = ?", (new_status, ended_at, ctx.run_id))
     ctx.con.commit()
+
+
+def _dod_gate(ctx: _RunCtx) -> str:
+    """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
+    definition_of_done is met, else FAILs. Expression criteria are enforced
+    deterministically; prose criteria are recorded as unevaluated (advisory,
+    not gating) until an evaluator agent is wired. Records the outcome as a
+    DOD_EVALUATED event either way, so a completion always carries the DoD
+    evidence and a failure carries the unmet criteria."""
+    dod = ctx.graph.doc.spec.definition_of_done
+    if dod is None:
+        return "COMPLETED"
+    result = evaluate_dod(dod, ctx.load_shared_state())
+    _log_event(
+        ctx.con, ctx.run_id, None, "DOD_EVALUATED",
+        result=result.met, condition_evaluated="; ".join(dod.criteria), state_diff=result.as_dict(),
+    )
+    ctx.con.commit()
+    if result.met:
+        return "COMPLETED"
+    log_event("ERROR", f"run {ctx.run_id} reached a terminal but its definition_of_done is not met: {result.unmet}", run_id=ctx.run_id)
+    return "FAILED"
 
 
 async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
