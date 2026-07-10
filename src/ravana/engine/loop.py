@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ravana.compiler.graph import TERMINAL, CompiledGraph
-from ravana.engine.dod import evaluate_dod
+from ravana.engine.dod import ProseVerdict, evaluate_dod
 from ravana.engine.expr import apply_on_enter, eval_condition
 from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
@@ -47,6 +47,12 @@ class _RunCtx:
     queue: list[str] = field(default_factory=list)
     terminal_reached: bool = False
     failed: bool = False
+    # §3.1 step 7: optional judge for *prose* DoD criteria. When set, prose
+    # criteria are enforced at the Terminate gate; when None (the default), they
+    # stay advisory. This is the engine-level injection point so a caller (CLI,
+    # tests) can supply a real evaluated_by-agent verdict without the evaluator
+    # itself living in the engine.
+    dod_prose_verdict: ProseVerdict | None = None
 
     def load_shared_state(self) -> dict[str, Any]:
         return loads(_get_run(self.con, self.run_id)["shared_state"], {})
@@ -155,6 +161,7 @@ async def start_run(
     workflow_id: str,
     triggered_by: str | None = None,
     input_payload: dict[str, Any] | None = None,
+    dod_prose_verdict: ProseVerdict | None = None,
 ) -> str:
     input_payload = input_payload or {}
     run_id = new_id()
@@ -199,7 +206,10 @@ async def start_run(
     con.commit()
 
     if status == "RUNNING":
-        ctx = _RunCtx(con=con, graph=graph, run_id=run_id, org_id=org_id, workflow_id=workflow_id, runtime=runtime, queue=[graph.entry])
+        ctx = _RunCtx(
+            con=con, graph=graph, run_id=run_id, org_id=org_id, workflow_id=workflow_id,
+            runtime=runtime, queue=[graph.entry], dod_prose_verdict=dod_prose_verdict,
+        )
         await _drain_queue(ctx)
 
     return run_id
@@ -303,7 +313,7 @@ def _dod_gate(ctx: _RunCtx) -> str:
     dod = ctx.graph.doc.spec.definition_of_done
     if dod is None:
         return "COMPLETED"
-    result = evaluate_dod(dod, ctx.load_shared_state())
+    result = evaluate_dod(dod, ctx.load_shared_state(), prose_verdict=ctx.dod_prose_verdict)
     _log_event(
         ctx.con, ctx.run_id, None, "DOD_EVALUATED",
         result=result.met, condition_evaluated="; ".join(dod.criteria), state_diff=result.as_dict(),
@@ -560,6 +570,7 @@ async def resume_hitl(
     run_id: str,
     hitl_request_id: str,
     response: dict[str, Any],
+    dod_prose_verdict: ProseVerdict | None = None,
 ) -> None:
     """§3.1's corrected Resume: append the human's response to the message
     thread, then dispatch a brand-new node_execution attempt for the same
@@ -588,6 +599,6 @@ async def resume_hitl(
     run_row = _get_run(con, run_id)
     ctx = _RunCtx(
         con=con, graph=graph, run_id=run_id, org_id=run_row["org_id"], workflow_id=run_row["workflow_id"],
-        runtime=runtime, queue=[node_id],
+        runtime=runtime, queue=[node_id], dod_prose_verdict=dod_prose_verdict,
     )
     await _drain_queue(ctx)

@@ -421,7 +421,7 @@ CREATE TABLE state_transition_log (
     run_id            UUID REFERENCES run(id),
     sequence          BIGINT NOT NULL,              -- monotonic per run_id; the real replay order — created_at alone isn't, under concurrent broadcast writes
     node_execution_id UUID REFERENCES node_execution(id), -- which attempt produced this event; was previously unlinkable back to node_execution
-    event_type        TEXT NOT NULL,                -- COMMIT | ROUTE | HITL_RAISED | HITL_RESOLVED | FAIL | TERMINATE — was implicitly ROUTE-only before
+    event_type        TEXT NOT NULL,                -- COMMIT | ROUTE | HITL_RAISED | HITL_RESOLVED | FAIL | TERMINATE | DOD_EVALUATED — was implicitly ROUTE-only before
     from_node         TEXT,
     to_node           TEXT,
     condition_evaluated TEXT,

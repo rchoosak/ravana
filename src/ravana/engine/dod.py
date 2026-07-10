@@ -14,17 +14,21 @@ Criteria come in two kinds (ARCHITECTURE §4):
     than silently passed, and they do NOT gate COMPLETED. Wiring a real
     agent-backed prose evaluator is a tracked follow-up.
 
-Classification is by behaviour, not by a marker: a criterion is an expression
-iff it evaluates cleanly through the condition engine; anything that fails to
-parse/evaluate (a sentence like "No open defects in state.qa_report") is prose.
+Classification is by PARSE, not by evaluation: a criterion is an expression iff
+it parses as one (`is_boolean_expression`); a sentence like "No open defects in
+state.qa_report" fails to parse and is prose. A parseable expression that only
+ERRORS at evaluation (e.g. `state.count > 5` on an unset key, where `None > 5`
+raises) is still an expression — a *failing* one — not prose; treating such a
+raise as prose would silently downgrade a genuinely-unmet criterion to advisory
+and defeat the gate.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
-from ravana.engine.expr import eval_condition
+from ravana.engine.expr import eval_condition, is_boolean_expression
 from ravana.schema.models import DefinitionOfDone
 
 # Given (evaluated_by agent id, the prose criteria, final shared_state), returns
@@ -36,7 +40,7 @@ ProseVerdict = Callable[[str, list[str], dict[str, Any]], dict[str, bool]]
 @dataclass
 class CriterionResult:
     criterion: str
-    kind: str  # "expression" | "prose"
+    kind: Literal["expression", "prose"]
     passed: bool | None  # None => not evaluated (prose with no evaluator wired)
 
 
@@ -63,14 +67,15 @@ class DodResult:
         }
 
 
-def _try_expression(criterion: str, state: dict[str, Any]) -> tuple[bool, bool]:
-    """(is_expression, value). A clean evaluation through the condition engine
-    means the criterion IS an expression; a raise (unparseable prose) means it
-    is not."""
+def _evaluate_expression(criterion: str, state: dict[str, Any]) -> bool:
+    """A parseable expression's boolean value. A raise at evaluation (e.g. an
+    ordering comparison against an unset key) means the criterion is NOT
+    demonstrably met — fail closed to False rather than error out, so an
+    erroring criterion FAILs the DoD gate instead of crashing the run."""
     try:
-        return True, eval_condition(criterion, state)
-    except Exception:  # noqa: BLE001 - any eval failure just means "this is prose"
-        return False, False
+        return eval_condition(criterion, state)
+    except Exception:  # noqa: BLE001 - a parseable expression that errors is "not met", not prose
+        return False
 
 
 def evaluate_dod(
@@ -85,9 +90,8 @@ def evaluate_dod(
     results: list[CriterionResult] = []
     prose_criteria: list[str] = []
     for criterion in dod.criteria:
-        is_expr, value = _try_expression(criterion, state)
-        if is_expr:
-            results.append(CriterionResult(criterion, "expression", bool(value)))
+        if is_boolean_expression(criterion):
+            results.append(CriterionResult(criterion, "expression", _evaluate_expression(criterion, state)))
         else:
             prose_criteria.append(criterion)
             results.append(CriterionResult(criterion, "prose", None))
