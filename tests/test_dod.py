@@ -194,6 +194,20 @@ def test_engine_enforces_prose_when_a_verdict_is_injected(con):
     assert con.execute("SELECT status FROM run WHERE id = ?", (passed,)).fetchone()["status"] == "COMPLETED"
 
 
+def test_throwing_prose_verdict_fails_the_run_not_strands_it(con):
+    # P2: the DoD gate runs outside _dispatch's failure boundary. A verdict that
+    # raises at Terminate must NOT escape start_run and leave the run stuck at
+    # RUNNING — it must fail closed (FAILED, ended_at set), per §3.1 step 7.
+    def boom(evaluated_by, criteria, state):
+        raise RuntimeError("evaluator exploded")
+
+    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, boom)
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"  # not stranded at RUNNING
+    assert run["ended_at"] is not None
+    assert _dod_event(con, run_id)["result"] == 0  # recorded as a failed DoD
+
+
 def test_engine_prose_verdict_receives_evaluated_by_and_final_state(con):
     seen: dict = {}
 

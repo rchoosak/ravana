@@ -313,7 +313,17 @@ def _dod_gate(ctx: _RunCtx) -> str:
     dod = ctx.graph.doc.spec.definition_of_done
     if dod is None:
         return "COMPLETED"
-    result = evaluate_dod(dod, ctx.load_shared_state(), prose_verdict=ctx.dod_prose_verdict)
+    # The DoD evaluation can run an INJECTED prose verdict (an agent turn), and
+    # this gate executes in _finalize_status — outside _dispatch's failure
+    # boundary. A raising verdict must not escape and strand the run at RUNNING;
+    # fail closed (the DoD isn't demonstrably met) and record it.
+    try:
+        result = evaluate_dod(dod, ctx.load_shared_state(), prose_verdict=ctx.dod_prose_verdict)
+    except Exception as exc:  # noqa: BLE001
+        _log_event(ctx.con, ctx.run_id, None, "DOD_EVALUATED", result=False, condition_evaluated="; ".join(dod.criteria))
+        ctx.con.commit()
+        log_event("ERROR", f"run {ctx.run_id} DoD evaluation raised, failing the run: {exc}", run_id=ctx.run_id)
+        return "FAILED"
     _log_event(
         ctx.con, ctx.run_id, None, "DOD_EVALUATED",
         result=result.met, condition_evaluated="; ".join(dod.criteria), state_diff=result.as_dict(),
