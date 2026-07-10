@@ -31,6 +31,7 @@ from ravana.runtime.base import AgentTurnResult, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
+from ravana.runtime.toolkits.base import ToolkitError
 from ravana.runtime.providers.base import (
     AssistantMessage,
     Capability,
@@ -310,6 +311,54 @@ class LLMGateway:
             output_tokens += response.output_tokens
 
             submit = next((tc for tc in response.tool_calls if tc.tool == SUBMIT_RESULT), None)
+            other_calls = [tc for tc in response.tool_calls if tc.tool != SUBMIT_RESULT]
+
+            # Real tool calls take precedence over a co-occurring submit_result.
+            # A model that calls a tool AND submits in the same response hasn't
+            # seen the tool's result yet, so its submit is premature — accepting
+            # it would drop the real tool call and let the payload claim work
+            # that never ran. Execute the tools this turn; defer the submit.
+            if other_calls:
+                # Preserve the assistant's tool_calls turn before the results —
+                # real providers reject a tool result with no preceding
+                # assistant tool_calls message. Every tool_use gets a matching
+                # tool_result (real or error) so the transcript stays balanced.
+                messages.append(AssistantMessage(tool_calls=response.tool_calls, text=response.text))
+                for tc in other_calls:
+                    tool_call_count += 1
+                    # §8 per-node tool boundary (ARCHITECTURE §916): an agent may
+                    # only run tools it was granted, even if the provider names
+                    # another registered tool. The offered-tools list is a
+                    # prompt-level hint; THIS is the enforcement point.
+                    if tc.tool not in allowed_tool_names:
+                        messages.append(_error_result(tc, f"tool '{tc.tool}' is not available to this agent"))
+                        continue
+                    # §3.4.4 guard: a single response can carry several tool
+                    # calls, so bound side effects WITHIN the batch too — a
+                    # multi-call response mustn't fire past max_tool_calls_per_turn
+                    # before the next iteration's force-submit kicks in.
+                    if tool_call_count > guards.max_tool_calls_per_turn:
+                        messages.append(_error_result(tc, "per-turn tool-call budget exhausted — call submit_result now"))
+                        continue
+                    key = compute_idempotency_key(run_id, node_id, tc.tool, tc.arguments)
+                    try:
+                        result = await self._tools.execute(
+                            run_id=run_id, node_id=node_id, tool=tc.tool, arguments=tc.arguments, idempotency_key=key
+                        )
+                    except ToolkitError as exc:
+                        # A tool failing is a normal event in an agent loop, not
+                        # a run crash: feed the error back so the model can
+                        # retry, route around it, or submit.
+                        messages.append(_error_result(tc, f"tool '{tc.tool}' failed: {exc}"))
+                        continue
+                    recorded_tool_calls.append({"tool": tc.tool, "arguments": tc.arguments, "idempotency_key": key})
+                    messages.append(ToolResultMessage(tool_call_id=tc.id, tool=tc.tool, content=result))
+                if submit is not None:
+                    # submit rode along with tool calls; its tool_use still needs
+                    # a tool_result, and we won't honor a premature submit.
+                    messages.append(_error_result(submit, "submit_result ignored: you still had pending tool calls; submit again after reviewing their results"))
+                continue
+
             if submit is not None:
                 error = _validate(submit.arguments, output_schema)
                 if error is None:
@@ -320,7 +369,11 @@ class LLMGateway:
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         repair_count=repair_count,
-                        tool_call_count=tool_call_count,
+                        # Report the count of tool calls actually EXECUTED (not
+                        # refused/over-budget attempts), so the engine's post-turn
+                        # max_tool_calls_per_turn guard reflects real side effects
+                        # and doesn't fail a run the gateway already capped.
+                        tool_call_count=len(recorded_tool_calls),
                     )
                 if repair_count >= guards.max_output_repairs:
                     raise TransientAgentError(
@@ -330,43 +383,9 @@ class LLMGateway:
                 messages.append(UserMessage(text=f"Your submit_result was invalid: {error}. Try again."))
                 continue
 
-            if not response.tool_calls:
-                messages.append(UserMessage(text="Call submit_result now with your final output."))
-                tool_call_count += 1
-                continue
-
-            # Preserve the assistant's tool_calls turn in the transcript before
-            # the results — real providers reject a tool result with no
-            # preceding assistant tool_calls message. Then execute each tool,
-            # computing its content-addressed idempotency key (§3.6) BEFORE the
-            # call so a side-effecting connector can dedupe a retry. Every
-            # tool_call gets a matching tool_result (real or error) so the
-            # transcript stays balanced for the next turn.
-            messages.append(AssistantMessage(tool_calls=response.tool_calls, text=response.text))
-            for tc in response.tool_calls:
-                tool_call_count += 1
-                # §8 per-node tool boundary (ARCHITECTURE §916): an agent may
-                # only run the tools it was granted, even if the provider names
-                # another tool that happens to be registered for the run. The
-                # offered-tools list is a prompt-level hint; THIS is the
-                # enforcement point. A prompt-injected call to a tool the agent
-                # doesn't hold is refused, not executed.
-                if tc.tool not in allowed_tool_names:
-                    messages.append(_error_result(tc, f"tool '{tc.tool}' is not available to this agent"))
-                    continue
-                # §3.4.4 guard: a single response can carry several tool calls,
-                # so bound side effects WITHIN the batch too — otherwise a
-                # multi-call response could fire past max_tool_calls_per_turn
-                # before the next iteration's force-submit ever kicks in.
-                if tool_call_count > guards.max_tool_calls_per_turn:
-                    messages.append(_error_result(tc, "per-turn tool-call budget exhausted — call submit_result now"))
-                    continue
-                key = compute_idempotency_key(run_id, node_id, tc.tool, tc.arguments)
-                result = await self._tools.execute(
-                    run_id=run_id, node_id=node_id, tool=tc.tool, arguments=tc.arguments, idempotency_key=key
-                )
-                recorded_tool_calls.append({"tool": tc.tool, "arguments": tc.arguments, "idempotency_key": key})
-                messages.append(ToolResultMessage(tool_call_id=tc.id, tool=tc.tool, content=result))
+            # No tool calls at all — nudge toward submit_result.
+            messages.append(UserMessage(text="Call submit_result now with your final output."))
+            tool_call_count += 1
 
 
 def _error_result(tc, message: str) -> ToolResultMessage:

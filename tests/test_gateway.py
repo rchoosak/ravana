@@ -285,8 +285,68 @@ def test_multi_call_response_is_capped_at_the_per_turn_budget(graph):
     )
     adapter = FakeAdapter(responses=[many, _submit({"requirement_clarity": "HIGH"})])
     gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=RecordingExec())
-    _run(gateway, "pm")
+    result = _run(gateway, "pm")
     assert len(executed) == cap  # exactly the budget fired; the surplus was refused
+    # P2a: the reported count is the EXECUTED count (== cap), not the inflated
+    # attempt count (cap + 2) — so the engine's post-turn guard won't fail a run
+    # the gateway already capped.
+    assert result.tool_call_count == cap
+
+
+def test_submit_alongside_tool_calls_defers_submit_and_runs_the_tool(graph):
+    # P2b: a response carrying BOTH a real tool call and submit_result must not
+    # accept the premature submit (the model hasn't seen the tool result yet) —
+    # the tool runs, the submit is deferred with an "ignored" notice, and the
+    # NEXT submit is honored. The real tool call must never be silently dropped.
+    executed: list[str] = []
+
+    class RecordingExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            executed.append(tool)
+            return "tool output"
+
+    adapter = FakeAdapter(
+        responses=[
+            ProviderResponse(
+                text="doing both",
+                tool_calls=[
+                    NormalizedToolCall(id="tc1", tool="web_search", arguments={"q": "x"}),
+                    NormalizedToolCall(id="tc2", tool=SUBMIT_RESULT, arguments={"requirement_clarity": "HIGH"}),
+                ],
+            ),
+            _submit({"requirement_clarity": "HIGH"}),
+        ]
+    )
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=RecordingExec())
+    result = _run(gateway, "pm")
+    assert executed == ["web_search"]  # the real tool ran; not dropped for the submit
+    assert len(adapter.requests) == 2  # the mixed turn did NOT return — submit was deferred
+    ignored = [m for m in adapter.requests[1].messages if m.role == "tool_result" and "submit_result ignored" in m.content]
+    assert ignored  # the model was told its premature submit was ignored
+    assert result.structured_payload == {"requirement_clarity": "HIGH"}
+
+
+def test_tool_execution_error_is_fed_back_not_raised(graph):
+    # A toolkit failing at execution is a normal agent-loop event, fed back as a
+    # tool error so the model can adapt — it must NOT crash the turn (which would
+    # escape the engine's transient-only catch and strand the run).
+    from ravana.runtime.toolkits.base import ToolkitError
+
+    class FailingExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            raise ToolkitError("remote 500")
+
+    adapter = FakeAdapter(
+        responses=[
+            ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="tc1", tool="web_search", arguments={})]),
+            _submit({"requirement_clarity": "HIGH"}),
+        ]
+    )
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=FailingExec())
+    result = _run(gateway, "pm")  # must not raise
+    tool_result = next(m for m in adapter.requests[1].messages if m.role == "tool_result")
+    assert "failed: remote 500" in tool_result.content
+    assert result.structured_payload == {"requirement_clarity": "HIGH"}
 
 
 def test_non_compliant_provider_that_never_submits_is_bounded(graph):

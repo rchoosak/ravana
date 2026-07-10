@@ -47,6 +47,31 @@ def test_implicit_terminal_node_completes_the_run(con):
     assert len(terminate_events) == 1
 
 
+def test_non_transient_turn_error_fails_the_run_cleanly(con):
+    """A non-transient error from run_turn (e.g. the gateway surfacing a
+    deferred toolkit, a submit_result-id collision, or an unexpected bug) must
+    land as a clean FAILED run + FAILED node_execution — never a crash that
+    strands the node in RUNNING. Only TransientAgentError is retried; everything
+    else is terminal."""
+    from ravana.runtime.toolkits.base import ToolkitError
+
+    class ExplodingRuntime:
+        async def run_turn(self, *, run_id, node_id, attempt, agent_id, shared_state):
+            raise ToolkitError("toolkit 'code_interpreter' is not executable in this build")
+
+    graph = compile_workflow(_single_node_workflow())
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+
+    # Must NOT raise out of start_run.
+    run_id = asyncio.run(start_run(con, graph, ExplodingRuntime(), org_id="test", workflow_id=workflow_id))
+
+    run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    ne = con.execute("SELECT * FROM node_execution WHERE run_id = ?", (run_id,)).fetchone()
+    assert ne["status"] == "FAILED"  # not stuck at RUNNING
+    assert "not executable" in ne["error"]
+
+
 def test_max_tool_calls_per_turn_guard_fails_the_run(con):
     graph = compile_workflow(_single_node_workflow())
     graph.doc.spec.graph.guards.max_tool_calls_per_turn = 2
