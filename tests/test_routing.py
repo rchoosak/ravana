@@ -82,13 +82,25 @@ def test_is_default_prevents_the_dead_end(con, sdlc_graph, sdlc_workflow_id):
     )
 
     run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
-    assert run["status"] == "COMPLETED"
+    # is_default routed qa_test -> pm_final_review, so the run reached the
+    # terminal rather than hitting the routing dead-end this test guards
+    # against. Its final status is FAILED (not COMPLETED) — but at the *DoD*
+    # gate, not the router: this scenario pins qa_status='FAIL' to force the
+    # loop-cap/default path, so definition_of_done's `state.qa_status == 'PASS'`
+    # is legitimately unmet. That's the DoD gate working, and it's distinct from
+    # a routing dead-end (which would carry a "no matching route" error).
+    assert run["status"] == "FAILED"
 
     default_route = con.execute(
         "SELECT * FROM state_transition_log WHERE run_id = ? AND event_type = 'ROUTE' AND from_node = 'qa_test' AND to_node = 'pm_final_review'",
         (run_id,),
     ).fetchall()
-    assert len(default_route) >= 1
+    assert len(default_route) >= 1  # the routing point this test exists to prove
+
+    dod_event = con.execute(
+        "SELECT result FROM state_transition_log WHERE run_id = ? AND event_type = 'DOD_EVALUATED'", (run_id,)
+    ).fetchone()
+    assert dod_event is not None and dod_event["result"] == 0  # failed at the DoD gate, not a dead-end
 
 
 def test_hitl_takes_priority_over_fail_fast(con, sdlc_graph, sdlc_workflow_id, sdlc_runtime):

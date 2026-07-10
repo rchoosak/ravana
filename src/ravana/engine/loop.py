@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ravana.compiler.graph import TERMINAL, CompiledGraph
+from ravana.engine.dod import ProseVerdict, evaluate_dod
 from ravana.engine.expr import apply_on_enter, eval_condition
 from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
@@ -46,6 +47,12 @@ class _RunCtx:
     queue: list[str] = field(default_factory=list)
     terminal_reached: bool = False
     failed: bool = False
+    # §3.1 step 7: optional judge for *prose* DoD criteria. When set, prose
+    # criteria are enforced at the Terminate gate; when None (the default), they
+    # stay advisory. This is the engine-level injection point so a caller (CLI,
+    # tests) can supply a real evaluated_by-agent verdict without the evaluator
+    # itself living in the engine.
+    dod_prose_verdict: ProseVerdict | None = None
 
     def load_shared_state(self) -> dict[str, Any]:
         return loads(_get_run(self.con, self.run_id)["shared_state"], {})
@@ -154,6 +161,7 @@ async def start_run(
     workflow_id: str,
     triggered_by: str | None = None,
     input_payload: dict[str, Any] | None = None,
+    dod_prose_verdict: ProseVerdict | None = None,
 ) -> str:
     input_payload = input_payload or {}
     run_id = new_id()
@@ -198,7 +206,10 @@ async def start_run(
     con.commit()
 
     if status == "RUNNING":
-        ctx = _RunCtx(con=con, graph=graph, run_id=run_id, org_id=org_id, workflow_id=workflow_id, runtime=runtime, queue=[graph.entry])
+        ctx = _RunCtx(
+            con=con, graph=graph, run_id=run_id, org_id=org_id, workflow_id=workflow_id,
+            runtime=runtime, queue=[graph.entry], dod_prose_verdict=dod_prose_verdict,
+        )
         await _drain_queue(ctx)
 
     return run_id
@@ -278,16 +289,50 @@ def _finalize_status(ctx: _RunCtx) -> None:
     if pending_hitl:
         new_status = "WAITING_HUMAN"
     elif ctx.terminal_reached:
-        new_status = "COMPLETED"
+        # §3.1 step 7: reaching a terminal is necessary but not sufficient — the
+        # run only COMPLETES if its definition_of_done is met, else it FAILs.
+        new_status = _dod_gate(ctx)
     else:
         # The queue drained with nothing pending and no __terminal__/implicit-terminal edge
         # ever fired — shouldn't happen given §3.1's fail-fast rule, but leave status as-is
         # rather than guess, so a genuine gap here is visible (stuck RUNNING) instead of
         # silently reported as either outcome.
         new_status = run["status"]
-    ended_at = now_iso() if new_status in ("COMPLETED",) else run["ended_at"]
+    ended_at = now_iso() if new_status in ("COMPLETED", "FAILED") else run["ended_at"]
     ctx.con.execute("UPDATE run SET status = ?, ended_at = ? WHERE id = ?", (new_status, ended_at, ctx.run_id))
     ctx.con.commit()
+
+
+def _dod_gate(ctx: _RunCtx) -> str:
+    """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
+    definition_of_done is met, else FAILs. Expression criteria are enforced
+    deterministically; prose criteria are recorded as unevaluated (advisory,
+    not gating) until an evaluator agent is wired. Records the outcome as a
+    DOD_EVALUATED event either way, so a completion always carries the DoD
+    evidence and a failure carries the unmet criteria."""
+    dod = ctx.graph.doc.spec.definition_of_done
+    if dod is None:
+        return "COMPLETED"
+    # The DoD evaluation can run an INJECTED prose verdict (an agent turn), and
+    # this gate executes in _finalize_status — outside _dispatch's failure
+    # boundary. A raising verdict must not escape and strand the run at RUNNING;
+    # fail closed (the DoD isn't demonstrably met) and record it.
+    try:
+        result = evaluate_dod(dod, ctx.load_shared_state(), prose_verdict=ctx.dod_prose_verdict)
+    except Exception as exc:  # noqa: BLE001
+        _log_event(ctx.con, ctx.run_id, None, "DOD_EVALUATED", result=False, condition_evaluated="; ".join(dod.criteria))
+        ctx.con.commit()
+        log_event("ERROR", f"run {ctx.run_id} DoD evaluation raised, failing the run: {exc}", run_id=ctx.run_id)
+        return "FAILED"
+    _log_event(
+        ctx.con, ctx.run_id, None, "DOD_EVALUATED",
+        result=result.met, condition_evaluated="; ".join(dod.criteria), state_diff=result.as_dict(),
+    )
+    ctx.con.commit()
+    if result.met:
+        return "COMPLETED"
+    log_event("ERROR", f"run {ctx.run_id} reached a terminal but its definition_of_done is not met: {result.unmet}", run_id=ctx.run_id)
+    return "FAILED"
 
 
 async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
@@ -535,6 +580,7 @@ async def resume_hitl(
     run_id: str,
     hitl_request_id: str,
     response: dict[str, Any],
+    dod_prose_verdict: ProseVerdict | None = None,
 ) -> None:
     """§3.1's corrected Resume: append the human's response to the message
     thread, then dispatch a brand-new node_execution attempt for the same
@@ -563,6 +609,6 @@ async def resume_hitl(
     run_row = _get_run(con, run_id)
     ctx = _RunCtx(
         con=con, graph=graph, run_id=run_id, org_id=run_row["org_id"], workflow_id=run_row["workflow_id"],
-        runtime=runtime, queue=[node_id],
+        runtime=runtime, queue=[node_id], dod_prose_verdict=dod_prose_verdict,
     )
     await _drain_queue(ctx)

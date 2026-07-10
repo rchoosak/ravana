@@ -12,6 +12,7 @@ workflow author to write Python.
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import Any
 
@@ -49,6 +50,24 @@ def eval_condition(expr: str, shared_state: dict[str, Any]) -> bool:
     evaluator = EvalWithCompoundTypes(names={"state": StateProxy(shared_state)})
     result = evaluator.eval(_translate(expr))
     return bool(result)
+
+
+def is_boolean_expression(expr: str) -> bool:
+    """Whether `expr` PARSES as a Python expression (after surface-syntax
+    translation) — used by the DoD evaluator (§3.1 step 7) to tell an
+    *expression* criterion from a *prose* sentence. Classification is by parse,
+    NOT by evaluation: a sentence like "All acceptance criteria are met" fails
+    to parse (adjacent bare words) and is prose, whereas a parseable expression
+    that merely ERRORS at evaluation (e.g. `state.count > 5` when the key is
+    unset, so `None > 5` raises) is still an expression — a failing one — not
+    prose. Evaluating-vs-parsing is the distinction that keeps a genuinely
+    unmet ordering/`in` criterion from being silently downgraded to advisory
+    prose."""
+    try:
+        ast.parse(_translate(expr), mode="eval")
+        return True
+    except SyntaxError:
+        return False
 
 
 _ON_ENTER_RE = re.compile(r"^\s*state\.(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<op>\+=|-=|=)\s*(?P<rhs>.+)$")
