@@ -310,7 +310,8 @@ class LLMGateway:
             input_tokens += response.input_tokens
             output_tokens += response.output_tokens
 
-            submit = next((tc for tc in response.tool_calls if tc.tool == SUBMIT_RESULT), None)
+            submit_calls = [tc for tc in response.tool_calls if tc.tool == SUBMIT_RESULT]
+            submit = submit_calls[0] if submit_calls else None
             other_calls = [tc for tc in response.tool_calls if tc.tool != SUBMIT_RESULT]
 
             # Real tool calls take precedence over a co-occurring submit_result.
@@ -353,10 +354,13 @@ class LLMGateway:
                         continue
                     recorded_tool_calls.append({"tool": tc.tool, "arguments": tc.arguments, "idempotency_key": key})
                     messages.append(ToolResultMessage(tool_call_id=tc.id, tool=tc.tool, content=result))
-                if submit is not None:
-                    # submit rode along with tool calls; its tool_use still needs
-                    # a tool_result, and we won't honor a premature submit.
-                    messages.append(_error_result(submit, "submit_result ignored: you still had pending tool calls; submit again after reviewing their results"))
+                # EVERY submit_result that rode along (a provider can emit more
+                # than one) needs a matching tool_result, or the transcript is
+                # unbalanced and a strict provider (OpenAI) rejects the next
+                # request. We won't honor a premature submit — feed each an
+                # "ignored" result.
+                for sc in submit_calls:
+                    messages.append(_error_result(sc, "submit_result ignored: you still had pending tool calls; submit again after reviewing their results"))
                 continue
 
             if submit is not None:

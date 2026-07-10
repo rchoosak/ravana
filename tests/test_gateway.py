@@ -326,6 +326,34 @@ def test_submit_alongside_tool_calls_defers_submit_and_runs_the_tool(graph):
     assert result.structured_payload == {"requirement_clarity": "HIGH"}
 
 
+def test_multiple_mixed_submit_results_keep_the_transcript_balanced(graph):
+    # A provider can emit more than one submit_result alongside a real tool
+    # call. EVERY tool_use in the recorded assistant turn must get a matching
+    # tool_result, or a strict provider rejects the next request. (Earlier only
+    # the first submit_result was answered, leaving orphan tool_use blocks.)
+    class RecordingExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            return "tool output"
+
+    mixed = ProviderResponse(
+        text="both, twice",
+        tool_calls=[
+            NormalizedToolCall(id="tc1", tool="web_search", arguments={"q": "x"}),
+            NormalizedToolCall(id="tc2", tool=SUBMIT_RESULT, arguments={"requirement_clarity": "HIGH"}),
+            NormalizedToolCall(id="tc3", tool=SUBMIT_RESULT, arguments={"requirement_clarity": "LOW"}),
+        ],
+    )
+    adapter = FakeAdapter(responses=[mixed, _submit({"requirement_clarity": "HIGH"})])
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=RecordingExec())
+    _run(gateway, "pm")
+
+    second = adapter.requests[1].messages
+    assistant = next(m for m in second if m.role == "assistant")
+    tool_use_ids = {tc.id for tc in assistant.tool_calls}
+    answered_ids = {m.tool_call_id for m in second if m.role == "tool_result"}
+    assert tool_use_ids <= answered_ids  # every tool_use (incl. both submits) has a result
+
+
 def test_tool_execution_error_is_fed_back_not_raised(graph):
     # A toolkit failing at execution is a normal agent-loop event, fed back as a
     # tool error so the model can adapt — it must NOT crash the turn (which would
