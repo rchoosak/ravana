@@ -22,6 +22,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from ravana.runtime.providers.base import Tool
 from ravana.runtime.schema_validate import validate_json
 from ravana.runtime.toolkits.base import ToolkitError, ToolkitHandler
 from ravana.schema.util import now_iso
@@ -31,6 +32,20 @@ class RavanaToolExecutor:
     def __init__(self, con: sqlite3.Connection, handlers: dict[str, ToolkitHandler]):
         self._con = con
         self._handlers = handlers
+
+    def tools_for(self, toolkit_ids: list[str]) -> list[Tool]:
+        """The callable-tool specs (name/description/input_schema) the gateway
+        offers the model for an agent, one per declared toolkit id. The
+        compiler already rejects an agent referencing an unknown toolkit, so a
+        missing handler here would be an internal bug — surface it loudly
+        rather than silently dropping a tool the agent expects to have."""
+        tools: list[Tool] = []
+        for tid in toolkit_ids:
+            handler = self._handlers.get(tid)
+            if handler is None:
+                raise ToolkitError(f"agent references toolkit '{tid}' with no registered handler")
+            tools.append(Tool(name=tid, description=handler.description, input_schema=handler.input_schema))
+        return tools
 
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str

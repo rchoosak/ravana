@@ -60,8 +60,8 @@ _ANY_OBJECT_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": 
 
 class ToolExecutor(Protocol):
     """Executes a real (non-submit_result) tool call and returns a result
-    string to feed back into the turn. Toolkits (§1.7) implement this in the
-    next slice; Phase 0b's gateway slice injects a no-op/fake.
+    string to feed back into the turn, and describes an agent's toolkits as
+    callable-tool specs the gateway surfaces to the model.
 
     `idempotency_key` is the content-addressed key from §3.6, computed by the
     gateway and passed in **before** execution — a side-effecting connector
@@ -69,18 +69,27 @@ class ToolExecutor(Protocol):
     has the key at execution time, not after. The engine's later persistence
     of the same key into message.tool_calls (loop.py) uses this same value."""
 
+    def tools_for(self, toolkit_ids: list[str]) -> list[Tool]: ...
+
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str
     ) -> str: ...
 
 
 class _NoToolExecutor:
+    """The default when no real executor is injected (the gateway's own test
+    fakes, or a run with no toolkits): it surfaces no tools, so the turn is
+    submit_result-only, and any tool call is a hard error."""
+
+    def tools_for(self, toolkit_ids: list[str]) -> list[Tool]:
+        return []
+
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str
     ) -> str:
         raise ProviderError(
             f"agent tried to call tool '{tool}' but no ToolExecutor is wired "
-            "(toolkits are the next Phase 0b slice)"
+            "(no toolkits are available to this run)"
         )
 
 
@@ -195,17 +204,18 @@ class LLMGateway:
     ) -> AgentTurnResult:
         adapter = self._adapter_for(llm.provider)
         strategy = self._strategy_for(adapter, llm.model)
-        if strategy.use_guided:
-            # Guided decoding constrains the *entire* response to the schema,
-            # so the payload arrives as JSON in the message text (not a
-            # submit_result tool call) and there's no intermediate tool loop —
-            # a guided completion is one-shot by construction. This is the read
-            # path the earlier code lacked: it waited for a submit_result tool
-            # even under guided decoding, so a real guided runtime's schema
-            # JSON would have looked like "no tool call".
+        # Guided decoding constrains the *entire* response to the output schema,
+        # so the payload arrives as JSON in the message text (not a
+        # submit_result tool call) and it's one-shot by construction — but that
+        # also means the model can't emit tool calls under it. So the guided
+        # one-shot path is only usable when the agent has NO toolkits; an agent
+        # WITH toolkits must run the tool loop (submit_result forces structure
+        # at the end), even on a guided-capable provider. Otherwise a guided
+        # agent would silently never see its tools.
+        if strategy.use_guided and not agent.toolkits:
             return await self._run_guided(node_id=node_id, llm=llm, adapter=adapter, system=system, output_schema=output_schema)
         return await self._run_tool_loop(
-            run_id=run_id, node_id=node_id, llm=llm, adapter=adapter, system=system, output_schema=output_schema
+            run_id=run_id, node_id=node_id, agent=agent, llm=llm, adapter=adapter, system=system, output_schema=output_schema
         )
 
     async def _run_guided(self, *, node_id, llm, adapter, system, output_schema):
@@ -233,20 +243,48 @@ class LLMGateway:
             repair_count += 1
             messages.append(UserMessage(text=f"That output was invalid: {error}. Return valid JSON matching the schema."))
 
-    async def _run_tool_loop(self, *, run_id, node_id, llm, adapter, system, output_schema):
+    async def _run_tool_loop(self, *, run_id, node_id, agent, llm, adapter, system, output_schema):
         guards = self._graph.doc.spec.graph.guards
+        # §3.4.4: the agent's real toolkits are offered as callable tools
+        # (name = toolkit id), plus the synthetic submit_result the turn
+        # terminates on. A toolkit named submit_result would shadow that
+        # terminator, so reject the collision loudly.
+        agent_tools = self._tools.tools_for(agent.toolkits)
+        if any(t.name == SUBMIT_RESULT for t in agent_tools):
+            # A config bug, not a transient fault — raise something the fallback
+            # loop (which only retries ProviderError) won't mask as retryable,
+            # so it surfaces immediately. A compile-time reserved-id check is a
+            # cleaner future home for this.
+            raise ValueError(f"toolkit id '{SUBMIT_RESULT}' collides with the reserved submit tool")
         submit_tool = Tool(
             name=SUBMIT_RESULT,
             description="Call this exactly once, when done, to submit your final structured result.",
             input_schema=output_schema,
         )
+        offered_tools = [*agent_tools, submit_tool]
         messages: list[Message] = [
             UserMessage(text="Complete your task, then call submit_result with your structured output.")
         ]
         tool_call_count = repair_count = input_tokens = output_tokens = 0
         recorded_tool_calls: list[dict[str, Any]] = []
 
+        # Absolute ceiling on model round-trips. Forcing submit_result at budget
+        # exhaustion terminates the turn for a *cooperative* provider, but a
+        # non-compliant one (a local runtime that ignores tool_choice, say)
+        # could keep answering without ever submitting — so bound the loop
+        # itself. The ceiling clears every legitimate path: up to
+        # max_tool_calls_per_turn tool round-trips, the forced-submit turn, and
+        # up to max_output_repairs repairs, plus slack.
+        max_model_calls = guards.max_tool_calls_per_turn + guards.max_output_repairs + 2
+        model_calls = 0
+
         while True:
+            if model_calls >= max_model_calls:
+                raise TransientAgentError(
+                    f"node '{node_id}' did not produce a valid submit_result within {max_model_calls} model turns "
+                    f"(provider ignored the forced submit?)"
+                )
+            model_calls += 1
             # §3.4.4: submit_result is offered as a tool and the prompt asks the
             # model to call it, but tool_choice is force-set to it ONLY once the
             # tool budget is spent — forcing every turn would drop the model's
@@ -257,7 +295,7 @@ class LLMGateway:
                 model=llm.model,
                 system=system,
                 messages=messages,
-                tools=[submit_tool],
+                tools=offered_tools,
                 force_tool=SUBMIT_RESULT if force_submit else None,
                 temperature=llm.temperature,
                 max_tokens=llm.max_tokens,

@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+import yaml
+
 from ravana.compiler.graph import compile_workflow
 from ravana.runtime.base import TransientAgentError
 from ravana.runtime.gateway import SUBMIT_RESULT, LLMGateway
@@ -21,9 +23,50 @@ from ravana.runtime.providers.base import (
     ProviderError,
     ProviderRequest,
     ProviderResponse,
+    Tool,
 )
 from ravana.schema.loader import load_workflow_yaml
+from ravana.schema.models import WorkflowDoc
 from tests.conftest import SDLC_WORKFLOW
+
+
+class _SurfacingExec:
+    """Base for tool-executor fakes: surfaces one Tool per declared toolkit id,
+    mirroring RavanaToolExecutor.tools_for so the gateway can offer them. Fakes
+    add their own execute()."""
+
+    def tools_for(self, toolkit_ids):
+        return [Tool(name=t, description=f"fake {t}", input_schema={"type": "object"}) for t in toolkit_ids]
+
+
+# A minimal single-agent workflow whose agent declares NO toolkits — used to
+# exercise the one-shot guided path, which is only taken for toolkit-free
+# agents (an agent WITH toolkits must run the tool loop instead).
+_GUIDED_MIN_WORKFLOW = """
+apiVersion: ravana/v1
+kind: Workflow
+metadata: { name: guided-min }
+spec:
+  agents:
+    - id: solo
+      name: Solo
+      llm: { provider: local, model: local-model }
+      system_prompt: "Return structured output."
+      output_schema:
+        type: object
+        properties: { system_spec: { type: object } }
+        required: [system_spec]
+        additionalProperties: false
+  graph:
+    entry: n
+    nodes: [{ id: n, agent: solo }]
+    edges: []
+"""
+
+
+@pytest.fixture
+def guided_graph():
+    return compile_workflow(WorkflowDoc.model_validate(yaml.safe_load(_GUIDED_MIN_WORKFLOW)))
 
 
 @dataclass
@@ -117,7 +160,7 @@ def test_budget_exhaustion_forces_submit_result(graph):
     guards = graph.doc.spec.graph.guards
     cap = guards.max_tool_calls_per_turn
 
-    class LoopExec:
+    class LoopExec(_SurfacingExec):
         async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
             return "keep going"
 
@@ -133,26 +176,89 @@ def test_budget_exhaustion_forces_submit_result(graph):
     assert any(r.force_tool == SUBMIT_RESULT for r in adapter.requests)
 
 
-def test_guided_provider_reads_schema_json_from_text(graph):
+def test_guided_provider_reads_schema_json_from_text(guided_graph):
     # A guided-capable local model (strongest tier) gets output_schema passed
     # for grammar-constrained decoding, is NOT sent a submit_result tool, and
-    # its schema JSON is read from message text — not from a tool call.
+    # its schema JSON is read from message text — not from a tool call. The
+    # guided one-shot path is only valid for a toolkit-free agent, so this uses
+    # the minimal single-agent graph (see test_guided_agent_with_toolkits_*).
     adapter = FakeAdapter(
         caps={Capability.GUIDED_DECODING, Capability.NATIVE_STRUCTURED_OUTPUT},
         responses=[_guided_text({"system_spec": {"stack": "python"}})],
     )
-    gateway = LLMGateway(graph, {"local": adapter})
-    result = _run(gateway, "dev")  # dev is provider: local
+    gateway = LLMGateway(guided_graph, {"local": adapter})
+    result = _run(gateway, "solo")
     assert adapter.requests[0].output_schema is not None
     assert adapter.requests[0].force_tool is None
     assert adapter.requests[0].tools == []  # no submit_result tool in the guided path
     assert result.structured_payload == {"system_spec": {"stack": "python"}}
 
 
+def test_guided_agent_with_toolkits_uses_tool_loop_not_guided(graph):
+    # dev is on a guided-capable provider AND has toolkits. Guided one-shot
+    # can't express tool calls, so the gateway MUST run the tool loop instead —
+    # offering submit_result (not the guided read path). Otherwise dev would
+    # silently never see its tools.
+    adapter = FakeAdapter(
+        caps={Capability.GUIDED_DECODING, Capability.NATIVE_STRUCTURED_OUTPUT},
+        responses=[_submit({"system_spec": {}})],
+    )
+    gateway = LLMGateway(graph, {"local": adapter}, tool_executor=_SurfacingExec())
+    result = _run(gateway, "dev")
+    offered = {t.name for t in adapter.requests[0].tools}
+    assert SUBMIT_RESULT in offered  # tool loop, not the guided one-shot
+    assert {"code_interpreter", "git_connector"} <= offered  # dev's toolkits surfaced
+    assert result.structured_payload == {"system_spec": {}}
+
+
+def test_agent_toolkits_offered_alongside_submit_result(graph):
+    # pm (anthropic, native forced-tool) declares toolkits=[web_search]; the
+    # gateway must offer web_search AND submit_result to the model.
+    adapter = FakeAdapter(responses=[_submit({"requirement_clarity": "HIGH"})])
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=_SurfacingExec())
+    _run(gateway, "pm")
+    offered = {t.name for t in adapter.requests[0].tools}
+    assert offered == {"web_search", SUBMIT_RESULT}
+
+
+def test_no_tool_executor_offers_only_submit_result(graph):
+    # Without a real executor, _NoToolExecutor surfaces no tools — the turn is
+    # submit_result-only even for an agent that declares toolkits.
+    adapter = FakeAdapter(responses=[_submit({"requirement_clarity": "HIGH"})])
+    gateway = LLMGateway(graph, {"anthropic": adapter})  # default _NoToolExecutor
+    _run(gateway, "pm")
+    assert [t.name for t in adapter.requests[0].tools] == [SUBMIT_RESULT]
+
+
+def test_toolkit_id_colliding_with_submit_result_is_rejected(graph):
+    class Collide(_SurfacingExec):
+        def tools_for(self, toolkit_ids):
+            return [Tool(name=SUBMIT_RESULT, description="x", input_schema={"type": "object"})]
+
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            return "x"
+
+    adapter = FakeAdapter(responses=[_submit({"requirement_clarity": "HIGH"})])
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=Collide())
+    with pytest.raises(ValueError, match="collides with the reserved submit tool"):
+        _run(gateway, "pm")
+
+
+def test_non_compliant_provider_that_never_submits_is_bounded(graph):
+    # A provider that keeps answering with text and never submits (ignoring the
+    # forced submit_result) must NOT loop forever — the gateway bounds total
+    # model round-trips and fails the turn.
+    never_submits = ProviderResponse(text="still thinking, no tool call", tool_calls=[])
+    adapter = FakeAdapter(responses=[never_submits])  # returned repeatedly
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=_SurfacingExec())
+    with pytest.raises(TransientAgentError, match="did not produce a valid submit_result"):
+        _run(gateway, "pm")
+
+
 def test_within_turn_tool_loop_then_submit(graph):
     seen: list[tuple[str, str]] = []
 
-    class Exec:
+    class Exec(_SurfacingExec):
         async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
             # §3.6: the key is present at execution time so a side-effecting
             # connector can dedupe — recording it here proves it arrived before
@@ -185,7 +291,7 @@ def test_second_model_turn_sees_normalized_transcript(graph):
     # assistant's tool_calls turn and (b) the tool_result — normalized shapes
     # the adapter later translates per-provider. Without the assistant turn,
     # real OpenAI rejects the tool result (P2 finding).
-    class Exec:
+    class Exec(_SurfacingExec):
         async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
             return "result-text"
 

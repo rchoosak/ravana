@@ -52,6 +52,11 @@ class ApiConnectorHandler:
         self._base_url = config.get("base_url")
         if not self._base_url:
             raise ToolkitError("api_connector requires config.base_url")
+        self.description = (
+            f"Make an HTTP request to the API at {self._base_url}. Set 'method' and a "
+            "base_url-relative 'path' (must start with '/'; absolute URLs are rejected). "
+            "Optional 'json' body and 'params' query."
+        )
         # A provider the runtime injects (§8c): returns an already-resolved
         # token at dispatch. The connector never holds the auth_ref or resolver.
         self._get_auth_token = get_auth_token
