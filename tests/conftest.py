@@ -16,6 +16,24 @@ SDLC_WORKFLOW = REPO_ROOT / "examples" / "workflows" / "software-development-tea
 SDLC_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "sdlc_mock_responses.yaml"
 
 
+class RecordingSleep:
+    """asyncio.sleep-shaped fake for §3.6 backoff: records each requested
+    delay instead of actually waiting, so retry tests stay instant."""
+
+    def __init__(self):
+        self.delays: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.delays.append(seconds)
+
+    def assert_delays(self, *exponentials: float) -> None:
+        """Assert one recorded delay per expected exponential, each within its
+        equal-jitter band [exp/2, exp] — the shared §3.6 bound check."""
+        assert len(self.delays) == len(exponentials), f"expected {len(exponentials)} backoffs, got {self.delays}"
+        for delay, exp in zip(self.delays, exponentials):
+            assert exp / 2 <= delay <= exp, f"delay {delay} outside equal-jitter band [{exp / 2}, {exp}]"
+
+
 @pytest.fixture
 def con() -> sqlite3.Connection:
     return init_db(":memory:")

@@ -9,6 +9,7 @@ import asyncio
 from ravana.engine.loop import resume_hitl, start_run
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.schema.util import loads
+from tests.conftest import RecordingSleep
 
 
 def test_full_sdlc_run_reaches_completed(con, sdlc_graph, sdlc_workflow_id, sdlc_runtime):
@@ -102,7 +103,7 @@ def test_max_total_steps_guard_fails_a_runaway_run(con, sdlc_graph, sdlc_workflo
 
 def test_transient_failure_retries_then_succeeds(con, sdlc_graph, sdlc_workflow_id):
     """§3.6: a transient failure gets retried (new node_execution attempt,
-    exponential backoff in a real implementation) up to max_retries_per_node,
+    with exponential backoff before the retry) up to max_retries_per_node,
     rather than failing the run on the first hiccup."""
     fixture = {
         "pm_intake": [
@@ -115,8 +116,13 @@ def test_transient_failure_retries_then_succeeds(con, sdlc_graph, sdlc_workflow_
         "pm_final_review": [{"structured_payload": {"pm_verdict": "COMPLETE"}}],
     }
     runtime = MockAgentRuntime(fixture)
+    sleeper = RecordingSleep()
+
     run_id = asyncio.run(
-        start_run(con, sdlc_graph, runtime, org_id="test", workflow_id=sdlc_workflow_id, input_payload={"repository": "r"})
+        start_run(
+            con, sdlc_graph, runtime, org_id="test", workflow_id=sdlc_workflow_id,
+            input_payload={"repository": "r"}, retry_sleep=sleeper,
+        )
     )
     run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
     assert run["status"] == "COMPLETED"
@@ -127,3 +133,6 @@ def test_transient_failure_retries_then_succeeds(con, sdlc_graph, sdlc_workflow_
     ).fetchall()
     assert pm_attempts[0]["status"] == "FAILED"
     assert pm_attempts[1]["status"] == "SUCCEEDED"
+    # §3.6: the retry backed off once (first-failure band around base=1s),
+    # instead of re-dispatching immediately.
+    sleeper.assert_delays(1.0)

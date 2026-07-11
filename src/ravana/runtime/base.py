@@ -30,6 +30,16 @@ class TransientAgentError(Exception):
     as opposed to a hard failure."""
 
 
+class AgentOutputError(Exception):
+    """The model exhausted its repair budget without producing valid
+    structured output (or blew the bounded-turn ceiling without submitting).
+    §3.6 classifies this as NON-transient — `node_execution.status = FAILED →
+    run.status = FAILED`, immediately — because re-running the node just
+    re-asks the same model the same question past a budget that already
+    expired: it would spend `max_retries_per_node` and call the model beyond
+    `max_output_repairs`. Deliberately NOT a TransientAgentError."""
+
+
 class AgentRuntime(Protocol):
     async def run_turn(
         self,

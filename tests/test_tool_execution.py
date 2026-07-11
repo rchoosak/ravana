@@ -13,7 +13,7 @@ import pytest
 from ravana.compiler.graph import compile_workflow
 from ravana.runtime.secrets import EnvSecretResolver, SecretNotFound
 from ravana.runtime.tool_executor import RavanaToolExecutor
-from ravana.runtime.toolkits.base import ToolkitError
+from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.loader import load_workflow_yaml
 from ravana.schema.util import now_iso
@@ -214,6 +214,104 @@ def test_api_connector_raises_on_http_error(graph):
     resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
     handlers = build_registry(graph, resolver, clients={"git_connector": fake})
     with pytest.raises(ToolkitError, match="HTTP 500"):
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+
+
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [
+        (500, ToolFailureKind.TRANSIENT),  # server error: §3.6 transient
+        (503, ToolFailureKind.TRANSIENT),
+        (429, ToolFailureKind.TRANSIENT),  # rate limit
+        (408, ToolFailureKind.TRANSIENT),  # request timeout
+        (404, ToolFailureKind.MODEL_ADDRESSABLE),  # the model can fix its path
+        (422, ToolFailureKind.MODEL_ADDRESSABLE),
+        (401, ToolFailureKind.FATAL),  # §3.6 "tool auth failure": non-transient
+        (403, ToolFailureKind.FATAL),
+    ],
+)
+def test_api_connector_classifies_http_failures(graph, status, kind):
+    # §3.6 taxonomy on tool failures: transient (retry attempt w/ backoff),
+    # fatal (auth — fails the run), or model-addressable (fed back).
+    fake = FakeHttpClient(FakeResponse(status, {"error": "x"}))
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": fake})
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    assert exc_info.value.kind is kind
+
+
+def test_api_connector_transport_failure_is_transient(graph):
+    # A connection-level failure (reset/timeout) is §3.6's "tool timeout" —
+    # transient, so the engine retries the attempt with backoff.
+    class ExplodingClient:
+        async def request(self, *args, **kwargs):
+            raise OSError("connection reset by peer")
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": ExplodingClient()})
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    assert exc_info.value.kind is ToolFailureKind.TRANSIENT
+
+
+def test_api_connector_httpx_timeout_is_transient(graph):
+    # httpx's own exceptions don't subclass OSError — the transport check must
+    # cover the httpx hierarchy too.
+    import httpx
+
+    class TimeoutClient:
+        async def request(self, *args, **kwargs):
+            raise httpx.ReadTimeout("read timed out")
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": TimeoutClient()})
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    assert exc_info.value.kind is ToolFailureKind.TRANSIENT
+
+
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [
+        (401, ToolFailureKind.FATAL),  # review probe: was blanket-TRANSIENT via httpx.HTTPError
+        (403, ToolFailureKind.FATAL),
+        (500, ToolFailureKind.TRANSIENT),
+        (404, ToolFailureKind.MODEL_ADDRESSABLE),
+    ],
+)
+def test_api_connector_raise_for_status_client_routes_by_status(graph, status, kind):
+    # A client configured to raise_for_status() surfaces HTTP errors as
+    # httpx.HTTPStatusError EXCEPTIONS instead of returned responses. These
+    # must route by their response status (§3.6) — a 401 is FATAL, never a
+    # backed-off transient retry. (No network: exceptions built directly.)
+    import httpx
+
+    class RaiseForStatusClient:
+        async def request(self, method, path, **kwargs):
+            request = httpx.Request(method, f"http://api.test{path}")
+            response = httpx.Response(status, request=request)
+            raise httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": RaiseForStatusClient()})
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    assert exc_info.value.kind is kind
+
+
+def test_api_connector_programming_bug_propagates_raw_not_transient(graph):
+    # Review finding: the transport catch was `except Exception`, so a
+    # TypeError from a programming/config bug was classified TRANSIENT and the
+    # engine retried broken code with backoff. A non-transport exception now
+    # propagates raw — the engine's terminal boundary fails the run hard.
+    class BuggyClient:
+        async def request(self, *args, **kwargs):
+            raise TypeError("request() got an unexpected keyword argument")
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": BuggyClient()})
+    with pytest.raises(TypeError):  # NOT ToolkitError — no wrong-type transient retry
         asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
 
 

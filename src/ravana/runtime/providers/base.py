@@ -97,8 +97,55 @@ class ProviderResponse:
 
 
 class ProviderError(Exception):
-    """Non-transient provider failure (auth, invalid request). The gateway
-    does not retry these — it moves to the next fallback entry (§3.6)."""
+    """A provider call failed. `retryable` is the §3.6 taxonomy split the
+    gateway acts on:
+
+      - retryable=True (429/5xx/timeouts/connection blips): retrying the SAME
+        entry after a backoff can plausibly succeed — the gateway spends its
+        per-entry retry, then moves down the fallback chain.
+      - retryable=False (auth 401/403, invalid request 400/422, model 404):
+        retrying the same entry cannot succeed; the gateway skips the
+        same-entry retry (and its backoff sleep) and goes straight to the next
+        fallback entry — a different provider/model may well work.
+
+    When EVERY entry in the chain failed permanently, the turn error is not
+    transient at all: the gateway raises a hard error the engine fails the run
+    on immediately, instead of TransientAgentError (which would burn
+    max_retries_per_node re-running a hopeless chain)."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+# HTTP statuses where a retry of the same endpoint can plausibly succeed:
+# timeout, contention, rate limit, server-side failure.
+_RETRYABLE_STATUSES = frozenset({408, 409, 429})
+
+# Builtin exception types that signal a programming/config error (a missing
+# credential surfaces as the SDK's TypeError/ValueError, not an HTTP status) —
+# a retry re-executes the same broken code/config and cannot succeed.
+_PERMANENT_EXC_TYPES = (TypeError, ValueError, KeyError, AttributeError)
+
+
+def classify_retryable(exc: Exception) -> bool:
+    """Whether a provider SDK exception is worth retrying at the same entry.
+    Both the anthropic and openai SDKs expose `status_code` on their API error
+    types, so status decides when present. Without a status: a builtin
+    programming/config error (e.g. the anthropic SDK's TypeError for a missing
+    credential) is permanent — retrying re-runs the same broken config — while
+    anything else (connection reset, timeout, unknown SDK error) is retryable,
+    an availability bias for genuinely flaky networks."""
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status in _RETRYABLE_STATUSES or status >= 500
+    return not isinstance(exc, _PERMANENT_EXC_TYPES)
+
+
+def to_provider_error(prefix: str, exc: Exception, *, retryable: bool | None = None) -> ProviderError:
+    """The one place an SDK exception becomes a normalized, classified
+    ProviderError — both adapters call this instead of hand-rolling the wrap."""
+    return ProviderError(f"{prefix}: {exc}", retryable=classify_retryable(exc) if retryable is None else retryable)
 
 
 class ProviderAdapter(Protocol):

@@ -18,6 +18,7 @@ differs.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -29,11 +30,19 @@ from ravana.engine.expr import apply_on_enter, eval_condition
 from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
 from ravana.observability.logging import log_event
+from ravana.runtime.backoff import RetrySleep, backoff_delay
 from ravana.runtime.base import AgentRuntime, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.schema.util import dumps, loads, new_id, now_iso
 
 _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
+
+# §3.6 backoff shape for the per-node transient retry. Module constants, not
+# guards fields: §4's guards schema governs *budgets* (how many), not timing —
+# making timing configurable is unwarranted surface until a real workflow
+# needs it.
+_NODE_RETRY_BASE_SECONDS = 1.0
+_NODE_RETRY_CAP_SECONDS = 30.0
 
 
 @dataclass
@@ -53,6 +62,9 @@ class _RunCtx:
     # tests) can supply a real evaluated_by-agent verdict without the evaluator
     # itself living in the engine.
     dod_prose_verdict: ProseVerdict | None = None
+    # §3.6: how a transient-retry backoff actually waits. Real runs sleep;
+    # tests inject a recorder so the suite doesn't spend wall-clock time.
+    retry_sleep: RetrySleep = asyncio.sleep
 
     def load_shared_state(self) -> dict[str, Any]:
         return loads(_get_run(self.con, self.run_id)["shared_state"], {})
@@ -162,6 +174,7 @@ async def start_run(
     triggered_by: str | None = None,
     input_payload: dict[str, Any] | None = None,
     dod_prose_verdict: ProseVerdict | None = None,
+    retry_sleep: RetrySleep = asyncio.sleep,
 ) -> str:
     input_payload = input_payload or {}
     run_id = new_id()
@@ -209,6 +222,7 @@ async def start_run(
         ctx = _RunCtx(
             con=con, graph=graph, run_id=run_id, org_id=org_id, workflow_id=workflow_id,
             runtime=runtime, queue=[graph.entry], dod_prose_verdict=dod_prose_verdict,
+            retry_sleep=retry_sleep,
         )
         await _drain_queue(ctx)
 
@@ -382,7 +396,27 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
             (str(exc), now_iso(), node_execution_id),
         )
         con.commit()
-        ctx.queue.insert(0, node_id)  # retried immediately; _consecutive_failures bounds this via max_retries_per_node
+        # §3.6: exponential backoff before the retry, keyed on the CONSECUTIVE
+        # failure streak (1st failure ~base, doubling, capped) — the same
+        # counter that bounds retries. NOT the node's lifetime `attempt`
+        # number: a node re-entered by a §3.7 loop or a HITL resume has
+        # SUCCEEDED rows inflating `attempt`, and its first transient failure
+        # must back off ~base, not near the cap.
+        failed_streak = consecutive_failures + 1  # +1 = the failure that just happened
+        if failed_streak > guards.max_retries_per_node:
+            # Budget already spent: the re-queued dispatch will trip the
+            # max_retries_per_node guard without running a turn, so sleeping
+            # here would only delay the inevitable FAILED verdict.
+            ctx.queue.insert(0, node_id)
+            return
+        delay = backoff_delay(failed_streak, base=_NODE_RETRY_BASE_SECONDS, cap=_NODE_RETRY_CAP_SECONDS)
+        log_event(
+            "WARN",
+            f"transient failure on node '{node_id}' ({failed_streak} consecutive), retrying in {delay:.1f}s: {exc}",
+            run_id=ctx.run_id,
+        )
+        await ctx.retry_sleep(delay)
+        ctx.queue.insert(0, node_id)
         return
     except Exception as exc:  # noqa: BLE001
         # Any NON-transient turn failure (a deferred/unknown toolkit surfaced by
@@ -581,6 +615,7 @@ async def resume_hitl(
     hitl_request_id: str,
     response: dict[str, Any],
     dod_prose_verdict: ProseVerdict | None = None,
+    retry_sleep: RetrySleep = asyncio.sleep,
 ) -> None:
     """§3.1's corrected Resume: append the human's response to the message
     thread, then dispatch a brand-new node_execution attempt for the same
@@ -609,6 +644,6 @@ async def resume_hitl(
     run_row = _get_run(con, run_id)
     ctx = _RunCtx(
         con=con, graph=graph, run_id=run_id, org_id=run_row["org_id"], workflow_id=run_row["workflow_id"],
-        runtime=runtime, queue=[node_id], dod_prose_verdict=dod_prose_verdict,
+        runtime=runtime, queue=[node_id], dod_prose_verdict=dod_prose_verdict, retry_sleep=retry_sleep,
     )
     await _drain_queue(ctx)

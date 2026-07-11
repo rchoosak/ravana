@@ -1,7 +1,10 @@
-"""LLM Gateway tests — all against fake provider adapters, so nothing here
-touches the network or needs an API key. Covers §3.4's strategy selection,
-the submit_result contract, the within-turn tool loop, the repair loop,
-§3.6's fallback chain, and §1.4's temperature normalization.
+"""LLM Gateway tests. Nothing here touches the network or needs an API key:
+most tests script fake provider adapters, while the credential/SDK-boundary
+probes use the REAL OpenAI/Anthropic adapter classes with only the SDK-client
+constructor patched or failing before any request is built. Covers §3.4's
+strategy selection, the submit_result contract, the within-turn tool loop,
+the repair loop, §3.6's fallback chain + error taxonomy, and §1.4's
+temperature normalization.
 """
 
 from __future__ import annotations
@@ -15,7 +18,9 @@ import pytest
 import yaml
 
 from ravana.compiler.graph import compile_workflow
-from ravana.runtime.base import TransientAgentError
+from ravana.compiler.persist import get_or_create_workflow
+from ravana.engine.loop import start_run
+from ravana.runtime.base import AgentOutputError, TransientAgentError
 from ravana.runtime.gateway import SUBMIT_RESULT, LLMGateway
 from ravana.runtime.providers.base import (
     Capability,
@@ -27,7 +32,7 @@ from ravana.runtime.providers.base import (
 )
 from ravana.schema.loader import load_workflow_yaml
 from ravana.schema.models import WorkflowDoc
-from tests.conftest import SDLC_WORKFLOW
+from tests.conftest import SDLC_WORKFLOW, RecordingSleep
 
 
 class _SurfacingExec:
@@ -37,6 +42,8 @@ class _SurfacingExec:
 
     def tools_for(self, toolkit_ids):
         return [Tool(name=t, description=f"fake {t}", input_schema={"type": "object"}) for t in toolkit_ids]
+
+
 
 
 # A minimal single-agent workflow whose agent declares NO toolkits — used to
@@ -79,6 +86,7 @@ class FakeAdapter:
     caps: set[Capability] = field(default_factory=lambda: {Capability.NATIVE_STRUCTURED_OUTPUT})
     responses: list[ProviderResponse] = field(default_factory=list)
     fail: bool = False
+    fail_retryable: bool = True  # False = permanent failure (auth/bad-request shaped)
     requests: list[ProviderRequest] = field(default_factory=list)
     _i: int = 0
 
@@ -88,7 +96,7 @@ class FakeAdapter:
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
         if self.fail:
-            raise ProviderError(f"{self.name} is down")
+            raise ProviderError(f"{self.name} is down", retryable=self.fail_retryable)
         resp = self.responses[min(self._i, len(self.responses) - 1)]
         self._i += 1
         return resp
@@ -354,15 +362,15 @@ def test_multiple_mixed_submit_results_keep_the_transcript_balanced(graph):
     assert tool_use_ids <= answered_ids  # every tool_use (incl. both submits) has a result
 
 
-def test_tool_execution_error_is_fed_back_not_raised(graph):
-    # A toolkit failing at execution is a normal agent-loop event, fed back as a
-    # tool error so the model can adapt — it must NOT crash the turn (which would
-    # escape the engine's transient-only catch and strand the run).
+def test_model_addressable_tool_error_is_fed_back_not_raised(graph):
+    # §3.6 taxonomy: a MODEL-ADDRESSABLE tool failure (404/422/bad args —
+    # neither retryable nor fatal) is fed back as an error tool_result so the
+    # model can adjust its call or route around it. It must NOT end the turn.
     from ravana.runtime.toolkits.base import ToolkitError
 
     class FailingExec(_SurfacingExec):
         async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
-            raise ToolkitError("remote 500")
+            raise ToolkitError("HTTP 404 from /nope")  # default kind: MODEL_ADDRESSABLE
 
     adapter = FakeAdapter(
         responses=[
@@ -373,18 +381,133 @@ def test_tool_execution_error_is_fed_back_not_raised(graph):
     gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=FailingExec())
     result = _run(gateway, "pm")  # must not raise
     tool_result = next(m for m in adapter.requests[1].messages if m.role == "tool_result")
-    assert "failed: remote 500" in tool_result.content
+    assert "failed: HTTP 404" in tool_result.content
     assert result.structured_payload == {"requirement_clarity": "HIGH"}
+
+
+def test_transient_tool_error_ends_the_turn_as_transient(graph):
+    # §3.6 lists "tool timeout" as TRANSIENT: a retryable ToolkitError must end
+    # the turn as TransientAgentError so the ENGINE retries a fresh
+    # node_execution attempt with backoff — not be silently fed back with no
+    # backoff anywhere.
+    from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+
+    class TimeoutExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            raise ToolkitError("request timed out", kind=ToolFailureKind.TRANSIENT)
+
+    adapter = FakeAdapter(
+        responses=[ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="tc1", tool="web_search", arguments={})])]
+    )
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=TimeoutExec())
+    with pytest.raises(TransientAgentError, match="failed transiently"):
+        _run(gateway, "pm")
+
+
+def test_fatal_tool_error_is_a_hard_failure(graph):
+    # §3.6 lists "tool auth failure" as NON-transient: a fatal ToolkitError
+    # (401/403) fails the run — neither fed back nor retried.
+    from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+
+    class AuthFailExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            raise ToolkitError("HTTP 401 unauthorized", kind=ToolFailureKind.FATAL)
+
+    adapter = FakeAdapter(
+        responses=[ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="tc1", tool="web_search", arguments={})])]
+    )
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=AuthFailExec())
+    with pytest.raises(RuntimeError, match="failed fatally"):
+        _run(gateway, "pm")
+
+
+def _single_node_gateway_graph(output_schema: dict | None = None, toolkits: list[str] | None = None):
+    """Minimal one-node workflow compiled for engine+gateway e2e tests."""
+    spec: dict = {
+        "agents": [{"id": "a", "name": "A", "llm": {"provider": "anthropic", "model": "m"}, "system_prompt": "p"}],
+        "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
+    }
+    if output_schema is not None:
+        spec["agents"][0]["output_schema"] = output_schema
+    if toolkits:
+        spec["toolkits"] = [{"id": t, "type": "web_search"} for t in toolkits]
+        spec["agents"][0]["toolkits"] = toolkits
+    doc = WorkflowDoc.model_validate(
+        {"apiVersion": "ravana/v1", "kind": "Workflow", "metadata": {"name": "gw-e2e", "version": 1}, "spec": spec}
+    )
+    return compile_workflow(doc)
+
+
+def test_engine_retries_a_transient_tool_failure_with_backoff(con):
+    # End-to-end §3.6: a tool timeout fails the attempt transiently; the engine
+    # backs off, dispatches a NEW attempt, and the retry succeeds.
+    from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+
+    class FlakyToolExec(_SurfacingExec):
+        calls = 0
+
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            self.calls += 1
+            if self.calls == 1:
+                raise ToolkitError("connect timeout", kind=ToolFailureKind.TRANSIENT)
+            return "recovered"
+
+    graph = _single_node_gateway_graph(toolkits=["web_search"])
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    calls_tool = ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="t1", tool="web_search", arguments={"q": "x"})])
+    # Attempt 1 consumes response[0] and dies at the tool; attempt 2 replays
+    # the tool call (response[1], tool now recovers) then submits (response[2]).
+    adapter = FakeAdapter(name="anthropic", responses=[calls_tool, calls_tool, _submit({"done": True})])
+    sleeper = RecordingSleep()
+    executor = FlakyToolExec()
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=executor, retry_sleep=sleeper)
+
+    run_id = asyncio.run(
+        start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id, retry_sleep=sleeper)
+    )
+    attempts = con.execute(
+        "SELECT attempt, status FROM node_execution WHERE run_id = ? ORDER BY attempt", (run_id,)
+    ).fetchall()
+    assert [r["status"] for r in attempts] == ["FAILED", "SUCCEEDED"]  # a NEW attempt, per §3.6
+    assert executor.calls == 2  # the tool actually re-ran on the retry
+    sleeper.assert_delays(1.0)  # and the engine backed off between attempts
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "COMPLETED"
+
+
+def test_repair_exhaustion_fails_the_run_without_node_retries(con):
+    # §3.6 "repair budget exhausted" is NON-transient: the run FAILs on the
+    # first node_execution — no backoff, no extra attempts, and the model is
+    # not called beyond the repair budget.
+    graph = _single_node_gateway_graph(
+        output_schema={"type": "object", "properties": {"verdict": {"type": "string", "enum": ["OK"]}}, "required": ["verdict"], "additionalProperties": False}
+    )
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    max_repairs = graph.doc.spec.graph.guards.max_output_repairs
+    adapter = FakeAdapter(name="anthropic", responses=[_submit({"verdict": "NOPE"})])  # invalid enum, forever
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"anthropic": adapter}, retry_sleep=sleeper)
+
+    run_id = asyncio.run(
+        start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id, retry_sleep=sleeper)
+    )
+    run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    rows = con.execute("SELECT COUNT(*) c FROM node_execution WHERE run_id = ?", (run_id,)).fetchone()["c"]
+    assert rows == 1  # no node retries for exhausted repairs
+    assert sleeper.delays == []  # and no backoff spent
+    assert len(adapter.requests) == max_repairs + 1  # model called exactly budget+1 times, never more
 
 
 def test_non_compliant_provider_that_never_submits_is_bounded(graph):
     # A provider that keeps answering with text and never submits (ignoring the
     # forced submit_result) must NOT loop forever — the gateway bounds total
-    # model round-trips and fails the turn.
+    # model round-trips and fails the turn. §3.6 "guard exceeded" is
+    # NON-transient: the same provider would ignore the forced submit again on
+    # a retried attempt, so this is AgentOutputError, not TransientAgentError.
     never_submits = ProviderResponse(text="still thinking, no tool call", tool_calls=[])
     adapter = FakeAdapter(responses=[never_submits])  # returned repeatedly
     gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=_SurfacingExec())
-    with pytest.raises(TransientAgentError, match="did not produce a valid submit_result"):
+    with pytest.raises(AgentOutputError, match="did not produce a valid submit_result"):
         _run(gateway, "pm")
 
 
@@ -463,10 +586,13 @@ def test_repair_loop_on_invalid_output(graph):
 
 
 def test_repair_budget_exhausted_fails(graph):
-    # max_output_repairs is 2 in the SDLC example; 3 invalid submits exhausts it.
+    # max_output_repairs is 2 in the SDLC example; 3 invalid submits exhausts
+    # it. §3.6: repair exhaustion is NON-transient (AgentOutputError, not
+    # TransientAgentError) — the engine must fail the run, not retry the node
+    # past a budget that already expired.
     adapter = FakeAdapter(responses=[_submit({"qa_status": "NOPE", "qa_report": {}})])
     gateway = LLMGateway(graph, {"openai": adapter})
-    with pytest.raises(TransientAgentError, match="failed validation"):
+    with pytest.raises(AgentOutputError, match="failed validation"):
         _run(gateway, "qa")
 
 
@@ -489,10 +615,13 @@ def test_primary_retried_once_before_falling_back(graph):
 
     primary = FlakyThenOK()
     fallback = FakeAdapter(name="anthropic", responses=[_submit({"system_spec": {"via": "fallback"}})])
-    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback})
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
     result = _run(gateway, "dev")
     assert result.structured_payload == {"system_spec": {}}  # primary's retry, not the fallback
     assert len(fallback.requests) == 0  # fallback never used
+    # §3.6: the same-entry retry backed off once (first-failure band, base=1s).
+    sleeper.assert_delays(1.0)
 
 
 def test_fallback_chain_used_when_primary_fails(graph):
@@ -500,18 +629,252 @@ def test_fallback_chain_used_when_primary_fails(graph):
     # (local) fail and confirm the run still succeeds via the fallback.
     primary = FakeAdapter(name="local", fail=True)
     fallback = FakeAdapter(name="anthropic", responses=[_submit({"system_spec": {}})])
-    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback})
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
     result = _run(gateway, "dev")
     assert result.structured_payload == {"system_spec": {}}
     assert len(fallback.requests) == 1  # fallback actually served the turn
+    # Only the primary's own retry backed off; SWITCHING to the fallback did
+    # not add a sleep — a different provider needs no breathing room.
+    assert len(sleeper.delays) == 1
 
 
 def test_all_entries_exhausted_raises(graph):
     primary = FakeAdapter(name="local", fail=True)
     fallback = FakeAdapter(name="anthropic", fail=True)
-    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback})
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
     with pytest.raises(TransientAgentError, match="all LLM entries exhausted"):
         _run(gateway, "dev")
+    # One backoff per entry's internal retry (2 entries), none on chain moves.
+    assert len(sleeper.delays) == 2
+
+
+# --- §3.6 error taxonomy: retryable vs permanent -----------------------------
+def test_classify_retryable_by_status_code():
+    from ravana.runtime.providers.base import classify_retryable
+
+    class FakeSdkStatusError(Exception):
+        """Shaped like both SDKs' API errors: carries an HTTP status_code."""
+
+        def __init__(self, status_code=None):
+            self.status_code = status_code
+
+    assert classify_retryable(FakeSdkStatusError(429)) is True  # rate limit: breathing room helps
+    assert classify_retryable(FakeSdkStatusError(500)) is True
+    assert classify_retryable(FakeSdkStatusError(503)) is True
+    assert classify_retryable(FakeSdkStatusError(408)) is True  # request timeout
+    assert classify_retryable(FakeSdkStatusError()) is True  # no status (connection blip): availability bias
+    assert classify_retryable(FakeSdkStatusError(401)) is False  # auth: a retry can't fix credentials
+    assert classify_retryable(FakeSdkStatusError(400)) is False  # invalid request
+    assert classify_retryable(FakeSdkStatusError(404)) is False  # unknown model
+    assert classify_retryable(FakeSdkStatusError(422)) is False
+    # Builtin programming/config errors carry no status_code but a retry
+    # re-runs the same broken config — permanent (the anthropic SDK surfaces a
+    # missing credential as TypeError; review probe caught it classified
+    # transient and wasting a backoff).
+    assert classify_retryable(TypeError("could not resolve authentication")) is False
+    assert classify_retryable(ValueError("bad config")) is False
+    assert classify_retryable(KeyError("missing")) is False
+    assert classify_retryable(AttributeError("nope")) is False
+
+
+def _fallback_chain_graph(name: str, primary_provider: str, fallback_provider: str):
+    """Single-node workflow whose agent runs on `primary_provider` (hosted
+    shape: no endpoint, no api_key_ref) with one fallback entry — the shared
+    testbed for the credential/SDK-boundary probes."""
+    doc = WorkflowDoc.model_validate(
+        {
+            "apiVersion": "ravana/v1",
+            "kind": "Workflow",
+            "metadata": {"name": name, "version": 1},
+            "spec": {
+                "agents": [
+                    {
+                        "id": "a",
+                        "name": "A",
+                        "llm": {"provider": primary_provider, "model": "m", "fallback": [{"provider": fallback_provider, "model": "m2"}]},
+                        "system_prompt": "p",
+                    }
+                ],
+                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
+            },
+        }
+    )
+    return compile_workflow(doc)
+
+
+def _assert_falls_back_cleanly(cred_graph, primary, primary_name: str, fallback_name: str):
+    """Shared probe assertion: the primary's client-init failure normalizes,
+    the fallback serves the turn, and no same-entry backoff is wasted."""
+    fallback = FakeAdapter(name=fallback_name, responses=[_submit({"done": True})])
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(cred_graph, {primary_name: primary, fallback_name: fallback}, retry_sleep=sleeper)
+    result = _run(gateway, "a")
+    assert result.structured_payload == {"done": True}
+    assert len(fallback.requests) == 1  # the fallback actually ran
+    assert sleeper.delays == []  # permanent: no same-entry backoff wasted
+
+
+def test_openai_missing_credential_is_normalized_and_falls_back(monkeypatch):
+    # Review probe: with no api_key anywhere, AsyncOpenAI() raises OpenAIError
+    # at client construction — previously OUTSIDE the normalization boundary,
+    # so the raw SDK error skipped the §3.6 fallback chain entirely (fallback
+    # called 0 times). Now it normalizes to ProviderError(retryable=False).
+    # (No network: the failure happens before any request is built.)
+    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    graph = _fallback_chain_graph("openai-cred-test", "openai", "anthropic")
+    _assert_falls_back_cleanly(graph, OpenAICompatibleAdapter(name="openai"), "openai", "anthropic")
+
+
+def test_anthropic_client_init_failure_is_normalized_and_falls_back(monkeypatch):
+    # Review probe: AnthropicAdapter built its SDK client eagerly in __init__,
+    # BEFORE any normalization boundary — a malformed proxy/credential config
+    # escaped as a raw ValueError and the fallback chain never ran. The client
+    # is now built lazily inside complete()'s boundary.
+    import anthropic
+
+    from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
+
+    def exploding_client(*args, **kwargs):
+        raise ValueError("malformed proxy configuration")
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", exploding_client)
+    graph = _fallback_chain_graph("anthropic-init-test", "anthropic", "openai")
+    _assert_falls_back_cleanly(graph, AnthropicAdapter(), "anthropic", "openai")
+
+
+def test_sdk_internal_retries_are_disabled(monkeypatch):
+    # Review finding: both SDKs default to max_retries=2, which STACKS with the
+    # gateway's per-entry retry (up to 6 HTTP attempts per entry) and sleeps
+    # outside the injected backoff waiter. The gateway owns retry policy —
+    # clients must be constructed with max_retries=0.
+    import anthropic
+    import openai
+
+    from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
+    from ravana.runtime.providers.base import UserMessage
+    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+
+    made: dict[str, dict[str, Any]] = {}
+
+    class FakeAnthropicClient:
+        def __init__(self, **kwargs):
+            made["anthropic"] = kwargs
+
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs):
+            made["openai"] = kwargs
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeAnthropicClient)
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeOpenAIClient)
+
+    AnthropicAdapter()._resolve_client()
+    OpenAICompatibleAdapter(name="local")._resolve_client(
+        ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a/v1")
+    )
+    assert made["anthropic"]["max_retries"] == 0
+    assert made["openai"]["max_retries"] == 0
+
+
+def test_entry_terminal_outcome_decides_transient_vs_hard(graph):
+    # Review probe: a historical retryable failure must not mask a chain that
+    # ENDED all-permanent. Primary fails 500 (retryable) then 401 (permanent)
+    # on its retry; fallback fails permanent. Every entry's TERMINAL outcome is
+    # permanent => hard error, not TransientAgentError (which would burn
+    # engine node retries re-running a hopeless chain).
+    class RetryableThenPermanent:
+        name = "local"
+        calls = 0
+
+        def capabilities(self, model):
+            return {Capability.NATIVE_STRUCTURED_OUTPUT}
+
+        async def complete(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderError("500 server error", retryable=True)
+            raise ProviderError("401 unauthorized", retryable=False)
+
+    primary = RetryableThenPermanent()
+    fallback = FakeAdapter(name="anthropic", fail=True, fail_retryable=False)
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
+    with pytest.raises(RuntimeError, match="failed permanently"):
+        _run(gateway, "dev")
+    assert primary.calls == 2  # the retryable failure did get its one retry
+    sleeper.assert_delays(1.0)  # ...with its backoff — but the OUTCOME stayed permanent
+
+
+def test_permanent_error_skips_same_entry_retry_and_goes_to_fallback(graph):
+    # An auth-shaped (permanent) primary failure must NOT be retried at the
+    # same entry — no backoff sleep — and the chain moves straight to the
+    # fallback, which serves the turn.
+    primary = FakeAdapter(name="local", fail=True, fail_retryable=False)
+    fallback = FakeAdapter(name="anthropic", responses=[_submit({"system_spec": {}})])
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
+    result = _run(gateway, "dev")
+    assert result.structured_payload == {"system_spec": {}}
+    assert len(primary.requests) == 1  # exactly one try: permanent means no same-entry retry
+    assert sleeper.delays == []  # and no backoff was spent on it
+
+
+def test_all_permanent_chain_raises_hard_error_not_transient(graph):
+    # Every entry failing permanently (auth/config) must NOT surface as
+    # TransientAgentError — the engine would burn max_retries_per_node
+    # re-running a hopeless chain. It surfaces as a hard error instead.
+    primary = FakeAdapter(name="local", fail=True, fail_retryable=False)
+    fallback = FakeAdapter(name="anthropic", fail=True, fail_retryable=False)
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
+    with pytest.raises(RuntimeError, match="failed permanently"):
+        _run(gateway, "dev")
+    assert sleeper.delays == []  # nothing to wait for anywhere in the chain
+
+
+def test_mixed_chain_with_any_retryable_failure_stays_transient(graph):
+    # Primary fails permanently, fallback fails transiently: the turn is still
+    # transient (the engine's own retry may recover), not a hard error.
+    primary = FakeAdapter(name="local", fail=True, fail_retryable=False)
+    fallback = FakeAdapter(name="anthropic", fail=True, fail_retryable=True)
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=RecordingSleep())
+    with pytest.raises(TransientAgentError, match="all LLM entries exhausted"):
+        _run(gateway, "dev")
+
+
+def test_all_permanent_chain_fails_the_run_without_node_retries(con):
+    # Engine-level consequence: a permanently-misconfigured agent fails the
+    # run on the FIRST node_execution — no §3.6 node retries, no backoff.
+    graph = compile_workflow(load_workflow_yaml(SDLC_WORKFLOW))
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    adapter = FakeAdapter(name="anthropic", fail=True, fail_retryable=False)
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {p: adapter for p in ("anthropic", "local", "openai")}, retry_sleep=sleeper)
+
+    run_id = asyncio.run(
+        start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id, input_payload={"repository": "r"}, retry_sleep=sleeper)
+    )
+    run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    rows = con.execute("SELECT COUNT(*) c FROM node_execution WHERE run_id = ?", (run_id,)).fetchone()["c"]
+    assert rows == 1  # failed immediately: no wrong-type node retries
+    assert sleeper.delays == []  # and zero backoff spent anywhere
+
+
+def test_no_tool_executor_wired_is_a_hard_error_not_provider_fault():
+    # Defense-in-depth taxonomy: _NoToolExecutor.execute is a WIRING bug, so it
+    # raises a hard error — NOT ProviderError, which the fallback loop would
+    # retry/fall through (burning full LLM turns per pass). Note it is normally
+    # unreachable through the tool loop: _NoToolExecutor surfaces zero tools,
+    # so the per-node boundary refuses any tool call before execute — this
+    # pins the taxonomy for whatever future path reaches it directly.
+    from ravana.runtime.gateway import _NoToolExecutor
+
+    with pytest.raises(RuntimeError, match="no ToolExecutor is wired"):
+        asyncio.run(_NoToolExecutor().execute(run_id="r", node_id="n", tool="x", arguments={}, idempotency_key="k"))
 
 
 def test_openai_adapter_caches_client_per_endpoint():

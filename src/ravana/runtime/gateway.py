@@ -22,16 +22,18 @@ slice and slot in behind this same protocol.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ravana.compiler.graph import CompiledGraph
-from ravana.runtime.base import AgentTurnResult, TransientAgentError
+from ravana.runtime.backoff import RetrySleep, backoff_delay
+from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
-from ravana.runtime.toolkits.base import ToolkitError
+from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.providers.base import (
     AssistantMessage,
     Capability,
@@ -51,6 +53,12 @@ SUBMIT_RESULT = "submit_result"
 # from the engine-level guards.max_retries_per_node, so a long fallback chain
 # can't multiply total attempts.
 _PER_ENTRY_RETRIES = 1
+
+# §3.6 backoff shape for a same-entry retry (a 429/5xx wants breathing room).
+# Smaller cap than the engine's per-node backoff: this is the inner loop — the
+# engine's own retry adds its own, larger delays on top.
+_ENTRY_RETRY_BASE_SECONDS = 1.0
+_ENTRY_RETRY_CAP_SECONDS = 10.0
 
 # A schema-less fallback when a node declares no output_schema: submit_result
 # then accepts any object, and the whole returned object becomes the
@@ -88,7 +96,12 @@ class _NoToolExecutor:
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str
     ) -> str:
-        raise ProviderError(
+        # A wiring bug, not a provider fault — deliberately NOT ProviderError,
+        # which the fallback loop would retry/fall through (each pass burning
+        # full LLM turns), nor ToolkitError, which the tool loop would feed
+        # back to the model to try again. No executor means no tool can ever
+        # run; fail the run hard via the engine's terminal boundary.
+        raise RuntimeError(
             f"agent tried to call tool '{tool}' but no ToolExecutor is wired "
             "(no toolkits are available to this run)"
         )
@@ -136,10 +149,14 @@ class LLMGateway:
         graph: CompiledGraph,
         adapters: dict[str, ProviderAdapter],
         tool_executor: ToolExecutor | None = None,
+        retry_sleep: RetrySleep = asyncio.sleep,
     ):
         self._graph = graph
         self._adapters = adapters
         self._tools = tool_executor or _NoToolExecutor()
+        # §3.6 backoff waiter for same-entry retries; injectable so tests
+        # record requested delays instead of actually waiting.
+        self._retry_sleep = retry_sleep
         # §3.4: strategy is decided once per (provider, model), not re-derived
         # every call. Capabilities are static, so this memo is the "decided at
         # registration" contract without a separate registration step.
@@ -148,7 +165,11 @@ class LLMGateway:
     def _adapter_for(self, provider: str) -> ProviderAdapter:
         adapter = self._adapters.get(provider)
         if adapter is None:
-            raise ProviderError(f"no adapter registered for provider '{provider}'")
+            # Config error, and permanent BY ENTRY: retrying this entry can't
+            # conjure the adapter, but the next fallback entry may name a
+            # provider that IS registered — so it stays a ProviderError
+            # (chain moves on), just never same-entry retried.
+            raise ProviderError(f"no adapter registered for provider '{provider}'", retryable=False)
         return adapter
 
     def _strategy_for(self, adapter: ProviderAdapter, model: str) -> _Strategy:
@@ -174,24 +195,60 @@ class LLMGateway:
         # own small retry budget (default 1 retry per entry — distinct from,
         # and smaller than, the engine-level max_retries_per_node, so a chain
         # of N fallbacks can't multiply total attempts by N). A provider-level
-        # failure (ProviderError) is what a retry/fallback responds to; a
-        # TransientAgentError from repair-budget exhaustion is the model
-        # producing bad output, not a provider fault, so it propagates
-        # immediately without burning the fallback chain. Only when every
-        # entry's budget is spent does the node_execution fail.
+        # failure (ProviderError) is what a retry/fallback responds to; an
+        # AgentOutputError from repair-budget exhaustion is the model producing
+        # bad output, not a provider fault, so it propagates immediately —
+        # past this chain AND past the engine's transient retry (§3.6 line:
+        # "repair budget exhausted" is non-transient). Only when every entry's
+        # budget is spent does the node_execution fail.
         chain: list[LLMConfig] = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
         last_error: Exception | None = None
+        # Whether any entry's TERMINAL outcome was retryable. Per-entry, not
+        # per-failure: an entry whose first failure was a 500 but whose retry
+        # died on a 401 ENDED permanent — a historical transient must not make
+        # a hopeless chain look worth the engine's node retries.
+        any_entry_ended_retryable = False
         for llm in chain:
-            for _ in range(_PER_ENTRY_RETRIES + 1):
+            entry_error: ProviderError | None = None
+            for try_index in range(_PER_ENTRY_RETRIES + 1):
                 try:
                     return await self._run_one_llm(
                         run_id=run_id, node_id=node_id, agent=agent, llm=llm,
                         system=system, output_schema=output_schema,
                     )
                 except ProviderError as exc:
+                    entry_error = exc
                     last_error = exc
+                    # §3.6 taxonomy: a PERMANENT failure (auth 401, invalid
+                    # request 400, unknown model) cannot succeed on a same-entry
+                    # retry — skip the retry AND its backoff sleep, and move
+                    # straight to the next fallback entry (a different
+                    # provider/model may well work).
+                    if not exc.retryable:
+                        break
+                    # Retryable (429/5xx/timeout): back off before retrying the
+                    # SAME entry — the provider needs breathing room. Moving to
+                    # the NEXT entry sleeps zero either way: it's a different
+                    # provider, and waiting on it would only delay the recovery
+                    # the chain exists to provide.
+                    if try_index < _PER_ENTRY_RETRIES:
+                        await self._retry_sleep(
+                            backoff_delay(try_index + 1, base=_ENTRY_RETRY_BASE_SECONDS, cap=_ENTRY_RETRY_CAP_SECONDS)
+                        )
                     continue
-        raise TransientAgentError(f"all LLM entries exhausted for agent '{agent_id}': {last_error}")
+            if entry_error is not None and entry_error.retryable:
+                any_entry_ended_retryable = True
+        if any_entry_ended_retryable:
+            # At least one entry ENDED on a transient fault — the engine's own
+            # §3.6 retry (fresh attempt, larger backoff) can plausibly recover.
+            raise TransientAgentError(f"all LLM entries exhausted for agent '{agent_id}': {last_error}")
+        # Every entry ENDED permanently (auth/config/bad request): re-running
+        # the chain cannot succeed, so this must NOT look transient — raise a
+        # hard error the engine fails the run on immediately, instead of
+        # burning max_retries_per_node re-running a hopeless chain.
+        raise RuntimeError(
+            f"all LLM entries failed permanently for agent '{agent_id}' (auth/config, not transient): {last_error}"
+        )
 
     async def _run_one_llm(
         self,
@@ -240,7 +297,9 @@ class LLMGateway:
                     input_tokens=input_tokens, output_tokens=output_tokens, repair_count=repair_count,
                 )
             if repair_count >= guards.max_output_repairs:
-                raise TransientAgentError(f"node '{node_id}' guided output invalid after {repair_count} repairs: {error}")
+                # §3.6: repair exhaustion is NON-transient — the run fails now;
+                # a node retry would just re-ask past an expired budget.
+                raise AgentOutputError(f"node '{node_id}' guided output invalid after {repair_count} repairs: {error}")
             repair_count += 1
             messages.append(UserMessage(text=f"That output was invalid: {error}. Return valid JSON matching the schema."))
 
@@ -284,7 +343,10 @@ class LLMGateway:
 
         while True:
             if model_calls >= max_model_calls:
-                raise TransientAgentError(
+                # §3.6 "guard exceeded" is non-transient: a provider that
+                # ignored the forced submit for a whole turn's ceiling will
+                # ignore it again on a retried attempt.
+                raise AgentOutputError(
                     f"node '{node_id}' did not produce a valid submit_result within {max_model_calls} model turns "
                     f"(provider ignored the forced submit?)"
                 )
@@ -347,9 +409,19 @@ class LLMGateway:
                             run_id=run_id, node_id=node_id, tool=tc.tool, arguments=tc.arguments, idempotency_key=key
                         )
                     except ToolkitError as exc:
-                        # A tool failing is a normal event in an agent loop, not
-                        # a run crash: feed the error back so the model can
-                        # retry, route around it, or submit.
+                        # §3.6 routes each ToolFailureKind differently:
+                        if exc.kind is ToolFailureKind.FATAL:
+                            # Tool auth failure — non-transient, fails the run
+                            # (neither the model nor a retry fixes credentials).
+                            raise RuntimeError(f"tool '{tc.tool}' failed fatally: {exc}") from exc
+                        if exc.kind is ToolFailureKind.TRANSIENT:
+                            # Tool timeout / 5xx — transient: end the turn so
+                            # the ENGINE retries a fresh node_execution attempt
+                            # with backoff. Side effects already fired in this
+                            # turn are deduped by the content-addressed key.
+                            raise TransientAgentError(f"tool '{tc.tool}' failed transiently: {exc}") from exc
+                        # MODEL_ADDRESSABLE (404/422/bad args): feed the error
+                        # back so the model can adjust or route around it.
                         messages.append(_error_result(tc, f"tool '{tc.tool}' failed: {exc}"))
                         continue
                     recorded_tool_calls.append({"tool": tc.tool, "arguments": tc.arguments, "idempotency_key": key})
@@ -380,7 +452,9 @@ class LLMGateway:
                         tool_call_count=len(recorded_tool_calls),
                     )
                 if repair_count >= guards.max_output_repairs:
-                    raise TransientAgentError(
+                    # §3.6: repair exhaustion is NON-transient — fail the run
+                    # now rather than re-asking past an expired budget.
+                    raise AgentOutputError(
                         f"node '{node_id}' output failed validation after {repair_count} repairs: {error}"
                     )
                 repair_count += 1

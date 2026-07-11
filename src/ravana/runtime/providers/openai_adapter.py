@@ -25,7 +25,7 @@ from typing import Any
 from ravana.runtime.providers.base import (
     Capability,
     NormalizedToolCall,
-    ProviderError,
+    to_provider_error,
     ProviderRequest,
     ProviderResponse,
 )
@@ -56,7 +56,11 @@ class OpenAICompatibleAdapter:
         if key not in self._clients:
             from openai import AsyncOpenAI
 
-            kwargs: dict[str, Any] = {}
+            # max_retries=0: the GATEWAY owns retry policy (§3.6). The SDK's
+            # default (2 internal retries) would stack with the gateway's
+            # per-entry retry — up to 6 HTTP attempts per entry — and its
+            # sleeps bypass the injected backoff waiter entirely.
+            kwargs: dict[str, Any] = {"max_retries": 0}
             if request.endpoint:
                 kwargs["base_url"] = request.endpoint  # routes to Ollama/vLLM/etc.
             if request.api_key_ref:
@@ -74,7 +78,15 @@ class OpenAICompatibleAdapter:
         return self._clients[key]
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
-        client = self._resolve_client(request)
+        # Client construction is INSIDE the normalization boundary: with no
+        # api_key anywhere the SDK raises OpenAIError right here, and a raw
+        # SDK exception would skip the §3.6 fallback chain entirely. A client
+        # that can't be built is a config error — permanent for this entry,
+        # but the next fallback entry (different provider/key) may work.
+        try:
+            client = self._resolve_client(request)
+        except Exception as exc:  # noqa: BLE001
+            raise to_provider_error("openai-compatible client init failed", exc, retryable=False) from exc
 
         messages = [{"role": "system", "content": request.system}, *_to_openai_messages(request.messages)]
         kwargs: dict[str, Any] = {"model": request.model, "messages": messages}
@@ -103,7 +115,8 @@ class OpenAICompatibleAdapter:
         try:
             completion = await client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise ProviderError(f"openai-compatible completion failed: {exc}") from exc
+            # §3.6 taxonomy: classified retryable/permanent in one shared place.
+            raise to_provider_error("openai-compatible completion failed", exc) from exc
 
         choice = completion.choices[0]
         msg = choice.message

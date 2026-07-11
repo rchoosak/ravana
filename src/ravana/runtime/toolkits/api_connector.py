@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from ravana.runtime.toolkits.base import ToolkitError
+from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 
 # §8(a): the connector's declared input schema. Result is a plain string
 # (the response body), so there is no separate output schema to declare.
@@ -94,18 +94,63 @@ class ApiConnectorHandler:
             response = await client.request(
                 method, path, headers=headers, json=arguments.get("json"), params=arguments.get("params")
             )
-        except Exception as exc:  # noqa: BLE001 - normalize transport failures
-            raise ToolkitError(f"api_connector request to {path} failed: {exc}") from exc
+        except Exception as exc:
+            # Classify what the client raised: an HTTP status error routes by
+            # its status (a 401 via raise_for_status is FATAL, not transient),
+            # a genuine transport failure (connection reset, timeout, DNS) is
+            # §3.6's "tool timeout" — transient. Anything else (a TypeError
+            # from a programming/config bug, say) propagates raw: the engine's
+            # terminal boundary fails the run hard instead of a wrong-type
+            # transient retry re-running broken code.
+            kind = _classify_exception(exc)
+            if kind is None:
+                raise
+            raise ToolkitError(f"api_connector request to {path} failed: {exc}", kind=kind) from exc
 
         status = getattr(response, "status_code", None)
         body = _body_text(response)
         if status is not None and status >= 400:
-            raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}")
+            raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}", kind=_classify_status(status))
         return body
 
 
 def _method_of(arguments: dict[str, Any]) -> str:
     return str(arguments.get("method", "POST")).upper()
+
+
+def _classify_exception(exc: Exception) -> ToolFailureKind | None:
+    """Classify a client-raised exception per §3.6, or None for "not ours —
+    propagate raw" (a programming/config bug the engine should fail hard on).
+
+    httpx.HTTPStatusError is checked FIRST and routed by its response status:
+    an injected/configured client that calls raise_for_status() surfaces a 401
+    as an exception, and blanket-treating the httpx hierarchy as transient
+    would turn that auth failure (§3.6 FATAL) into a backed-off retry. Only
+    httpx.TransportError (timeouts, connection failures) and the builtin
+    OS-level types count as transient."""
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a direct dependency
+        httpx = None
+    if httpx is not None and isinstance(exc, httpx.HTTPStatusError):
+        return _classify_status(exc.response.status_code)
+    if isinstance(exc, (OSError, TimeoutError)):
+        return ToolFailureKind.TRANSIENT
+    if httpx is not None and isinstance(exc, httpx.TransportError):
+        return ToolFailureKind.TRANSIENT
+    return None
+
+
+def _classify_status(status: int) -> ToolFailureKind:
+    """§3.6's tool-failure taxonomy by HTTP status: 401/403 is the "tool auth
+    failure" (fatal, fails the run); 5xx/429/408 may recover (transient —
+    engine retries the attempt with backoff); any other 4xx is something the
+    model can adjust to (bad path, validation) — fed back."""
+    if status in (401, 403):
+        return ToolFailureKind.FATAL
+    if status in (408, 429) or status >= 500:
+        return ToolFailureKind.TRANSIENT
+    return ToolFailureKind.MODEL_ADDRESSABLE
 
 
 def _reject_offbase_path(path: str) -> None:
