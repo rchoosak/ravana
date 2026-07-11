@@ -22,11 +22,13 @@ slice and slot in behind this same protocol.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from ravana.compiler.graph import CompiledGraph
+from ravana.runtime.backoff import backoff_delay
 from ravana.runtime.base import AgentTurnResult, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
@@ -51,6 +53,12 @@ SUBMIT_RESULT = "submit_result"
 # from the engine-level guards.max_retries_per_node, so a long fallback chain
 # can't multiply total attempts.
 _PER_ENTRY_RETRIES = 1
+
+# §3.6 backoff shape for a same-entry retry (a 429/5xx wants breathing room).
+# Smaller cap than the engine's per-node backoff: this is the inner loop — the
+# engine's own retry adds its own, larger delays on top.
+_ENTRY_RETRY_BASE_SECONDS = 1.0
+_ENTRY_RETRY_CAP_SECONDS = 10.0
 
 # A schema-less fallback when a node declares no output_schema: submit_result
 # then accepts any object, and the whole returned object becomes the
@@ -136,10 +144,14 @@ class LLMGateway:
         graph: CompiledGraph,
         adapters: dict[str, ProviderAdapter],
         tool_executor: ToolExecutor | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ):
         self._graph = graph
         self._adapters = adapters
         self._tools = tool_executor or _NoToolExecutor()
+        # §3.6 backoff waiter for same-entry retries; injectable so tests
+        # record requested delays instead of actually waiting.
+        self._sleep = sleep
         # §3.4: strategy is decided once per (provider, model), not re-derived
         # every call. Capabilities are static, so this memo is the "decided at
         # registration" contract without a separate registration step.
@@ -182,7 +194,7 @@ class LLMGateway:
         chain: list[LLMConfig] = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
         last_error: Exception | None = None
         for llm in chain:
-            for _ in range(_PER_ENTRY_RETRIES + 1):
+            for try_index in range(_PER_ENTRY_RETRIES + 1):
                 try:
                     return await self._run_one_llm(
                         run_id=run_id, node_id=node_id, agent=agent, llm=llm,
@@ -190,6 +202,15 @@ class LLMGateway:
                     )
                 except ProviderError as exc:
                     last_error = exc
+                    # §3.6: back off before retrying the SAME entry — a 429/5xx
+                    # provider needs breathing room. Moving to the NEXT fallback
+                    # entry sleeps zero: it's a different provider/model, and
+                    # waiting on it would only delay the recovery the chain
+                    # exists to provide.
+                    if try_index < _PER_ENTRY_RETRIES:
+                        await self._sleep(
+                            backoff_delay(try_index + 1, base=_ENTRY_RETRY_BASE_SECONDS, cap=_ENTRY_RETRY_CAP_SECONDS)
+                        )
                     continue
         raise TransientAgentError(f"all LLM entries exhausted for agent '{agent_id}': {last_error}")
 

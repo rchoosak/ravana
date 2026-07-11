@@ -1,0 +1,32 @@
+"""Exponential backoff for transient-failure retries (§3.6). One pure delay
+function shared by both retry sites — the engine's per-node retry (a
+`TransientAgentError` re-queues the node, bounded by
+`guards.max_retries_per_node`) and the gateway's per-fallback-entry retry (a
+`ProviderError` retries the same entry once before moving down the chain).
+
+Equal jitter (half the exponential delay fixed, half uniformly random) rather
+than full jitter: it still de-synchronizes concurrent retriers, but keeps a
+deterministic lower bound (delay >= exp/2), which makes "it actually backed
+off" assertable in tests and predictable in logs.
+
+The *sleep* itself is injected at each call site (an `asyncio.sleep`-shaped
+callable), so tests record requested delays instead of actually waiting.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Callable
+
+# Uniform-random source, injectable for deterministic tests: rng(a, b) -> float in [a, b].
+Rng = Callable[[float, float], float]
+
+
+def backoff_delay(attempt: int, *, base: float, cap: float, rng: Rng = random.uniform) -> float:
+    """Delay in seconds before retrying after the `attempt`-th failure
+    (1-indexed: the first failure backs off `~base`, doubling per failure,
+    capped at `cap`). Equal jitter: exp/2 fixed + uniform(0, exp/2)."""
+    if attempt < 1:
+        raise ValueError(f"attempt is 1-indexed, got {attempt}")
+    exp = min(cap, base * (2 ** (attempt - 1)))
+    return exp / 2 + rng(0.0, exp / 2)
