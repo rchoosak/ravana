@@ -255,6 +255,37 @@ def test_api_connector_transport_failure_is_transient(graph):
     assert exc_info.value.kind is ToolFailureKind.TRANSIENT
 
 
+def test_api_connector_httpx_timeout_is_transient(graph):
+    # httpx's own exceptions don't subclass OSError — the transport check must
+    # cover the httpx hierarchy too.
+    import httpx
+
+    class TimeoutClient:
+        async def request(self, *args, **kwargs):
+            raise httpx.ReadTimeout("read timed out")
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": TimeoutClient()})
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    assert exc_info.value.kind is ToolFailureKind.TRANSIENT
+
+
+def test_api_connector_programming_bug_propagates_raw_not_transient(graph):
+    # Review finding: the transport catch was `except Exception`, so a
+    # TypeError from a programming/config bug was classified TRANSIENT and the
+    # engine retried broken code with backoff. A non-transport exception now
+    # propagates raw — the engine's terminal boundary fails the run hard.
+    class BuggyClient:
+        async def request(self, *args, **kwargs):
+            raise TypeError("request() got an unexpected keyword argument")
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": BuggyClient()})
+    with pytest.raises(TypeError):  # NOT ToolkitError — no wrong-type transient retry
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+
+
 @pytest.mark.parametrize(
     "bad_path",
     [

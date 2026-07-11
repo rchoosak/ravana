@@ -56,7 +56,11 @@ class OpenAICompatibleAdapter:
         if key not in self._clients:
             from openai import AsyncOpenAI
 
-            kwargs: dict[str, Any] = {}
+            # max_retries=0: the GATEWAY owns retry policy (§3.6). The SDK's
+            # default (2 internal retries) would stack with the gateway's
+            # per-entry retry — up to 6 HTTP attempts per entry — and its
+            # sleeps bypass the injected backoff waiter entirely.
+            kwargs: dict[str, Any] = {"max_retries": 0}
             if request.endpoint:
                 kwargs["base_url"] = request.endpoint  # routes to Ollama/vLLM/etc.
             if request.api_key_ref:

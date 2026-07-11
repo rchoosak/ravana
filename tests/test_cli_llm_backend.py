@@ -35,21 +35,19 @@ def test_make_adapter_maps_non_anthropic_to_openai_compatible():
     assert isinstance(_make_adapter("openai"), OpenAICompatibleAdapter)
 
 
-def test_make_adapter_maps_anthropic_to_anthropic_adapter(monkeypatch):
-    # AnthropicAdapter() builds a real SDK client, which needs *a* key present
-    # (no network call happens at construction).
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-key-not-used")
+def test_make_adapter_maps_anthropic_to_anthropic_adapter():
+    # AnthropicAdapter defers its SDK-client construction to the first
+    # complete() call (inside the normalization boundary), so building the
+    # adapter needs no credential at all.
     assert isinstance(_make_adapter("anthropic"), AnthropicAdapter)
 
 
-def test_adapters_for_graph_covers_every_provider(sdlc_graph, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-key-not-used")
+def test_adapters_for_graph_covers_every_provider(sdlc_graph):
     adapters = _adapters_for_graph(sdlc_graph)
     assert set(adapters) == {"anthropic", "local", "openai"}
 
 
-def test_build_llm_gateway_wires_graph_toolkits(sdlc_graph, con, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-key-not-used")
+def test_build_llm_gateway_wires_graph_toolkits(sdlc_graph, con):
     gateway = _build_llm_gateway(con, sdlc_graph)
     assert isinstance(gateway, LLMGateway)
     # The gateway's executor surfaces an agent's declared toolkits as tools.

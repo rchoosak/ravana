@@ -50,13 +50,18 @@ class AnthropicAdapter:
     name = "anthropic"
 
     def __init__(self, client: Any | None = None):
-        # Deferred import so the dependency is only needed when this adapter is
-        # actually constructed with a real client (tests inject a fake).
-        if client is None:
+        self._client = client  # injected (tests) or built lazily in complete()
+
+    def _resolve_client(self) -> Any:
+        if self._client is None:
             import anthropic
 
-            client = anthropic.AsyncAnthropic()
-        self._client = client
+            # max_retries=0: the GATEWAY owns retry policy (§3.6). The SDK's
+            # default (2 internal retries) would stack with the gateway's
+            # per-entry retry — up to 6 HTTP attempts per entry — and its
+            # sleeps bypass the injected backoff waiter entirely.
+            self._client = anthropic.AsyncAnthropic(max_retries=0)
+        return self._client
 
     def capabilities(self, model: str) -> set[Capability]:
         # Anthropic offers provider-guaranteed conformance via forced
@@ -64,6 +69,16 @@ class AnthropicAdapter:
         return {Capability.NATIVE_STRUCTURED_OUTPUT}
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
+        # Client construction is INSIDE the normalization boundary (mirrors the
+        # OpenAI adapter): a missing/malformed credential or proxy config makes
+        # the SDK raise at init, and a raw SDK exception would skip the §3.6
+        # fallback chain. A client that can't be built is permanent for this
+        # entry; the next fallback entry (different provider) may work.
+        try:
+            client = self._resolve_client()
+        except Exception as exc:  # noqa: BLE001
+            raise to_provider_error("anthropic client init failed", exc, retryable=False) from exc
+
         kwargs: dict[str, Any] = {
             "model": request.model,
             "max_tokens": request.max_tokens or 4096,
@@ -81,7 +96,7 @@ class AnthropicAdapter:
             kwargs["temperature"] = request.temperature
 
         try:
-            message = await self._client.messages.create(**kwargs)
+            message = await client.messages.create(**kwargs)
         except Exception as exc:  # noqa: BLE001 - normalize every provider failure to one type
             # §3.6 taxonomy: classified retryable/permanent in one shared place
             # (a missing credential arrives as the SDK's TypeError — no

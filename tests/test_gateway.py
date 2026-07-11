@@ -651,19 +651,21 @@ def test_all_entries_exhausted_raises(graph):
 def test_classify_retryable_by_status_code():
     from ravana.runtime.providers.base import classify_retryable
 
-    class _Err(Exception):
+    class FakeSdkStatusError(Exception):
+        """Shaped like both SDKs' API errors: carries an HTTP status_code."""
+
         def __init__(self, status_code=None):
             self.status_code = status_code
 
-    assert classify_retryable(_Err(429)) is True  # rate limit: breathing room helps
-    assert classify_retryable(_Err(500)) is True
-    assert classify_retryable(_Err(503)) is True
-    assert classify_retryable(_Err(408)) is True  # request timeout
-    assert classify_retryable(_Err()) is True  # no status (connection blip): availability bias
-    assert classify_retryable(_Err(401)) is False  # auth: a retry can't fix credentials
-    assert classify_retryable(_Err(400)) is False  # invalid request
-    assert classify_retryable(_Err(404)) is False  # unknown model
-    assert classify_retryable(_Err(422)) is False
+    assert classify_retryable(FakeSdkStatusError(429)) is True  # rate limit: breathing room helps
+    assert classify_retryable(FakeSdkStatusError(500)) is True
+    assert classify_retryable(FakeSdkStatusError(503)) is True
+    assert classify_retryable(FakeSdkStatusError(408)) is True  # request timeout
+    assert classify_retryable(FakeSdkStatusError()) is True  # no status (connection blip): availability bias
+    assert classify_retryable(FakeSdkStatusError(401)) is False  # auth: a retry can't fix credentials
+    assert classify_retryable(FakeSdkStatusError(400)) is False  # invalid request
+    assert classify_retryable(FakeSdkStatusError(404)) is False  # unknown model
+    assert classify_retryable(FakeSdkStatusError(422)) is False
     # Builtin programming/config errors carry no status_code but a retry
     # re-runs the same broken config — permanent (the anthropic SDK surfaces a
     # missing credential as TypeError; review probe caught it classified
@@ -712,6 +714,82 @@ def test_openai_missing_credential_is_normalized_and_falls_back(monkeypatch):
     assert result.structured_payload == {"done": True}
     assert len(fallback.requests) == 1  # the fallback actually ran (was 0 before the fix)
     assert sleeper.delays == []  # permanent: no same-entry backoff wasted
+
+
+def test_anthropic_client_init_failure_is_normalized_and_falls_back(monkeypatch):
+    # Review probe: AnthropicAdapter built its SDK client eagerly in __init__,
+    # BEFORE any normalization boundary — a malformed proxy/credential config
+    # escaped as a raw ValueError and the fallback chain never ran. The client
+    # is now built lazily inside complete()'s boundary: init failure becomes
+    # ProviderError(retryable=False) and the fallback serves the turn.
+    import anthropic
+
+    def exploding_client(*args, **kwargs):
+        raise ValueError("malformed proxy configuration")
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", exploding_client)
+    doc = WorkflowDoc.model_validate(
+        {
+            "apiVersion": "ravana/v1",
+            "kind": "Workflow",
+            "metadata": {"name": "anthropic-init-test", "version": 1},
+            "spec": {
+                "agents": [
+                    {
+                        "id": "a",
+                        "name": "A",
+                        "llm": {"provider": "anthropic", "model": "m", "fallback": [{"provider": "openai", "model": "m2"}]},
+                        "system_prompt": "p",
+                    }
+                ],
+                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
+            },
+        }
+    )
+    init_graph = compile_workflow(doc)
+    from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
+
+    primary = AnthropicAdapter()  # no injected client -> lazy (exploding) construction
+    fallback = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(init_graph, {"anthropic": primary, "openai": fallback}, retry_sleep=sleeper)
+    result = _run(gateway, "a")
+    assert result.structured_payload == {"done": True}
+    assert len(fallback.requests) == 1  # fallback actually ran (was unreachable before the fix)
+    assert sleeper.delays == []  # permanent: no same-entry backoff wasted
+
+
+def test_sdk_internal_retries_are_disabled(monkeypatch):
+    # Review finding: both SDKs default to max_retries=2, which STACKS with the
+    # gateway's per-entry retry (up to 6 HTTP attempts per entry) and sleeps
+    # outside the injected backoff waiter. The gateway owns retry policy —
+    # clients must be constructed with max_retries=0.
+    import anthropic
+    import openai
+
+    from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
+    from ravana.runtime.providers.base import UserMessage
+    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+
+    made: dict[str, dict[str, Any]] = {}
+
+    class FakeAnthropicClient:
+        def __init__(self, **kwargs):
+            made["anthropic"] = kwargs
+
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs):
+            made["openai"] = kwargs
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeAnthropicClient)
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeOpenAIClient)
+
+    AnthropicAdapter()._resolve_client()
+    OpenAICompatibleAdapter(name="local")._resolve_client(
+        ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a/v1")
+    )
+    assert made["anthropic"]["max_retries"] == 0
+    assert made["openai"]["max_retries"] == 0
 
 
 def test_entry_terminal_outcome_decides_transient_vs_hard(graph):

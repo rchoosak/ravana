@@ -94,8 +94,14 @@ class ApiConnectorHandler:
             response = await client.request(
                 method, path, headers=headers, json=arguments.get("json"), params=arguments.get("params")
             )
-        except Exception as exc:  # noqa: BLE001 - normalize transport failures
-            # Connection reset / timeout: §3.6's "tool timeout" — transient.
+        except Exception as exc:
+            # ONLY transport-level failures (connection reset, timeout, DNS)
+            # are §3.6's "tool timeout" — transient. Anything else (a TypeError
+            # from a programming/config bug, say) propagates raw: the engine's
+            # terminal boundary fails the run hard instead of a wrong-type
+            # transient retry re-running broken code.
+            if not _is_transport_error(exc):
+                raise
             raise ToolkitError(
                 f"api_connector request to {path} failed: {exc}", kind=ToolFailureKind.TRANSIENT
             ) from exc
@@ -109,6 +115,21 @@ class ApiConnectorHandler:
 
 def _method_of(arguments: dict[str, Any]) -> str:
     return str(arguments.get("method", "POST")).upper()
+
+
+def _is_transport_error(exc: Exception) -> bool:
+    """Whether `exc` is a transport-level failure (network/timeout — §3.6
+    transient) as opposed to a programming/config bug. Covers the builtin
+    OS-level types plus httpx's own hierarchy (TransportError/TimeoutException
+    both subclass httpx.HTTPError; we never call raise_for_status, so the
+    status branch of that hierarchy can't occur here)."""
+    if isinstance(exc, (OSError, TimeoutError)):
+        return True
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a direct dependency
+        return False
+    return isinstance(exc, httpx.HTTPError)
 
 
 def _classify_status(status: int) -> ToolFailureKind:

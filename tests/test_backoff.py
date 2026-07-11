@@ -52,21 +52,29 @@ def test_failure_number_is_one_indexed():
         backoff_delay(0, base=1.0, cap=30.0)
 
 
-def test_engine_delays_grow_exponentially_across_retries(con):
-    # Two consecutive transient failures on one node: the recorded backoffs
-    # must double (attempt 1 ~base, attempt 2 ~2*base), per §3.6.
-    doc = WorkflowDoc.model_validate(
+def _single_node_doc(name: str, guards: dict | None = None) -> WorkflowDoc:
+    """One agent, one node, no edges — the minimal engine-retry testbed.
+    `guards` overrides (e.g. {"max_retries_per_node": 1}) apply to the graph."""
+    graph: dict = {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []}
+    if guards:
+        graph["guards"] = guards
+    return WorkflowDoc.model_validate(
         {
             "apiVersion": "ravana/v1",
             "kind": "Workflow",
-            "metadata": {"name": "backoff-test", "version": 1},
+            "metadata": {"name": name, "version": 1},
             "spec": {
                 "agents": [{"id": "a", "name": "A", "llm": {"provider": "anthropic", "model": "m"}, "system_prompt": "p"}],
-                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
+                "graph": graph,
             },
         }
     )
-    graph = compile_workflow(doc)
+
+
+def test_engine_delays_grow_exponentially_across_retries(con):
+    # Two consecutive transient failures on one node: the recorded backoffs
+    # must double (attempt 1 ~base, attempt 2 ~2*base), per §3.6.
+    graph = compile_workflow(_single_node_doc("backoff-test"))
     workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
     runtime = MockAgentRuntime(
         {"only": [{"transient_error": True}, {"transient_error": True}, {"structured_payload": {}}]}
@@ -144,23 +152,7 @@ def test_no_sleep_before_a_guaranteed_budget_failure(con):
     # the re-queued dispatch will fail the run without running a turn — so the
     # engine must NOT spend a backoff sleep first. Regression for the review
     # finding (the final sleep bought nothing).
-    doc = WorkflowDoc.model_validate(
-        {
-            "apiVersion": "ravana/v1",
-            "kind": "Workflow",
-            "metadata": {"name": "backoff-exhaust-test", "version": 1},
-            "spec": {
-                "agents": [{"id": "a", "name": "A", "llm": {"provider": "anthropic", "model": "m"}, "system_prompt": "p"}],
-                "graph": {
-                    "entry": "only",
-                    "nodes": [{"id": "only", "agent": "a"}],
-                    "edges": [],
-                    "guards": {"max_retries_per_node": 1},
-                },
-            },
-        }
-    )
-    graph = compile_workflow(doc)
+    graph = compile_workflow(_single_node_doc("backoff-exhaust-test", guards={"max_retries_per_node": 1}))
     workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
     runtime = MockAgentRuntime({"only": [{"transient_error": True}] * 5})
     sleeper = RecordingSleep()
