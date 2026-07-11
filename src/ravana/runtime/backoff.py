@@ -16,10 +16,14 @@ callable), so tests record requested delays instead of actually waiting.
 from __future__ import annotations
 
 import random
-from typing import Callable
+from typing import Awaitable, Callable
 
 # Uniform-random source, injectable for deterministic tests: rng(a, b) -> float in [a, b].
 Rng = Callable[[float, float], float]
+
+# The asyncio.sleep-shaped waiter both retry sites inject (engine per-node,
+# gateway per-entry). One alias so the concept is spelled once.
+RetrySleep = Callable[[float], Awaitable[None]]
 
 
 def backoff_delay(attempt: int, *, base: float, cap: float, rng: Rng = random.uniform) -> float:

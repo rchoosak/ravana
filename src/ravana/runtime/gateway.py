@@ -25,10 +25,10 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Protocol
 
 from ravana.compiler.graph import CompiledGraph
-from ravana.runtime.backoff import backoff_delay
+from ravana.runtime.backoff import RetrySleep, backoff_delay
 from ravana.runtime.base import AgentTurnResult, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
@@ -144,14 +144,14 @@ class LLMGateway:
         graph: CompiledGraph,
         adapters: dict[str, ProviderAdapter],
         tool_executor: ToolExecutor | None = None,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        retry_sleep: RetrySleep = asyncio.sleep,
     ):
         self._graph = graph
         self._adapters = adapters
         self._tools = tool_executor or _NoToolExecutor()
         # §3.6 backoff waiter for same-entry retries; injectable so tests
         # record requested delays instead of actually waiting.
-        self._sleep = sleep
+        self._retry_sleep = retry_sleep
         # §3.4: strategy is decided once per (provider, model), not re-derived
         # every call. Capabilities are static, so this memo is the "decided at
         # registration" contract without a separate registration step.
@@ -208,7 +208,7 @@ class LLMGateway:
                     # waiting on it would only delay the recovery the chain
                     # exists to provide.
                     if try_index < _PER_ENTRY_RETRIES:
-                        await self._sleep(
+                        await self._retry_sleep(
                             backoff_delay(try_index + 1, base=_ENTRY_RETRY_BASE_SECONDS, cap=_ENTRY_RETRY_CAP_SECONDS)
                         )
                     continue

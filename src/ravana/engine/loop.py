@@ -22,7 +22,7 @@ import asyncio
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from ravana.compiler.graph import TERMINAL, CompiledGraph
 from ravana.engine.dod import ProseVerdict, evaluate_dod
@@ -30,7 +30,7 @@ from ravana.engine.expr import apply_on_enter, eval_condition
 from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
 from ravana.observability.logging import log_event
-from ravana.runtime.backoff import backoff_delay
+from ravana.runtime.backoff import RetrySleep, backoff_delay
 from ravana.runtime.base import AgentRuntime, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.schema.util import dumps, loads, new_id, now_iso
@@ -43,9 +43,6 @@ _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
 # needs it.
 _NODE_RETRY_BASE_SECONDS = 1.0
 _NODE_RETRY_CAP_SECONDS = 30.0
-
-# asyncio.sleep-shaped; injectable so tests observe delays instead of waiting.
-RetrySleep = Callable[[float], Awaitable[None]]
 
 
 @dataclass
@@ -399,13 +396,25 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
             (str(exc), now_iso(), node_execution_id),
         )
         con.commit()
-        # §3.6: exponential backoff before the retry, keyed on the attempt that
-        # just failed (1st failure ~base, doubling, capped). The sleep is
-        # ctx.retry_sleep so tests record delays instead of waiting them out;
-        # _consecutive_failures still bounds total retries via
-        # max_retries_per_node.
-        delay = backoff_delay(attempt, base=_NODE_RETRY_BASE_SECONDS, cap=_NODE_RETRY_CAP_SECONDS)
-        log_event("WARN", f"transient failure on node '{node_id}' attempt {attempt}, retrying in {delay:.1f}s: {exc}", run_id=ctx.run_id)
+        # §3.6: exponential backoff before the retry, keyed on the CONSECUTIVE
+        # failure streak (1st failure ~base, doubling, capped) — the same
+        # counter that bounds retries. NOT the node's lifetime `attempt`
+        # number: a node re-entered by a §3.7 loop or a HITL resume has
+        # SUCCEEDED rows inflating `attempt`, and its first transient failure
+        # must back off ~base, not near the cap.
+        failed_streak = consecutive_failures + 1  # +1 = the failure that just happened
+        if failed_streak > guards.max_retries_per_node:
+            # Budget already spent: the re-queued dispatch will trip the
+            # max_retries_per_node guard without running a turn, so sleeping
+            # here would only delay the inevitable FAILED verdict.
+            ctx.queue.insert(0, node_id)
+            return
+        delay = backoff_delay(failed_streak, base=_NODE_RETRY_BASE_SECONDS, cap=_NODE_RETRY_CAP_SECONDS)
+        log_event(
+            "WARN",
+            f"transient failure on node '{node_id}' ({failed_streak} consecutive), retrying in {delay:.1f}s: {exc}",
+            run_id=ctx.run_id,
+        )
         await ctx.retry_sleep(delay)
         ctx.queue.insert(0, node_id)
         return

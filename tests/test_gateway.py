@@ -27,7 +27,7 @@ from ravana.runtime.providers.base import (
 )
 from ravana.schema.loader import load_workflow_yaml
 from ravana.schema.models import WorkflowDoc
-from tests.conftest import SDLC_WORKFLOW
+from tests.conftest import SDLC_WORKFLOW, RecordingSleep
 
 
 class _SurfacingExec:
@@ -39,15 +39,6 @@ class _SurfacingExec:
         return [Tool(name=t, description=f"fake {t}", input_schema={"type": "object"}) for t in toolkit_ids]
 
 
-class RecordingSleep:
-    """asyncio.sleep-shaped fake: records each requested backoff delay instead
-    of actually waiting, so retry tests stay instant."""
-
-    def __init__(self):
-        self.delays: list[float] = []
-
-    async def __call__(self, seconds: float) -> None:
-        self.delays.append(seconds)
 
 
 # A minimal single-agent workflow whose agent declares NO toolkits — used to
@@ -501,7 +492,7 @@ def test_primary_retried_once_before_falling_back(graph):
     primary = FlakyThenOK()
     fallback = FakeAdapter(name="anthropic", responses=[_submit({"system_spec": {"via": "fallback"}})])
     sleeper = RecordingSleep()
-    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, sleep=sleeper)
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
     result = _run(gateway, "dev")
     assert result.structured_payload == {"system_spec": {}}  # primary's retry, not the fallback
     assert len(fallback.requests) == 0  # fallback never used
@@ -515,7 +506,7 @@ def test_fallback_chain_used_when_primary_fails(graph):
     primary = FakeAdapter(name="local", fail=True)
     fallback = FakeAdapter(name="anthropic", responses=[_submit({"system_spec": {}})])
     sleeper = RecordingSleep()
-    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, sleep=sleeper)
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
     result = _run(gateway, "dev")
     assert result.structured_payload == {"system_spec": {}}
     assert len(fallback.requests) == 1  # fallback actually served the turn
@@ -528,7 +519,7 @@ def test_all_entries_exhausted_raises(graph):
     primary = FakeAdapter(name="local", fail=True)
     fallback = FakeAdapter(name="anthropic", fail=True)
     sleeper = RecordingSleep()
-    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, sleep=sleeper)
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
     with pytest.raises(TransientAgentError, match="all LLM entries exhausted"):
         _run(gateway, "dev")
     # One backoff per entry's internal retry (2 entries), none on chain moves.

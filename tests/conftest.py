@@ -16,6 +16,17 @@ SDLC_WORKFLOW = REPO_ROOT / "examples" / "workflows" / "software-development-tea
 SDLC_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "sdlc_mock_responses.yaml"
 
 
+class RecordingSleep:
+    """asyncio.sleep-shaped fake for §3.6 backoff: records each requested
+    delay instead of actually waiting, so retry tests stay instant."""
+
+    def __init__(self):
+        self.delays: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.delays.append(seconds)
+
+
 @pytest.fixture
 def con() -> sqlite3.Connection:
     return init_db(":memory:")

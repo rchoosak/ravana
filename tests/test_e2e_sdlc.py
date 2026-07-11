@@ -9,6 +9,7 @@ import asyncio
 from ravana.engine.loop import resume_hitl, start_run
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.schema.util import loads
+from tests.conftest import RecordingSleep
 
 
 def test_full_sdlc_run_reaches_completed(con, sdlc_graph, sdlc_workflow_id, sdlc_runtime):
@@ -115,15 +116,12 @@ def test_transient_failure_retries_then_succeeds(con, sdlc_graph, sdlc_workflow_
         "pm_final_review": [{"structured_payload": {"pm_verdict": "COMPLETE"}}],
     }
     runtime = MockAgentRuntime(fixture)
-    delays: list[float] = []
-
-    async def recording_sleep(seconds: float) -> None:
-        delays.append(seconds)
+    sleeper = RecordingSleep()
 
     run_id = asyncio.run(
         start_run(
             con, sdlc_graph, runtime, org_id="test", workflow_id=sdlc_workflow_id,
-            input_payload={"repository": "r"}, retry_sleep=recording_sleep,
+            input_payload={"repository": "r"}, retry_sleep=sleeper,
         )
     )
     run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
@@ -137,4 +135,4 @@ def test_transient_failure_retries_then_succeeds(con, sdlc_graph, sdlc_workflow_
     assert pm_attempts[1]["status"] == "SUCCEEDED"
     # §3.6: the retry backed off (one failure => one delay, equal jitter around
     # base=1s: 0.5 <= d <= 1.0), instead of re-dispatching immediately.
-    assert len(delays) == 1 and 0.5 <= delays[0] <= 1.0
+    assert len(sleeper.delays) == 1 and 0.5 <= sleeper.delays[0] <= 1.0
