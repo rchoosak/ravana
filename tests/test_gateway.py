@@ -81,6 +81,7 @@ class FakeAdapter:
     caps: set[Capability] = field(default_factory=lambda: {Capability.NATIVE_STRUCTURED_OUTPUT})
     responses: list[ProviderResponse] = field(default_factory=list)
     fail: bool = False
+    fail_retryable: bool = True  # False = permanent failure (auth/bad-request shaped)
     requests: list[ProviderRequest] = field(default_factory=list)
     _i: int = 0
 
@@ -90,7 +91,7 @@ class FakeAdapter:
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
         if self.fail:
-            raise ProviderError(f"{self.name} is down")
+            raise ProviderError(f"{self.name} is down", retryable=self.fail_retryable)
         resp = self.responses[min(self._i, len(self.responses) - 1)]
         self._i += 1
         return resp
@@ -496,8 +497,8 @@ def test_primary_retried_once_before_falling_back(graph):
     result = _run(gateway, "dev")
     assert result.structured_payload == {"system_spec": {}}  # primary's retry, not the fallback
     assert len(fallback.requests) == 0  # fallback never used
-    # §3.6: the same-entry retry backed off once (equal jitter: base/2 <= d <= base).
-    assert len(sleeper.delays) == 1 and 0.5 <= sleeper.delays[0] <= 1.0
+    # §3.6: the same-entry retry backed off once (first-failure band, base=1s).
+    sleeper.assert_delays(1.0)
 
 
 def test_fallback_chain_used_when_primary_fails(graph):
@@ -524,6 +525,100 @@ def test_all_entries_exhausted_raises(graph):
         _run(gateway, "dev")
     # One backoff per entry's internal retry (2 entries), none on chain moves.
     assert len(sleeper.delays) == 2
+
+
+# --- §3.6 error taxonomy: retryable vs permanent -----------------------------
+def test_classify_retryable_by_status_code():
+    from ravana.runtime.providers.base import classify_retryable
+
+    class _Err(Exception):
+        def __init__(self, status_code=None):
+            self.status_code = status_code
+
+    assert classify_retryable(_Err(429)) is True  # rate limit: breathing room helps
+    assert classify_retryable(_Err(500)) is True
+    assert classify_retryable(_Err(503)) is True
+    assert classify_retryable(_Err(408)) is True  # request timeout
+    assert classify_retryable(_Err()) is True  # no status (connection blip): availability bias
+    assert classify_retryable(_Err(401)) is False  # auth: a retry can't fix credentials
+    assert classify_retryable(_Err(400)) is False  # invalid request
+    assert classify_retryable(_Err(404)) is False  # unknown model
+    assert classify_retryable(_Err(422)) is False
+
+
+def test_permanent_error_skips_same_entry_retry_and_goes_to_fallback(graph):
+    # An auth-shaped (permanent) primary failure must NOT be retried at the
+    # same entry — no backoff sleep — and the chain moves straight to the
+    # fallback, which serves the turn.
+    primary = FakeAdapter(name="local", fail=True, fail_retryable=False)
+    fallback = FakeAdapter(name="anthropic", responses=[_submit({"system_spec": {}})])
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
+    result = _run(gateway, "dev")
+    assert result.structured_payload == {"system_spec": {}}
+    assert len(primary.requests) == 1  # exactly one try: permanent means no same-entry retry
+    assert sleeper.delays == []  # and no backoff was spent on it
+
+
+def test_all_permanent_chain_raises_hard_error_not_transient(graph):
+    # Every entry failing permanently (auth/config) must NOT surface as
+    # TransientAgentError — the engine would burn max_retries_per_node
+    # re-running a hopeless chain. It surfaces as a hard error instead.
+    primary = FakeAdapter(name="local", fail=True, fail_retryable=False)
+    fallback = FakeAdapter(name="anthropic", fail=True, fail_retryable=False)
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=sleeper)
+    with pytest.raises(RuntimeError, match="failed permanently"):
+        _run(gateway, "dev")
+    assert sleeper.delays == []  # nothing to wait for anywhere in the chain
+
+
+def test_mixed_chain_with_any_retryable_failure_stays_transient(graph):
+    # Primary fails permanently, fallback fails transiently: the turn is still
+    # transient (the engine's own retry may recover), not a hard error.
+    primary = FakeAdapter(name="local", fail=True, fail_retryable=False)
+    fallback = FakeAdapter(name="anthropic", fail=True, fail_retryable=True)
+    gateway = LLMGateway(graph, {"local": primary, "anthropic": fallback}, retry_sleep=RecordingSleep())
+    with pytest.raises(TransientAgentError, match="all LLM entries exhausted"):
+        _run(gateway, "dev")
+
+
+def test_all_permanent_chain_fails_the_run_without_node_retries(con):
+    # Engine-level consequence: a permanently-misconfigured agent fails the
+    # run on the FIRST node_execution — no §3.6 node retries, no backoff.
+    import asyncio as _asyncio
+
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+    from ravana.schema.loader import load_workflow_yaml as _load
+
+    graph = compile_workflow(_load(SDLC_WORKFLOW))
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    adapter = FakeAdapter(name="anthropic", fail=True, fail_retryable=False)
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(graph, {p: adapter for p in ("anthropic", "local", "openai")}, retry_sleep=sleeper)
+
+    run_id = _asyncio.run(
+        start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id, input_payload={"repository": "r"}, retry_sleep=sleeper)
+    )
+    run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    rows = con.execute("SELECT COUNT(*) c FROM node_execution WHERE run_id = ?", (run_id,)).fetchone()["c"]
+    assert rows == 1  # failed immediately: no wrong-type node retries
+    assert sleeper.delays == []  # and zero backoff spent anywhere
+
+
+def test_no_tool_executor_wired_is_a_hard_error_not_provider_fault():
+    # Defense-in-depth taxonomy: _NoToolExecutor.execute is a WIRING bug, so it
+    # raises a hard error — NOT ProviderError, which the fallback loop would
+    # retry/fall through (burning full LLM turns per pass). Note it is normally
+    # unreachable through the tool loop: _NoToolExecutor surfaces zero tools,
+    # so the per-node boundary refuses any tool call before execute — this
+    # pins the taxonomy for whatever future path reaches it directly.
+    from ravana.runtime.gateway import _NoToolExecutor
+
+    with pytest.raises(RuntimeError, match="no ToolExecutor is wired"):
+        asyncio.run(_NoToolExecutor().execute(run_id="r", node_id="n", tool="x", arguments={}, idempotency_key="k"))
 
 
 def test_openai_adapter_caches_client_per_endpoint():

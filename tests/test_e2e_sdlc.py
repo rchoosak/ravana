@@ -133,6 +133,6 @@ def test_transient_failure_retries_then_succeeds(con, sdlc_graph, sdlc_workflow_
     ).fetchall()
     assert pm_attempts[0]["status"] == "FAILED"
     assert pm_attempts[1]["status"] == "SUCCEEDED"
-    # §3.6: the retry backed off (one failure => one delay, equal jitter around
-    # base=1s: 0.5 <= d <= 1.0), instead of re-dispatching immediately.
-    assert len(sleeper.delays) == 1 and 0.5 <= sleeper.delays[0] <= 1.0
+    # §3.6: the retry backed off once (first-failure band around base=1s),
+    # instead of re-dispatching immediately.
+    sleeper.assert_delays(1.0)

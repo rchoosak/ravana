@@ -26,11 +26,14 @@ Rng = Callable[[float, float], float]
 RetrySleep = Callable[[float], Awaitable[None]]
 
 
-def backoff_delay(attempt: int, *, base: float, cap: float, rng: Rng = random.uniform) -> float:
-    """Delay in seconds before retrying after the `attempt`-th failure
-    (1-indexed: the first failure backs off `~base`, doubling per failure,
-    capped at `cap`). Equal jitter: exp/2 fixed + uniform(0, exp/2)."""
-    if attempt < 1:
-        raise ValueError(f"attempt is 1-indexed, got {attempt}")
-    exp = min(cap, base * (2 ** (attempt - 1)))
+def backoff_delay(failure_number: int, *, base: float, cap: float, rng: Rng = random.uniform) -> float:
+    """Delay in seconds before retrying after the `failure_number`-th
+    CONSECUTIVE failure (1-indexed: the first failure backs off `~base`,
+    doubling per failure, capped at `cap`). Named to be unmistakably the
+    failure-streak ordinal — NOT the engine's lifetime `attempt` number, which
+    counts successes too (a §3.7 loop revisit must not inflate the delay).
+    Equal jitter: exp/2 fixed + uniform(0, exp/2)."""
+    if failure_number < 1:
+        raise ValueError(f"failure_number is 1-indexed, got {failure_number}")
+    exp = min(cap, base * (2 ** (failure_number - 1)))
     return exp / 2 + rng(0.0, exp / 2)

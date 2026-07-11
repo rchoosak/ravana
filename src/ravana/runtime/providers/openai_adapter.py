@@ -26,6 +26,7 @@ from ravana.runtime.providers.base import (
     Capability,
     NormalizedToolCall,
     ProviderError,
+    classify_retryable,
     ProviderRequest,
     ProviderResponse,
 )
@@ -103,7 +104,9 @@ class OpenAICompatibleAdapter:
         try:
             completion = await client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            raise ProviderError(f"openai-compatible completion failed: {exc}") from exc
+            # §3.6 taxonomy: carry whether a same-entry retry can plausibly
+            # succeed (429/5xx/timeout) or not (auth/bad-request 4xx).
+            raise ProviderError(f"openai-compatible completion failed: {exc}", retryable=classify_retryable(exc)) from exc
 
         choice = completion.choices[0]
         msg = choice.message

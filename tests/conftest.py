@@ -26,6 +26,13 @@ class RecordingSleep:
     async def __call__(self, seconds: float) -> None:
         self.delays.append(seconds)
 
+    def assert_delays(self, *exponentials: float) -> None:
+        """Assert one recorded delay per expected exponential, each within its
+        equal-jitter band [exp/2, exp] — the shared §3.6 bound check."""
+        assert len(self.delays) == len(exponentials), f"expected {len(exponentials)} backoffs, got {self.delays}"
+        for delay, exp in zip(self.delays, exponentials):
+            assert exp / 2 <= delay <= exp, f"delay {delay} outside equal-jitter band [{exp / 2}, {exp}]"
+
 
 @pytest.fixture
 def con() -> sqlite3.Connection:

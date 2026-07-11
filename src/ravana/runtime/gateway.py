@@ -96,7 +96,12 @@ class _NoToolExecutor:
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str
     ) -> str:
-        raise ProviderError(
+        # A wiring bug, not a provider fault — deliberately NOT ProviderError,
+        # which the fallback loop would retry/fall through (each pass burning
+        # full LLM turns), nor ToolkitError, which the tool loop would feed
+        # back to the model to try again. No executor means no tool can ever
+        # run; fail the run hard via the engine's terminal boundary.
+        raise RuntimeError(
             f"agent tried to call tool '{tool}' but no ToolExecutor is wired "
             "(no toolkits are available to this run)"
         )
@@ -160,7 +165,11 @@ class LLMGateway:
     def _adapter_for(self, provider: str) -> ProviderAdapter:
         adapter = self._adapters.get(provider)
         if adapter is None:
-            raise ProviderError(f"no adapter registered for provider '{provider}'")
+            # Config error, and permanent BY ENTRY: retrying this entry can't
+            # conjure the adapter, but the next fallback entry may name a
+            # provider that IS registered — so it stays a ProviderError
+            # (chain moves on), just never same-entry retried.
+            raise ProviderError(f"no adapter registered for provider '{provider}'", retryable=False)
         return adapter
 
     def _strategy_for(self, adapter: ProviderAdapter, model: str) -> _Strategy:
@@ -193,6 +202,7 @@ class LLMGateway:
         # entry's budget is spent does the node_execution fail.
         chain: list[LLMConfig] = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
         last_error: Exception | None = None
+        saw_retryable = False
         for llm in chain:
             for try_index in range(_PER_ENTRY_RETRIES + 1):
                 try:
@@ -202,17 +212,35 @@ class LLMGateway:
                     )
                 except ProviderError as exc:
                     last_error = exc
-                    # §3.6: back off before retrying the SAME entry — a 429/5xx
-                    # provider needs breathing room. Moving to the NEXT fallback
-                    # entry sleeps zero: it's a different provider/model, and
-                    # waiting on it would only delay the recovery the chain
-                    # exists to provide.
+                    # §3.6 taxonomy: a PERMANENT failure (auth 401, invalid
+                    # request 400, unknown model) cannot succeed on a same-entry
+                    # retry — skip the retry AND its backoff sleep, and move
+                    # straight to the next fallback entry (a different
+                    # provider/model may well work).
+                    if not exc.retryable:
+                        break
+                    saw_retryable = True
+                    # Retryable (429/5xx/timeout): back off before retrying the
+                    # SAME entry — the provider needs breathing room. Moving to
+                    # the NEXT entry sleeps zero either way: it's a different
+                    # provider, and waiting on it would only delay the recovery
+                    # the chain exists to provide.
                     if try_index < _PER_ENTRY_RETRIES:
                         await self._retry_sleep(
                             backoff_delay(try_index + 1, base=_ENTRY_RETRY_BASE_SECONDS, cap=_ENTRY_RETRY_CAP_SECONDS)
                         )
                     continue
-        raise TransientAgentError(f"all LLM entries exhausted for agent '{agent_id}': {last_error}")
+        if saw_retryable:
+            # At least one failure was transient — the engine's own §3.6 retry
+            # (fresh attempt, larger backoff) can plausibly recover the node.
+            raise TransientAgentError(f"all LLM entries exhausted for agent '{agent_id}': {last_error}")
+        # Every entry failed PERMANENTLY (auth/config/bad request): re-running
+        # the chain cannot succeed, so this must NOT look transient — raise a
+        # hard error the engine fails the run on immediately, instead of
+        # burning max_retries_per_node re-running a hopeless chain.
+        raise RuntimeError(
+            f"all LLM entries failed permanently for agent '{agent_id}' (auth/config, not transient): {last_error}"
+        )
 
     async def _run_one_llm(
         self,

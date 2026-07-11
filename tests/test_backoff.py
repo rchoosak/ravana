@@ -24,30 +24,30 @@ def _mid(a: float, b: float) -> float:
     return (a + b) / 2
 
 
-def test_delay_doubles_per_attempt():
+def test_delay_doubles_per_consecutive_failure():
     # With rng pinned to the midpoint, equal jitter yields exactly 3/4 of the
-    # exponential: attempt 1 -> 0.75*base, 2 -> 1.5*base, 3 -> 3*base.
+    # exponential: failure 1 -> 0.75*base, 2 -> 1.5*base, 3 -> 3*base.
     assert backoff_delay(1, base=1.0, cap=30.0, rng=_mid) == pytest.approx(0.75)
     assert backoff_delay(2, base=1.0, cap=30.0, rng=_mid) == pytest.approx(1.5)
     assert backoff_delay(3, base=1.0, cap=30.0, rng=_mid) == pytest.approx(3.0)
 
 
 def test_delay_is_capped():
-    # Attempt 10 of base=1 would be 512s uncapped; the cap bounds it.
+    # Failure 10 of base=1 would be 512s uncapped; the cap bounds it.
     assert backoff_delay(10, base=1.0, cap=30.0, rng=_mid) == pytest.approx(22.5)  # 0.75 * cap
 
 
 def test_jitter_stays_within_equal_jitter_bounds():
     # Real rng: delay must live in [exp/2, exp] — never below half (equal
     # jitter's deterministic floor), never above the full exponential.
-    for attempt in (1, 2, 3, 4):
-        exp = min(30.0, 1.0 * 2 ** (attempt - 1))
+    for failure_number in (1, 2, 3, 4):
+        exp = min(30.0, 1.0 * 2 ** (failure_number - 1))
         for _ in range(50):
-            d = backoff_delay(attempt, base=1.0, cap=30.0)
+            d = backoff_delay(failure_number, base=1.0, cap=30.0)
             assert exp / 2 <= d <= exp
 
 
-def test_attempt_is_one_indexed():
+def test_failure_number_is_one_indexed():
     with pytest.raises(ValueError, match="1-indexed"):
         backoff_delay(0, base=1.0, cap=30.0)
 
@@ -77,9 +77,8 @@ def test_engine_delays_grow_exponentially_across_retries(con):
         start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id, retry_sleep=sleeper)
     )
     assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "COMPLETED"
-    assert len(sleeper.delays) == 2
-    assert 0.5 <= sleeper.delays[0] <= 1.0  # 1st consecutive failure: exp=1s, equal jitter
-    assert 1.0 <= sleeper.delays[1] <= 2.0  # 2nd consecutive failure: exp=2s — grew, not flat
+    # 1st consecutive failure: exp=1s; 2nd: exp=2s — grew, not flat.
+    sleeper.assert_delays(1.0, 2.0)
 
 
 def _cyclic_two_node_doc() -> WorkflowDoc:
@@ -135,10 +134,9 @@ def test_backoff_keys_on_consecutive_failures_not_lifetime_attempts(con):
         start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id, retry_sleep=sleeper)
     )
     assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "COMPLETED"
-    # One failure => one backoff, and it's a FIRST-failure delay (exp=1s =>
-    # 0.5..1.0s), NOT backoff_delay(3) (exp=4s => 2..4s) off the lifetime attempt.
-    assert len(sleeper.delays) == 1
-    assert 0.5 <= sleeper.delays[0] <= 1.0
+    # One failure => one backoff, and it's a FIRST-failure delay (exp=1s),
+    # NOT backoff_delay(3) (exp=4s) off the lifetime attempt.
+    sleeper.assert_delays(1.0)
 
 
 def test_no_sleep_before_a_guaranteed_budget_failure(con):

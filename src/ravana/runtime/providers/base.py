@@ -97,8 +97,42 @@ class ProviderResponse:
 
 
 class ProviderError(Exception):
-    """Non-transient provider failure (auth, invalid request). The gateway
-    does not retry these — it moves to the next fallback entry (§3.6)."""
+    """A provider call failed. `retryable` is the §3.6 taxonomy split the
+    gateway acts on:
+
+      - retryable=True (429/5xx/timeouts/connection blips): retrying the SAME
+        entry after a backoff can plausibly succeed — the gateway spends its
+        per-entry retry, then moves down the fallback chain.
+      - retryable=False (auth 401/403, invalid request 400/422, model 404):
+        retrying the same entry cannot succeed; the gateway skips the
+        same-entry retry (and its backoff sleep) and goes straight to the next
+        fallback entry — a different provider/model may well work.
+
+    When EVERY entry in the chain failed permanently, the turn error is not
+    transient at all: the gateway raises a hard error the engine fails the run
+    on immediately, instead of TransientAgentError (which would burn
+    max_retries_per_node re-running a hopeless chain)."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+# HTTP statuses where a retry of the same endpoint can plausibly succeed:
+# timeout, contention, rate limit, server-side failure.
+_RETRYABLE_STATUSES = frozenset({408, 409, 429})
+
+
+def classify_retryable(exc: Exception) -> bool:
+    """Whether a provider SDK exception is worth retrying at the same entry.
+    Both the anthropic and openai SDKs expose `status_code` on their API
+    error types; anything without one (connection reset, timeout, unknown) is
+    treated as retryable — availability bias for genuinely flaky networks —
+    while a definite non-retryable 4xx (auth, bad request) is permanent."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        return True
+    return status in _RETRYABLE_STATUSES or status >= 500
 
 
 class ProviderAdapter(Protocol):
