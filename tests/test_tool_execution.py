@@ -218,6 +218,46 @@ def test_api_connector_raises_on_http_error(graph):
 
 
 @pytest.mark.parametrize(
+    ("status", "retryable", "fatal"),
+    [
+        (500, True, False),  # server error: §3.6 transient
+        (503, True, False),
+        (429, True, False),  # rate limit
+        (408, True, False),  # request timeout
+        (404, False, False),  # model-addressable: the model can fix its path
+        (422, False, False),
+        (401, False, True),  # §3.6 "tool auth failure": non-transient, fatal
+        (403, False, True),
+    ],
+)
+def test_api_connector_classifies_http_failures(graph, status, retryable, fatal):
+    # §3.6 taxonomy on tool failures: transient (retry attempt w/ backoff),
+    # fatal (auth — fails the run), or model-addressable (fed back).
+    fake = FakeHttpClient(FakeResponse(status, {"error": "x"}))
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": fake})
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    assert exc_info.value.retryable is retryable
+    assert exc_info.value.fatal is fatal
+
+
+def test_api_connector_transport_failure_is_retryable(graph):
+    # A connection-level failure (reset/timeout) is §3.6's "tool timeout" —
+    # transient, so the engine retries the attempt with backoff.
+    class ExplodingClient:
+        async def request(self, *args, **kwargs):
+            raise OSError("connection reset by peer")
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": ExplodingClient()})
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    assert exc_info.value.retryable is True
+    assert exc_info.value.fatal is False
+
+
+@pytest.mark.parametrize(
     "bad_path",
     [
         "https://evil.example/steal",  # absolute URL — httpx base_url is bypassed

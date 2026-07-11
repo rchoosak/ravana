@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from ravana.compiler.graph import compile_workflow
-from ravana.runtime.base import TransientAgentError
+from ravana.runtime.base import AgentOutputError, TransientAgentError
 from ravana.runtime.gateway import SUBMIT_RESULT, LLMGateway
 from ravana.runtime.providers.base import (
     Capability,
@@ -357,15 +357,15 @@ def test_multiple_mixed_submit_results_keep_the_transcript_balanced(graph):
     assert tool_use_ids <= answered_ids  # every tool_use (incl. both submits) has a result
 
 
-def test_tool_execution_error_is_fed_back_not_raised(graph):
-    # A toolkit failing at execution is a normal agent-loop event, fed back as a
-    # tool error so the model can adapt — it must NOT crash the turn (which would
-    # escape the engine's transient-only catch and strand the run).
+def test_model_addressable_tool_error_is_fed_back_not_raised(graph):
+    # §3.6 taxonomy: a MODEL-ADDRESSABLE tool failure (404/422/bad args —
+    # neither retryable nor fatal) is fed back as an error tool_result so the
+    # model can adjust its call or route around it. It must NOT end the turn.
     from ravana.runtime.toolkits.base import ToolkitError
 
     class FailingExec(_SurfacingExec):
         async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
-            raise ToolkitError("remote 500")
+            raise ToolkitError("HTTP 404 from /nope")  # default: retryable=False, fatal=False
 
     adapter = FakeAdapter(
         responses=[
@@ -376,18 +376,144 @@ def test_tool_execution_error_is_fed_back_not_raised(graph):
     gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=FailingExec())
     result = _run(gateway, "pm")  # must not raise
     tool_result = next(m for m in adapter.requests[1].messages if m.role == "tool_result")
-    assert "failed: remote 500" in tool_result.content
+    assert "failed: HTTP 404" in tool_result.content
     assert result.structured_payload == {"requirement_clarity": "HIGH"}
+
+
+def test_transient_tool_error_ends_the_turn_as_transient(graph):
+    # §3.6 lists "tool timeout" as TRANSIENT: a retryable ToolkitError must end
+    # the turn as TransientAgentError so the ENGINE retries a fresh
+    # node_execution attempt with backoff — not be silently fed back with no
+    # backoff anywhere.
+    from ravana.runtime.toolkits.base import ToolkitError
+
+    class TimeoutExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            raise ToolkitError("request timed out", retryable=True)
+
+    adapter = FakeAdapter(
+        responses=[ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="tc1", tool="web_search", arguments={})])]
+    )
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=TimeoutExec())
+    with pytest.raises(TransientAgentError, match="failed transiently"):
+        _run(gateway, "pm")
+
+
+def test_fatal_tool_error_is_a_hard_failure(graph):
+    # §3.6 lists "tool auth failure" as NON-transient: a fatal ToolkitError
+    # (401/403) fails the run — neither fed back nor retried.
+    from ravana.runtime.toolkits.base import ToolkitError
+
+    class AuthFailExec(_SurfacingExec):
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            raise ToolkitError("HTTP 401 unauthorized", retryable=False, fatal=True)
+
+    adapter = FakeAdapter(
+        responses=[ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="tc1", tool="web_search", arguments={})])]
+    )
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=AuthFailExec())
+    with pytest.raises(RuntimeError, match="failed fatally"):
+        _run(gateway, "pm")
+
+
+def _single_node_gateway_graph(output_schema: dict | None = None, toolkits: list[str] | None = None):
+    """Minimal one-node workflow compiled for engine+gateway e2e tests."""
+    spec: dict = {
+        "agents": [{"id": "a", "name": "A", "llm": {"provider": "anthropic", "model": "m"}, "system_prompt": "p"}],
+        "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
+    }
+    if output_schema is not None:
+        spec["agents"][0]["output_schema"] = output_schema
+    if toolkits:
+        spec["toolkits"] = [{"id": t, "type": "web_search"} for t in toolkits]
+        spec["agents"][0]["toolkits"] = toolkits
+    doc = WorkflowDoc.model_validate(
+        {"apiVersion": "ravana/v1", "kind": "Workflow", "metadata": {"name": "gw-e2e", "version": 1}, "spec": spec}
+    )
+    return compile_workflow(doc)
+
+
+def test_engine_retries_a_transient_tool_failure_with_backoff(con):
+    # End-to-end §3.6: a tool timeout fails the attempt transiently; the engine
+    # backs off, dispatches a NEW attempt, and the retry succeeds.
+    import asyncio as _asyncio
+
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+    from ravana.runtime.toolkits.base import ToolkitError
+    from tests.conftest import RecordingSleep as _RS
+
+    class FlakyToolExec(_SurfacingExec):
+        calls = 0
+
+        async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):
+            self.calls += 1
+            if self.calls == 1:
+                raise ToolkitError("connect timeout", retryable=True)
+            return "recovered"
+
+    graph = _single_node_gateway_graph(toolkits=["web_search"])
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    calls_tool = ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="t1", tool="web_search", arguments={"q": "x"})])
+    # Attempt 1 consumes response[0] and dies at the tool; attempt 2 replays
+    # the tool call (response[1], tool now recovers) then submits (response[2]).
+    adapter = FakeAdapter(name="anthropic", responses=[calls_tool, calls_tool, _submit({"done": True})])
+    sleeper = _RS()
+    executor = FlakyToolExec()
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=executor, retry_sleep=sleeper)
+
+    run_id = _asyncio.run(
+        start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id, retry_sleep=sleeper)
+    )
+    attempts = con.execute(
+        "SELECT attempt, status FROM node_execution WHERE run_id = ? ORDER BY attempt", (run_id,)
+    ).fetchall()
+    assert [r["status"] for r in attempts] == ["FAILED", "SUCCEEDED"]  # a NEW attempt, per §3.6
+    assert executor.calls == 2  # the tool actually re-ran on the retry
+    sleeper.assert_delays(1.0)  # and the engine backed off between attempts
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "COMPLETED"
+
+
+def test_repair_exhaustion_fails_the_run_without_node_retries(con):
+    # §3.6 "repair budget exhausted" is NON-transient: the run FAILs on the
+    # first node_execution — no backoff, no extra attempts, and the model is
+    # not called beyond the repair budget.
+    import asyncio as _asyncio
+
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+    from tests.conftest import RecordingSleep as _RS
+
+    graph = _single_node_gateway_graph(
+        output_schema={"type": "object", "properties": {"verdict": {"type": "string", "enum": ["OK"]}}, "required": ["verdict"], "additionalProperties": False}
+    )
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    max_repairs = graph.doc.spec.graph.guards.max_output_repairs
+    adapter = FakeAdapter(name="anthropic", responses=[_submit({"verdict": "NOPE"})])  # invalid enum, forever
+    sleeper = _RS()
+    gateway = LLMGateway(graph, {"anthropic": adapter}, retry_sleep=sleeper)
+
+    run_id = _asyncio.run(
+        start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id, retry_sleep=sleeper)
+    )
+    run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    rows = con.execute("SELECT COUNT(*) c FROM node_execution WHERE run_id = ?", (run_id,)).fetchone()["c"]
+    assert rows == 1  # no node retries for exhausted repairs
+    assert sleeper.delays == []  # and no backoff spent
+    assert len(adapter.requests) == max_repairs + 1  # model called exactly budget+1 times, never more
 
 
 def test_non_compliant_provider_that_never_submits_is_bounded(graph):
     # A provider that keeps answering with text and never submits (ignoring the
     # forced submit_result) must NOT loop forever — the gateway bounds total
-    # model round-trips and fails the turn.
+    # model round-trips and fails the turn. §3.6 "guard exceeded" is
+    # NON-transient: the same provider would ignore the forced submit again on
+    # a retried attempt, so this is AgentOutputError, not TransientAgentError.
     never_submits = ProviderResponse(text="still thinking, no tool call", tool_calls=[])
     adapter = FakeAdapter(responses=[never_submits])  # returned repeatedly
     gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=_SurfacingExec())
-    with pytest.raises(TransientAgentError, match="did not produce a valid submit_result"):
+    with pytest.raises(AgentOutputError, match="did not produce a valid submit_result"):
         _run(gateway, "pm")
 
 
@@ -466,10 +592,13 @@ def test_repair_loop_on_invalid_output(graph):
 
 
 def test_repair_budget_exhausted_fails(graph):
-    # max_output_repairs is 2 in the SDLC example; 3 invalid submits exhausts it.
+    # max_output_repairs is 2 in the SDLC example; 3 invalid submits exhausts
+    # it. §3.6: repair exhaustion is NON-transient (AgentOutputError, not
+    # TransientAgentError) — the engine must fail the run, not retry the node
+    # past a budget that already expired.
     adapter = FakeAdapter(responses=[_submit({"qa_status": "NOPE", "qa_report": {}})])
     gateway = LLMGateway(graph, {"openai": adapter})
-    with pytest.raises(TransientAgentError, match="failed validation"):
+    with pytest.raises(AgentOutputError, match="failed validation"):
         _run(gateway, "qa")
 
 

@@ -29,7 +29,7 @@ from typing import Any, Protocol
 
 from ravana.compiler.graph import CompiledGraph
 from ravana.runtime.backoff import RetrySleep, backoff_delay
-from ravana.runtime.base import AgentTurnResult, TransientAgentError
+from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
@@ -195,11 +195,12 @@ class LLMGateway:
         # own small retry budget (default 1 retry per entry — distinct from,
         # and smaller than, the engine-level max_retries_per_node, so a chain
         # of N fallbacks can't multiply total attempts by N). A provider-level
-        # failure (ProviderError) is what a retry/fallback responds to; a
-        # TransientAgentError from repair-budget exhaustion is the model
-        # producing bad output, not a provider fault, so it propagates
-        # immediately without burning the fallback chain. Only when every
-        # entry's budget is spent does the node_execution fail.
+        # failure (ProviderError) is what a retry/fallback responds to; an
+        # AgentOutputError from repair-budget exhaustion is the model producing
+        # bad output, not a provider fault, so it propagates immediately —
+        # past this chain AND past the engine's transient retry (§3.6 line:
+        # "repair budget exhausted" is non-transient). Only when every entry's
+        # budget is spent does the node_execution fail.
         chain: list[LLMConfig] = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
         last_error: Exception | None = None
         saw_retryable = False
@@ -289,7 +290,9 @@ class LLMGateway:
                     input_tokens=input_tokens, output_tokens=output_tokens, repair_count=repair_count,
                 )
             if repair_count >= guards.max_output_repairs:
-                raise TransientAgentError(f"node '{node_id}' guided output invalid after {repair_count} repairs: {error}")
+                # §3.6: repair exhaustion is NON-transient — the run fails now;
+                # a node retry would just re-ask past an expired budget.
+                raise AgentOutputError(f"node '{node_id}' guided output invalid after {repair_count} repairs: {error}")
             repair_count += 1
             messages.append(UserMessage(text=f"That output was invalid: {error}. Return valid JSON matching the schema."))
 
@@ -333,7 +336,10 @@ class LLMGateway:
 
         while True:
             if model_calls >= max_model_calls:
-                raise TransientAgentError(
+                # §3.6 "guard exceeded" is non-transient: a provider that
+                # ignored the forced submit for a whole turn's ceiling will
+                # ignore it again on a retried attempt.
+                raise AgentOutputError(
                     f"node '{node_id}' did not produce a valid submit_result within {max_model_calls} model turns "
                     f"(provider ignored the forced submit?)"
                 )
@@ -396,9 +402,19 @@ class LLMGateway:
                             run_id=run_id, node_id=node_id, tool=tc.tool, arguments=tc.arguments, idempotency_key=key
                         )
                     except ToolkitError as exc:
-                        # A tool failing is a normal event in an agent loop, not
-                        # a run crash: feed the error back so the model can
-                        # retry, route around it, or submit.
+                        # §3.6 routes each failure type differently:
+                        if exc.fatal:
+                            # Tool auth failure — non-transient, fails the run
+                            # (neither the model nor a retry fixes credentials).
+                            raise RuntimeError(f"tool '{tc.tool}' failed fatally: {exc}") from exc
+                        if exc.retryable:
+                            # Tool timeout / 5xx — transient: end the turn so
+                            # the ENGINE retries a fresh node_execution attempt
+                            # with backoff. Side effects already fired in this
+                            # turn are deduped by the content-addressed key.
+                            raise TransientAgentError(f"tool '{tc.tool}' failed transiently: {exc}") from exc
+                        # Model-addressable (404/422/bad args): feed the error
+                        # back so the model can adjust or route around it.
                         messages.append(_error_result(tc, f"tool '{tc.tool}' failed: {exc}"))
                         continue
                     recorded_tool_calls.append({"tool": tc.tool, "arguments": tc.arguments, "idempotency_key": key})
@@ -429,7 +445,9 @@ class LLMGateway:
                         tool_call_count=len(recorded_tool_calls),
                     )
                 if repair_count >= guards.max_output_repairs:
-                    raise TransientAgentError(
+                    # §3.6: repair exhaustion is NON-transient — fail the run
+                    # now rather than re-asking past an expired budget.
+                    raise AgentOutputError(
                         f"node '{node_id}' output failed validation after {repair_count} repairs: {error}"
                     )
                 repair_count += 1

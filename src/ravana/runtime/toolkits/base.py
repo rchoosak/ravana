@@ -12,8 +12,25 @@ from typing import Any, Protocol
 
 
 class ToolkitError(Exception):
-    """A toolkit failed to execute (bad config, remote error, unimplemented
-    type). Surfaces to the gateway as a tool failure."""
+    """A toolkit failed to execute. §3.6 types the failure, and the gateway
+    routes each type differently:
+
+      - retryable=True (transport timeout, HTTP 5xx/429/408): §3.6 lists "tool
+        timeout" as TRANSIENT — the turn ends as a TransientAgentError so the
+        engine retries the node_execution attempt with backoff (side effects
+        already fired are deduped by the content-addressed idempotency key).
+      - fatal=True (tool auth 401/403): §3.6 lists "tool auth failure" as
+        NON-transient — the run fails immediately; neither the model nor a
+        retry can fix credentials.
+      - neither (HTTP 404/422, invalid arguments, bad path): model-addressable
+        — fed back into the turn as an error tool_result so the model can
+        adjust its call or route around it.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False, fatal: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+        self.fatal = fatal
 
 
 class ToolkitHandler(Protocol):

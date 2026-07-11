@@ -95,12 +95,20 @@ class ApiConnectorHandler:
                 method, path, headers=headers, json=arguments.get("json"), params=arguments.get("params")
             )
         except Exception as exc:  # noqa: BLE001 - normalize transport failures
-            raise ToolkitError(f"api_connector request to {path} failed: {exc}") from exc
+            # Connection reset / timeout: §3.6's "tool timeout" — transient.
+            raise ToolkitError(f"api_connector request to {path} failed: {exc}", retryable=True) from exc
 
         status = getattr(response, "status_code", None)
         body = _body_text(response)
         if status is not None and status >= 400:
-            raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}")
+            raise ToolkitError(
+                f"api_connector got HTTP {status} from {path}: {body[:500]}",
+                # 5xx/429/408: the remote may recover — transient (§3.6).
+                retryable=status in (408, 429) or status >= 500,
+                # 401/403: §3.6 "tool auth failure" — non-transient, fails the
+                # run; neither the model nor a retry can fix credentials.
+                fatal=status in (401, 403),
+            )
         return body
 
 
