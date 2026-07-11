@@ -25,8 +25,7 @@ from typing import Any
 from ravana.runtime.providers.base import (
     Capability,
     NormalizedToolCall,
-    ProviderError,
-    classify_retryable,
+    to_provider_error,
     ProviderRequest,
     ProviderResponse,
 )
@@ -84,9 +83,10 @@ class AnthropicAdapter:
         try:
             message = await self._client.messages.create(**kwargs)
         except Exception as exc:  # noqa: BLE001 - normalize every provider failure to one type
-            # §3.6 taxonomy: carry whether a same-entry retry can plausibly
-            # succeed (429/5xx/timeout) or not (auth/bad-request 4xx).
-            raise ProviderError(f"anthropic completion failed: {exc}", retryable=classify_retryable(exc)) from exc
+            # §3.6 taxonomy: classified retryable/permanent in one shared place
+            # (a missing credential arrives as the SDK's TypeError — no
+            # status_code — and classifies permanent, not transient).
+            raise to_provider_error("anthropic completion failed", exc) from exc
 
         text_parts: list[str] = []
         tool_calls: list[NormalizedToolCall] = []

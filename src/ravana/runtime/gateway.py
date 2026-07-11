@@ -33,7 +33,7 @@ from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgen
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
-from ravana.runtime.toolkits.base import ToolkitError
+from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.providers.base import (
     AssistantMessage,
     Capability,
@@ -203,8 +203,13 @@ class LLMGateway:
         # budget is spent does the node_execution fail.
         chain: list[LLMConfig] = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
         last_error: Exception | None = None
-        saw_retryable = False
+        # Whether any entry's TERMINAL outcome was retryable. Per-entry, not
+        # per-failure: an entry whose first failure was a 500 but whose retry
+        # died on a 401 ENDED permanent — a historical transient must not make
+        # a hopeless chain look worth the engine's node retries.
+        any_entry_ended_retryable = False
         for llm in chain:
+            entry_error: ProviderError | None = None
             for try_index in range(_PER_ENTRY_RETRIES + 1):
                 try:
                     return await self._run_one_llm(
@@ -212,6 +217,7 @@ class LLMGateway:
                         system=system, output_schema=output_schema,
                     )
                 except ProviderError as exc:
+                    entry_error = exc
                     last_error = exc
                     # §3.6 taxonomy: a PERMANENT failure (auth 401, invalid
                     # request 400, unknown model) cannot succeed on a same-entry
@@ -220,7 +226,6 @@ class LLMGateway:
                     # provider/model may well work).
                     if not exc.retryable:
                         break
-                    saw_retryable = True
                     # Retryable (429/5xx/timeout): back off before retrying the
                     # SAME entry — the provider needs breathing room. Moving to
                     # the NEXT entry sleeps zero either way: it's a different
@@ -231,11 +236,13 @@ class LLMGateway:
                             backoff_delay(try_index + 1, base=_ENTRY_RETRY_BASE_SECONDS, cap=_ENTRY_RETRY_CAP_SECONDS)
                         )
                     continue
-        if saw_retryable:
-            # At least one failure was transient — the engine's own §3.6 retry
-            # (fresh attempt, larger backoff) can plausibly recover the node.
+            if entry_error is not None and entry_error.retryable:
+                any_entry_ended_retryable = True
+        if any_entry_ended_retryable:
+            # At least one entry ENDED on a transient fault — the engine's own
+            # §3.6 retry (fresh attempt, larger backoff) can plausibly recover.
             raise TransientAgentError(f"all LLM entries exhausted for agent '{agent_id}': {last_error}")
-        # Every entry failed PERMANENTLY (auth/config/bad request): re-running
+        # Every entry ENDED permanently (auth/config/bad request): re-running
         # the chain cannot succeed, so this must NOT look transient — raise a
         # hard error the engine fails the run on immediately, instead of
         # burning max_retries_per_node re-running a hopeless chain.
@@ -402,18 +409,18 @@ class LLMGateway:
                             run_id=run_id, node_id=node_id, tool=tc.tool, arguments=tc.arguments, idempotency_key=key
                         )
                     except ToolkitError as exc:
-                        # §3.6 routes each failure type differently:
-                        if exc.fatal:
+                        # §3.6 routes each ToolFailureKind differently:
+                        if exc.kind is ToolFailureKind.FATAL:
                             # Tool auth failure — non-transient, fails the run
                             # (neither the model nor a retry fixes credentials).
                             raise RuntimeError(f"tool '{tc.tool}' failed fatally: {exc}") from exc
-                        if exc.retryable:
+                        if exc.kind is ToolFailureKind.TRANSIENT:
                             # Tool timeout / 5xx — transient: end the turn so
                             # the ENGINE retries a fresh node_execution attempt
                             # with backoff. Side effects already fired in this
                             # turn are deduped by the content-addressed key.
                             raise TransientAgentError(f"tool '{tc.tool}' failed transiently: {exc}") from exc
-                        # Model-addressable (404/422/bad args): feed the error
+                        # MODEL_ADDRESSABLE (404/422/bad args): feed the error
                         # back so the model can adjust or route around it.
                         messages.append(_error_result(tc, f"tool '{tc.tool}' failed: {exc}"))
                         continue

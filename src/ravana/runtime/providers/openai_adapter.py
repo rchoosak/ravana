@@ -25,8 +25,7 @@ from typing import Any
 from ravana.runtime.providers.base import (
     Capability,
     NormalizedToolCall,
-    ProviderError,
-    classify_retryable,
+    to_provider_error,
     ProviderRequest,
     ProviderResponse,
 )
@@ -75,7 +74,15 @@ class OpenAICompatibleAdapter:
         return self._clients[key]
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
-        client = self._resolve_client(request)
+        # Client construction is INSIDE the normalization boundary: with no
+        # api_key anywhere the SDK raises OpenAIError right here, and a raw
+        # SDK exception would skip the §3.6 fallback chain entirely. A client
+        # that can't be built is a config error — permanent for this entry,
+        # but the next fallback entry (different provider/key) may work.
+        try:
+            client = self._resolve_client(request)
+        except Exception as exc:  # noqa: BLE001
+            raise to_provider_error("openai-compatible client init failed", exc, retryable=False) from exc
 
         messages = [{"role": "system", "content": request.system}, *_to_openai_messages(request.messages)]
         kwargs: dict[str, Any] = {"model": request.model, "messages": messages}
@@ -104,9 +111,8 @@ class OpenAICompatibleAdapter:
         try:
             completion = await client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            # §3.6 taxonomy: carry whether a same-entry retry can plausibly
-            # succeed (429/5xx/timeout) or not (auth/bad-request 4xx).
-            raise ProviderError(f"openai-compatible completion failed: {exc}", retryable=classify_retryable(exc)) from exc
+            # §3.6 taxonomy: classified retryable/permanent in one shared place.
+            raise to_provider_error("openai-compatible completion failed", exc) from exc
 
         choice = completion.choices[0]
         msg = choice.message

@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from ravana.runtime.toolkits.base import ToolkitError
+from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 
 # §8(a): the connector's declared input schema. Result is a plain string
 # (the response body), so there is no separate output schema to declare.
@@ -96,24 +96,31 @@ class ApiConnectorHandler:
             )
         except Exception as exc:  # noqa: BLE001 - normalize transport failures
             # Connection reset / timeout: §3.6's "tool timeout" — transient.
-            raise ToolkitError(f"api_connector request to {path} failed: {exc}", retryable=True) from exc
+            raise ToolkitError(
+                f"api_connector request to {path} failed: {exc}", kind=ToolFailureKind.TRANSIENT
+            ) from exc
 
         status = getattr(response, "status_code", None)
         body = _body_text(response)
         if status is not None and status >= 400:
-            raise ToolkitError(
-                f"api_connector got HTTP {status} from {path}: {body[:500]}",
-                # 5xx/429/408: the remote may recover — transient (§3.6).
-                retryable=status in (408, 429) or status >= 500,
-                # 401/403: §3.6 "tool auth failure" — non-transient, fails the
-                # run; neither the model nor a retry can fix credentials.
-                fatal=status in (401, 403),
-            )
+            raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}", kind=_classify_status(status))
         return body
 
 
 def _method_of(arguments: dict[str, Any]) -> str:
     return str(arguments.get("method", "POST")).upper()
+
+
+def _classify_status(status: int) -> ToolFailureKind:
+    """§3.6's tool-failure taxonomy by HTTP status: 401/403 is the "tool auth
+    failure" (fatal, fails the run); 5xx/429/408 may recover (transient —
+    engine retries the attempt with backoff); any other 4xx is something the
+    model can adjust to (bad path, validation) — fed back."""
+    if status in (401, 403):
+        return ToolFailureKind.FATAL
+    if status in (408, 429) or status >= 500:
+        return ToolFailureKind.TRANSIENT
+    return ToolFailureKind.MODEL_ADDRESSABLE
 
 
 def _reject_offbase_path(path: str) -> None:

@@ -8,29 +8,36 @@ dedup in RavanaToolExecutor.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Protocol
 
 
+class ToolFailureKind(Enum):
+    """§3.6's three-way classification of a tool failure — one enum, so an
+    illegal combination (a failure both transient and fatal) cannot be
+    constructed, and each kind names the route the gateway takes."""
+
+    # Transport timeout, HTTP 5xx/429/408: §3.6 lists "tool timeout" as
+    # TRANSIENT — the turn ends as a TransientAgentError so the engine retries
+    # the node_execution attempt with backoff (side effects already fired are
+    # deduped by the content-addressed idempotency key).
+    TRANSIENT = "transient"
+    # Tool auth 401/403: §3.6 "tool auth failure" is NON-transient — the run
+    # fails immediately; neither the model nor a retry can fix credentials.
+    FATAL = "fatal"
+    # HTTP 404/422, invalid arguments, bad path: fed back into the turn as an
+    # error tool_result so the model can adjust its call or route around it.
+    MODEL_ADDRESSABLE = "model_addressable"
+
+
 class ToolkitError(Exception):
-    """A toolkit failed to execute. §3.6 types the failure, and the gateway
-    routes each type differently:
+    """A toolkit failed to execute; `kind` (ToolFailureKind) decides how the
+    gateway routes it. Defaults to MODEL_ADDRESSABLE — the safe middle: the
+    model sees the error and adapts, nothing retries or dies silently."""
 
-      - retryable=True (transport timeout, HTTP 5xx/429/408): §3.6 lists "tool
-        timeout" as TRANSIENT — the turn ends as a TransientAgentError so the
-        engine retries the node_execution attempt with backoff (side effects
-        already fired are deduped by the content-addressed idempotency key).
-      - fatal=True (tool auth 401/403): §3.6 lists "tool auth failure" as
-        NON-transient — the run fails immediately; neither the model nor a
-        retry can fix credentials.
-      - neither (HTTP 404/422, invalid arguments, bad path): model-addressable
-        — fed back into the turn as an error tool_result so the model can
-        adjust its call or route around it.
-    """
-
-    def __init__(self, message: str, *, retryable: bool = False, fatal: bool = False):
+    def __init__(self, message: str, *, kind: ToolFailureKind = ToolFailureKind.MODEL_ADDRESSABLE):
         super().__init__(message)
-        self.retryable = retryable
-        self.fatal = fatal
+        self.kind = kind
 
 
 class ToolkitHandler(Protocol):

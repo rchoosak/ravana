@@ -13,7 +13,7 @@ import pytest
 from ravana.compiler.graph import compile_workflow
 from ravana.runtime.secrets import EnvSecretResolver, SecretNotFound
 from ravana.runtime.tool_executor import RavanaToolExecutor
-from ravana.runtime.toolkits.base import ToolkitError
+from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.loader import load_workflow_yaml
 from ravana.schema.util import now_iso
@@ -218,19 +218,19 @@ def test_api_connector_raises_on_http_error(graph):
 
 
 @pytest.mark.parametrize(
-    ("status", "retryable", "fatal"),
+    ("status", "kind"),
     [
-        (500, True, False),  # server error: §3.6 transient
-        (503, True, False),
-        (429, True, False),  # rate limit
-        (408, True, False),  # request timeout
-        (404, False, False),  # model-addressable: the model can fix its path
-        (422, False, False),
-        (401, False, True),  # §3.6 "tool auth failure": non-transient, fatal
-        (403, False, True),
+        (500, ToolFailureKind.TRANSIENT),  # server error: §3.6 transient
+        (503, ToolFailureKind.TRANSIENT),
+        (429, ToolFailureKind.TRANSIENT),  # rate limit
+        (408, ToolFailureKind.TRANSIENT),  # request timeout
+        (404, ToolFailureKind.MODEL_ADDRESSABLE),  # the model can fix its path
+        (422, ToolFailureKind.MODEL_ADDRESSABLE),
+        (401, ToolFailureKind.FATAL),  # §3.6 "tool auth failure": non-transient
+        (403, ToolFailureKind.FATAL),
     ],
 )
-def test_api_connector_classifies_http_failures(graph, status, retryable, fatal):
+def test_api_connector_classifies_http_failures(graph, status, kind):
     # §3.6 taxonomy on tool failures: transient (retry attempt w/ backoff),
     # fatal (auth — fails the run), or model-addressable (fed back).
     fake = FakeHttpClient(FakeResponse(status, {"error": "x"}))
@@ -238,11 +238,10 @@ def test_api_connector_classifies_http_failures(graph, status, retryable, fatal)
     handlers = build_registry(graph, resolver, clients={"git_connector": fake})
     with pytest.raises(ToolkitError) as exc_info:
         asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
-    assert exc_info.value.retryable is retryable
-    assert exc_info.value.fatal is fatal
+    assert exc_info.value.kind is kind
 
 
-def test_api_connector_transport_failure_is_retryable(graph):
+def test_api_connector_transport_failure_is_transient(graph):
     # A connection-level failure (reset/timeout) is §3.6's "tool timeout" —
     # transient, so the engine retries the attempt with backoff.
     class ExplodingClient:
@@ -253,8 +252,7 @@ def test_api_connector_transport_failure_is_retryable(graph):
     handlers = build_registry(graph, resolver, clients={"git_connector": ExplodingClient()})
     with pytest.raises(ToolkitError) as exc_info:
         asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
-    assert exc_info.value.retryable is True
-    assert exc_info.value.fatal is False
+    assert exc_info.value.kind is ToolFailureKind.TRANSIENT
 
 
 @pytest.mark.parametrize(
