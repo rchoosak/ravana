@@ -1,8 +1,9 @@
 """`ravana run ... --backend llm` wiring. These cover the pure selection/build
 helpers — which providers become which adapters, and that the gateway is
-constructed with the graph's toolkits — without any network call (constructing
-an adapter builds a client object but makes no request). The end-to-end run
-against real models/APIs is intentionally not exercised here (it needs real
+constructed with the graph's toolkits — without any network call (adapters
+defer their SDK-client construction to the first complete() call, so building
+one needs neither a credential nor a connection). The end-to-end run against
+real models/APIs is intentionally not exercised here (it needs real
 credentials); that remains a manual smoke test, tracked in TASKS.md.
 """
 

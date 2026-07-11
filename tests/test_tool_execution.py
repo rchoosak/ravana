@@ -271,6 +271,35 @@ def test_api_connector_httpx_timeout_is_transient(graph):
     assert exc_info.value.kind is ToolFailureKind.TRANSIENT
 
 
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [
+        (401, ToolFailureKind.FATAL),  # review probe: was blanket-TRANSIENT via httpx.HTTPError
+        (403, ToolFailureKind.FATAL),
+        (500, ToolFailureKind.TRANSIENT),
+        (404, ToolFailureKind.MODEL_ADDRESSABLE),
+    ],
+)
+def test_api_connector_raise_for_status_client_routes_by_status(graph, status, kind):
+    # A client configured to raise_for_status() surfaces HTTP errors as
+    # httpx.HTTPStatusError EXCEPTIONS instead of returned responses. These
+    # must route by their response status (§3.6) — a 401 is FATAL, never a
+    # backed-off transient retry. (No network: exceptions built directly.)
+    import httpx
+
+    class RaiseForStatusClient:
+        async def request(self, method, path, **kwargs):
+            request = httpx.Request(method, f"http://api.test{path}")
+            response = httpx.Response(status, request=request)
+            raise httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={"git_connector": RaiseForStatusClient()})
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    assert exc_info.value.kind is kind
+
+
 def test_api_connector_programming_bug_propagates_raw_not_transient(graph):
     # Review finding: the transport catch was `except Exception`, so a
     # TypeError from a programming/config bug was classified TRANSIENT and the

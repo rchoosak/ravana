@@ -95,16 +95,17 @@ class ApiConnectorHandler:
                 method, path, headers=headers, json=arguments.get("json"), params=arguments.get("params")
             )
         except Exception as exc:
-            # ONLY transport-level failures (connection reset, timeout, DNS)
-            # are §3.6's "tool timeout" — transient. Anything else (a TypeError
+            # Classify what the client raised: an HTTP status error routes by
+            # its status (a 401 via raise_for_status is FATAL, not transient),
+            # a genuine transport failure (connection reset, timeout, DNS) is
+            # §3.6's "tool timeout" — transient. Anything else (a TypeError
             # from a programming/config bug, say) propagates raw: the engine's
             # terminal boundary fails the run hard instead of a wrong-type
             # transient retry re-running broken code.
-            if not _is_transport_error(exc):
+            kind = _classify_exception(exc)
+            if kind is None:
                 raise
-            raise ToolkitError(
-                f"api_connector request to {path} failed: {exc}", kind=ToolFailureKind.TRANSIENT
-            ) from exc
+            raise ToolkitError(f"api_connector request to {path} failed: {exc}", kind=kind) from exc
 
         status = getattr(response, "status_code", None)
         body = _body_text(response)
@@ -117,19 +118,27 @@ def _method_of(arguments: dict[str, Any]) -> str:
     return str(arguments.get("method", "POST")).upper()
 
 
-def _is_transport_error(exc: Exception) -> bool:
-    """Whether `exc` is a transport-level failure (network/timeout — §3.6
-    transient) as opposed to a programming/config bug. Covers the builtin
-    OS-level types plus httpx's own hierarchy (TransportError/TimeoutException
-    both subclass httpx.HTTPError; we never call raise_for_status, so the
-    status branch of that hierarchy can't occur here)."""
-    if isinstance(exc, (OSError, TimeoutError)):
-        return True
+def _classify_exception(exc: Exception) -> ToolFailureKind | None:
+    """Classify a client-raised exception per §3.6, or None for "not ours —
+    propagate raw" (a programming/config bug the engine should fail hard on).
+
+    httpx.HTTPStatusError is checked FIRST and routed by its response status:
+    an injected/configured client that calls raise_for_status() surfaces a 401
+    as an exception, and blanket-treating the httpx hierarchy as transient
+    would turn that auth failure (§3.6 FATAL) into a backed-off retry. Only
+    httpx.TransportError (timeouts, connection failures) and the builtin
+    OS-level types count as transient."""
     try:
         import httpx
     except ImportError:  # pragma: no cover - httpx is a direct dependency
-        return False
-    return isinstance(exc, httpx.HTTPError)
+        httpx = None
+    if httpx is not None and isinstance(exc, httpx.HTTPStatusError):
+        return _classify_status(exc.response.status_code)
+    if isinstance(exc, (OSError, TimeoutError)):
+        return ToolFailureKind.TRANSIENT
+    if httpx is not None and isinstance(exc, httpx.TransportError):
+        return ToolFailureKind.TRANSIENT
+    return None
 
 
 def _classify_status(status: int) -> ToolFailureKind:

@@ -1,7 +1,10 @@
-"""LLM Gateway tests — all against fake provider adapters, so nothing here
-touches the network or needs an API key. Covers §3.4's strategy selection,
-the submit_result contract, the within-turn tool loop, the repair loop,
-§3.6's fallback chain, and §1.4's temperature normalization.
+"""LLM Gateway tests. Nothing here touches the network or needs an API key:
+most tests script fake provider adapters, while the credential/SDK-boundary
+probes use the REAL OpenAI/Anthropic adapter classes with only the SDK-client
+constructor patched or failing before any request is built. Covers §3.4's
+strategy selection, the submit_result contract, the within-turn tool loop,
+the repair loop, §3.6's fallback chain + error taxonomy, and §1.4's
+temperature normalization.
 """
 
 from __future__ import annotations
@@ -676,28 +679,21 @@ def test_classify_retryable_by_status_code():
     assert classify_retryable(AttributeError("nope")) is False
 
 
-def test_openai_missing_credential_is_normalized_and_falls_back(monkeypatch):
-    # Review probe: with no api_key anywhere, AsyncOpenAI() raises OpenAIError
-    # at client construction — previously OUTSIDE the normalization boundary,
-    # so the raw SDK error skipped the §3.6 fallback chain entirely (fallback
-    # called 0 times). Now it normalizes to ProviderError(retryable=False):
-    # no same-entry retry, no backoff, fallback serves the turn. (No network:
-    # the failure happens before any request is built.)
-    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
-
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+def _fallback_chain_graph(name: str, primary_provider: str, fallback_provider: str):
+    """Single-node workflow whose agent runs on `primary_provider` (hosted
+    shape: no endpoint, no api_key_ref) with one fallback entry — the shared
+    testbed for the credential/SDK-boundary probes."""
     doc = WorkflowDoc.model_validate(
         {
             "apiVersion": "ravana/v1",
             "kind": "Workflow",
-            "metadata": {"name": "openai-cred-test", "version": 1},
+            "metadata": {"name": name, "version": 1},
             "spec": {
                 "agents": [
                     {
                         "id": "a",
                         "name": "A",
-                        # Hosted shape: provider openai, NO endpoint, NO api_key_ref.
-                        "llm": {"provider": "openai", "model": "gpt-4o", "fallback": [{"provider": "anthropic", "model": "m"}]},
+                        "llm": {"provider": primary_provider, "model": "m", "fallback": [{"provider": fallback_provider, "model": "m2"}]},
                         "system_prompt": "p",
                     }
                 ],
@@ -705,58 +701,49 @@ def test_openai_missing_credential_is_normalized_and_falls_back(monkeypatch):
             },
         }
     )
-    cred_graph = compile_workflow(doc)
-    primary = OpenAICompatibleAdapter(name="openai")  # real adapter, lazy client
-    fallback = FakeAdapter(name="anthropic", responses=[_submit({"done": True})])
+    return compile_workflow(doc)
+
+
+def _assert_falls_back_cleanly(cred_graph, primary, primary_name: str, fallback_name: str):
+    """Shared probe assertion: the primary's client-init failure normalizes,
+    the fallback serves the turn, and no same-entry backoff is wasted."""
+    fallback = FakeAdapter(name=fallback_name, responses=[_submit({"done": True})])
     sleeper = RecordingSleep()
-    gateway = LLMGateway(cred_graph, {"openai": primary, "anthropic": fallback}, retry_sleep=sleeper)
+    gateway = LLMGateway(cred_graph, {primary_name: primary, fallback_name: fallback}, retry_sleep=sleeper)
     result = _run(gateway, "a")
     assert result.structured_payload == {"done": True}
-    assert len(fallback.requests) == 1  # the fallback actually ran (was 0 before the fix)
+    assert len(fallback.requests) == 1  # the fallback actually ran
     assert sleeper.delays == []  # permanent: no same-entry backoff wasted
+
+
+def test_openai_missing_credential_is_normalized_and_falls_back(monkeypatch):
+    # Review probe: with no api_key anywhere, AsyncOpenAI() raises OpenAIError
+    # at client construction — previously OUTSIDE the normalization boundary,
+    # so the raw SDK error skipped the §3.6 fallback chain entirely (fallback
+    # called 0 times). Now it normalizes to ProviderError(retryable=False).
+    # (No network: the failure happens before any request is built.)
+    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    graph = _fallback_chain_graph("openai-cred-test", "openai", "anthropic")
+    _assert_falls_back_cleanly(graph, OpenAICompatibleAdapter(name="openai"), "openai", "anthropic")
 
 
 def test_anthropic_client_init_failure_is_normalized_and_falls_back(monkeypatch):
     # Review probe: AnthropicAdapter built its SDK client eagerly in __init__,
     # BEFORE any normalization boundary — a malformed proxy/credential config
     # escaped as a raw ValueError and the fallback chain never ran. The client
-    # is now built lazily inside complete()'s boundary: init failure becomes
-    # ProviderError(retryable=False) and the fallback serves the turn.
+    # is now built lazily inside complete()'s boundary.
     import anthropic
+
+    from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
 
     def exploding_client(*args, **kwargs):
         raise ValueError("malformed proxy configuration")
 
     monkeypatch.setattr(anthropic, "AsyncAnthropic", exploding_client)
-    doc = WorkflowDoc.model_validate(
-        {
-            "apiVersion": "ravana/v1",
-            "kind": "Workflow",
-            "metadata": {"name": "anthropic-init-test", "version": 1},
-            "spec": {
-                "agents": [
-                    {
-                        "id": "a",
-                        "name": "A",
-                        "llm": {"provider": "anthropic", "model": "m", "fallback": [{"provider": "openai", "model": "m2"}]},
-                        "system_prompt": "p",
-                    }
-                ],
-                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
-            },
-        }
-    )
-    init_graph = compile_workflow(doc)
-    from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
-
-    primary = AnthropicAdapter()  # no injected client -> lazy (exploding) construction
-    fallback = FakeAdapter(name="openai", responses=[_submit({"done": True})])
-    sleeper = RecordingSleep()
-    gateway = LLMGateway(init_graph, {"anthropic": primary, "openai": fallback}, retry_sleep=sleeper)
-    result = _run(gateway, "a")
-    assert result.structured_payload == {"done": True}
-    assert len(fallback.requests) == 1  # fallback actually ran (was unreachable before the fix)
-    assert sleeper.delays == []  # permanent: no same-entry backoff wasted
+    graph = _fallback_chain_graph("anthropic-init-test", "anthropic", "openai")
+    _assert_falls_back_cleanly(graph, AnthropicAdapter(), "anthropic", "openai")
 
 
 def test_sdk_internal_retries_are_disabled(monkeypatch):
