@@ -1,6 +1,6 @@
 """Toolkit handler interface (§1.2, §1.7). A handler is the executor behind a
 Toolkit manifest — it takes JSON arguments and returns a result string the
-agent turn feeds back to the model. The content-addressed `idempotency_key`
+agent turn feeds back to the model. The logical-invocation `idempotency_key`
 (§3.6) is passed in so a side-effecting handler can forward it to the remote
 (e.g. an `Idempotency-Key` header) in addition to Ravana's own ledger-level
 dedup in RavanaToolExecutor.
@@ -20,7 +20,7 @@ class ToolFailureKind(Enum):
     # Transport timeout, HTTP 5xx/429/408: §3.6 lists "tool timeout" as
     # TRANSIENT — the turn ends as a TransientAgentError so the engine retries
     # the node_execution attempt with backoff (side effects already fired are
-    # deduped by the content-addressed idempotency key).
+    # deduped by the logical-invocation idempotency key).
     TRANSIENT = "transient"
     # Tool auth 401/403: §3.6 "tool auth failure" is NON-transient — the run
     # fails immediately; neither the model nor a retry can fix credentials.
@@ -69,3 +69,5 @@ class ToolkitHandler(Protocol):
         ...
 
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str) -> str: ...
+
+    async def aclose(self) -> None: ...

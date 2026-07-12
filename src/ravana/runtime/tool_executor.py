@@ -6,7 +6,7 @@ executes it, with the idempotency ledger (§3.6/§8) wrapped around
   - For a side-effecting handler, look up `idempotency_key` in
     `tool_invocation`. A prior SUCCEEDED row => return its stored result
     WITHOUT re-executing — this is how a retried attempt (same
-    content-addressed key) avoids double-firing a side effect (a second git
+    logical-invocation key) avoids double-firing a side effect (a second git
     push / ticket / email). Read-only handlers skip the ledger entirely so a
     repeated read returns live state, not the first cached response (§3.6
     scopes the dedup mandate to side effects).
@@ -57,6 +57,27 @@ class RavanaToolExecutor:
                 )
             tools.append(Tool(name=tid, description=handler.description, input_schema=handler.input_schema))
         return tools
+
+    async def aclose(self) -> None:
+        """Close each distinct handler owned by this execution scope."""
+        first_error: RuntimeError | None = None
+        seen: set[int] = set()
+        for handler in self._handlers.values():
+            identity = id(handler)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            close = getattr(handler, "aclose", None)
+            if close is None:
+                continue
+            try:
+                await close()
+            except Exception as exc:  # noqa: BLE001 - continue closing siblings
+                first_error = first_error or RuntimeError(
+                    f"toolkit cleanup failed ({type(exc).__name__})"
+                )
+        if first_error is not None:
+            raise first_error
 
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str

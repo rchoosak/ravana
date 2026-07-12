@@ -1,9 +1,10 @@
-"""§3.6's content-addressed tool-call idempotency key — the fix for the P1
-finding that `hash(run_id, node_id, attempt)` changes on every retry by
-construction (a retry *is* a new attempt), making "dedupe on this key"
-impossible exactly when it's needed. This key depends on what's being asked
-for, not on which dispatch asked for it, so a retry that reissues the
-identical call reproduces the identical key.
+"""§3.6's logical-invocation idempotency key.
+
+`logical_visit_id` stays stable across retry attempts but changes when the
+graph enters the node again. `tool_call_ordinal` distinguishes two intentional
+identical calls within that visit. The command content remains in the hash so a
+retry whose model changes the call at the same position cannot replay a stale
+result.
 """
 
 from __future__ import annotations
@@ -13,7 +14,14 @@ import json
 from typing import Any
 
 
-def compute_idempotency_key(run_id: str, node_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
+def compute_idempotency_key(
+    run_id: str,
+    node_id: str,
+    logical_visit_id: str,
+    tool_call_ordinal: int,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> str:
     canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
-    payload = f"{run_id}:{node_id}:{tool_name}:{canonical}"
+    payload = f"{run_id}:{node_id}:{logical_visit_id}:{tool_call_ordinal}:{tool_name}:{canonical}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

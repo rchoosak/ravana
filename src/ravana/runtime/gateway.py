@@ -27,13 +27,13 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ravana.compiler.graph import CompiledGraph
+from ravana.compiler.graph import CompiledGraph, NodeExecutionContract
 from ravana.runtime.backoff import RetrySleep, backoff_delay
 from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
-from ravana.runtime.secrets import ResolvedSecret, SecretResolver
+from ravana.runtime.secrets import ResolvedSecret, SecretResolver, ensure_secret_free
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.providers.base import (
     AssistantMessage,
@@ -42,11 +42,13 @@ from ravana.runtime.providers.base import (
     ProviderAdapter,
     ProviderError,
     ProviderRequest,
+    ProviderResponse,
+    ProviderTarget,
     Tool,
     ToolResultMessage,
     UserMessage,
 )
-from ravana.schema.models import AgentConfig, LLMConfig, LLMFallbackEntry
+from ravana.schema.models import LLMConfig, LLMFallbackEntry
 
 SUBMIT_RESULT = "submit_result"
 
@@ -73,8 +75,8 @@ class ToolExecutor(Protocol):
     string to feed back into the turn, and describes an agent's toolkits as
     callable-tool specs the gateway surfaces to the model.
 
-    `idempotency_key` is the content-addressed key from §3.6, computed by the
-    gateway and passed in **before** execution — a side-effecting connector
+    `idempotency_key` identifies a logical tool invocation (§3.6), computed by
+    the gateway and passed in **before** execution — a side-effecting connector
     (git push, ticket create) MUST dedupe on it, which is only possible if it
     has the key at execution time, not after. The engine's later persistence
     of the same key into message.tool_calls (loop.py) uses this same value."""
@@ -84,6 +86,8 @@ class ToolExecutor(Protocol):
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str
     ) -> str: ...
+
+    async def aclose(self) -> None: ...
 
 
 class _NoToolExecutor:
@@ -107,6 +111,9 @@ class _NoToolExecutor:
             "(no toolkits are available to this run)"
         )
 
+    async def aclose(self) -> None:
+        return None
+
 
 @dataclass
 class _Strategy:
@@ -118,8 +125,8 @@ class _Strategy:
     # If neither of the above, the only lever left is the repair loop.
 
 
-def _select_strategy(adapter: ProviderAdapter, model: str) -> _Strategy:
-    caps = adapter.capabilities(model)
+def _select_strategy(adapter: ProviderAdapter, target: ProviderTarget) -> _Strategy:
+    caps = adapter.capabilities(target)
     if Capability.GUIDED_DECODING in caps:
         return _Strategy(use_guided=True, use_native_forced_tool=False)
     if Capability.NATIVE_STRUCTURED_OUTPUT in caps:
@@ -144,6 +151,24 @@ def _parse_json(text: str | None) -> tuple[Any, str | None]:
         return None, f"output was not valid JSON: {exc}"
 
 
+def _ensure_provider_response_secret_free(
+    response: ProviderResponse, api_key: ResolvedSecret | None
+) -> None:
+    values = (api_key.value(),) if api_key is not None else ()
+    ensure_secret_free(
+        {
+            "text": response.text,
+            "tool_calls": [
+                {"id": call.id, "tool": call.tool, "arguments": call.arguments}
+                for call in response.tool_calls
+            ],
+            "stop_reason": response.stop_reason,
+        },
+        context="provider response",
+        values=values,
+    )
+
+
 class LLMGateway:
     def __init__(
         self,
@@ -166,10 +191,31 @@ class LLMGateway:
         # Deliberately NO key memo here: resolution is per entry-try (see
         # _resolve_api_key) so there is no shared mutable credential state.
         self._secret_resolver = secret_resolver
-        # §3.4: strategy is decided once per (provider, model), not re-derived
-        # every call. Capabilities are static, so this memo is the "decided at
-        # registration" contract without a separate registration step.
-        self._strategy_cache: dict[tuple[str, str], _Strategy] = {}
+        # §3.4: strategy is decided once per immutable provider target, not
+        # re-derived on every call.
+        self._strategy_cache: dict[tuple[int, ProviderTarget], _Strategy] = {}
+
+    async def aclose(self) -> None:
+        """Close every execution-plane resource owned by this gateway."""
+        first_error: RuntimeError | None = None
+        resources = [*self._adapters.values(), self._tools]
+        seen: set[int] = set()
+        for resource in resources:
+            identity = id(resource)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            close = getattr(resource, "aclose", None)
+            if close is None:
+                continue
+            try:
+                await close()
+            except Exception as exc:  # noqa: BLE001 - continue closing siblings
+                first_error = first_error or RuntimeError(
+                    f"runtime resource cleanup failed ({type(exc).__name__})"
+                )
+        if first_error is not None:
+            raise first_error
 
     def _adapter_for(self, provider: str) -> ProviderAdapter:
         adapter = self._adapters.get(provider)
@@ -215,10 +261,11 @@ class LLMGateway:
                 f"resolving llm.api_key_ref '{ref}' failed ({type(exc).__name__})", retryable=False
             ) from exc
 
-    def _strategy_for(self, adapter: ProviderAdapter, model: str) -> _Strategy:
-        key = (adapter.name, model)
+    def _strategy_for(self, adapter: ProviderAdapter, llm: LLMConfig) -> _Strategy:
+        target = ProviderTarget(provider=llm.provider, model=llm.model, endpoint=llm.endpoint)
+        key = (id(adapter), target)
         if key not in self._strategy_cache:
-            self._strategy_cache[key] = _select_strategy(adapter, model)
+            self._strategy_cache[key] = _select_strategy(adapter, target)
         return self._strategy_cache[key]
 
     async def run_turn(
@@ -227,12 +274,16 @@ class LLMGateway:
         run_id: str,
         node_id: str,
         attempt: int,
+        logical_visit_id: str,
         agent_id: str,
         shared_state: dict[str, Any],
     ) -> AgentTurnResult:
         agent = self._graph.agents_by_id[agent_id]
+        contract = self._graph.contract_for_node(node_id)
+        if self._graph.node(node_id).agent != agent_id:
+            raise ValueError(f"node '{node_id}' is not backed by agent '{agent_id}'")
         system = assemble_system_prompt(agent, self._graph.skills_by_id, shared_state)
-        output_schema = agent.output_schema or _ANY_OBJECT_SCHEMA
+        output_schema = contract.output_schema or _ANY_OBJECT_SCHEMA
 
         # §3.6: try the primary llm, then each fallback entry, each with its
         # own small retry budget (default 1 retry per entry — distinct from,
@@ -256,7 +307,8 @@ class LLMGateway:
             for try_index in range(_PER_ENTRY_RETRIES + 1):
                 try:
                     return await self._run_one_llm(
-                        run_id=run_id, node_id=node_id, agent=agent, llm=llm,
+                        run_id=run_id, node_id=node_id, logical_visit_id=logical_visit_id,
+                        contract=contract, llm=llm,
                         system=system, output_schema=output_schema,
                     )
                 except ProviderError as exc:
@@ -298,13 +350,14 @@ class LLMGateway:
         *,
         run_id: str,
         node_id: str,
-        agent: AgentConfig,
+        logical_visit_id: str,
+        contract: NodeExecutionContract,
         llm: LLMConfig,
         system: str,
         output_schema: dict[str, Any],
     ) -> AgentTurnResult:
         adapter = self._adapter_for(llm.provider)
-        strategy = self._strategy_for(adapter, llm.model)
+        strategy = self._strategy_for(adapter, llm)
         # §8c: resolve THIS entry's key once per try, as a local — the value
         # flows down the call stack (no gateway-level shared credential state,
         # so concurrent run_turn()s can never swap each other's keys mid-turn).
@@ -317,12 +370,13 @@ class LLMGateway:
         # WITH toolkits must run the tool loop (submit_result forces structure
         # at the end), even on a guided-capable provider. Otherwise a guided
         # agent would silently never see its tools.
-        if strategy.use_guided and not agent.toolkits:
+        if strategy.use_guided and not contract.toolkits:
             return await self._run_guided(
                 node_id=node_id, llm=llm, adapter=adapter, system=system, output_schema=output_schema, api_key=api_key
             )
         return await self._run_tool_loop(
-            run_id=run_id, node_id=node_id, agent=agent, llm=llm, adapter=adapter, system=system,
+            run_id=run_id, node_id=node_id, logical_visit_id=logical_visit_id,
+            contract=contract, llm=llm, adapter=adapter, system=system,
             output_schema=output_schema, api_key=api_key,
         )
 
@@ -356,6 +410,7 @@ class LLMGateway:
         while True:
             request = self._request_for(llm, api_key=api_key, system=system, messages=messages, output_schema=output_schema)
             response = await adapter.complete(request)
+            _ensure_provider_response_secret_free(response, api_key)
             input_tokens += response.input_tokens
             output_tokens += response.output_tokens
             payload, error = _parse_json(response.text)
@@ -373,13 +428,25 @@ class LLMGateway:
             repair_count += 1
             messages.append(UserMessage(text=f"That output was invalid: {error}. Return valid JSON matching the schema."))
 
-    async def _run_tool_loop(self, *, run_id, node_id, agent, llm, adapter, system, output_schema, api_key):
+    async def _run_tool_loop(
+        self,
+        *,
+        run_id,
+        node_id,
+        logical_visit_id,
+        contract,
+        llm,
+        adapter,
+        system,
+        output_schema,
+        api_key,
+    ):
         guards = self._graph.doc.spec.graph.guards
-        # §3.4.4: the agent's real toolkits are offered as callable tools
+        # §3.4.4: the node's resolved tool grants are offered as callable tools
         # (name = toolkit id), plus the synthetic submit_result the turn
         # terminates on. A toolkit named submit_result would shadow that
         # terminator, so reject the collision loudly.
-        agent_tools = self._tools.tools_for(agent.toolkits)
+        agent_tools = self._tools.tools_for(list(contract.toolkits))
         if any(t.name == SUBMIT_RESULT for t in agent_tools):
             # A config bug, not a transient fault — raise something the fallback
             # loop (which only retries ProviderError) won't mask as retryable,
@@ -432,6 +499,7 @@ class LLMGateway:
                 tools=offered_tools, force_tool=SUBMIT_RESULT if force_submit else None,
             )
             response = await adapter.complete(request)
+            _ensure_provider_response_secret_free(response, api_key)
             input_tokens += response.input_tokens
             output_tokens += response.output_tokens
 
@@ -466,7 +534,14 @@ class LLMGateway:
                     if tool_call_count > guards.max_tool_calls_per_turn:
                         messages.append(_error_result(tc, "per-turn tool-call budget exhausted — call submit_result now"))
                         continue
-                    key = compute_idempotency_key(run_id, node_id, tc.tool, tc.arguments)
+                    key = compute_idempotency_key(
+                        run_id,
+                        node_id,
+                        logical_visit_id,
+                        tool_call_count,
+                        tc.tool,
+                        tc.arguments,
+                    )
                     try:
                         result = await self._tools.execute(
                             run_id=run_id, node_id=node_id, tool=tc.tool, arguments=tc.arguments, idempotency_key=key
@@ -481,13 +556,22 @@ class LLMGateway:
                             # Tool timeout / 5xx — transient: end the turn so
                             # the ENGINE retries a fresh node_execution attempt
                             # with backoff. Side effects already fired in this
-                            # turn are deduped by the content-addressed key.
+                            # turn are deduped by logical invocation identity.
                             raise TransientAgentError(f"tool '{tc.tool}' failed transiently: {exc}") from exc
                         # MODEL_ADDRESSABLE (404/422/bad args): feed the error
                         # back so the model can adjust or route around it.
                         messages.append(_error_result(tc, f"tool '{tc.tool}' failed: {exc}"))
                         continue
-                    recorded_tool_calls.append({"tool": tc.tool, "arguments": tc.arguments, "idempotency_key": key})
+                    ensure_secret_free(result, context=f"tool '{tc.tool}' result")
+                    recorded_tool_calls.append(
+                        {
+                            "tool": tc.tool,
+                            "arguments": tc.arguments,
+                            "logical_visit_id": logical_visit_id,
+                            "tool_call_ordinal": tool_call_count,
+                            "idempotency_key": key,
+                        }
+                    )
                     messages.append(ToolResultMessage(tool_call_id=tc.id, tool=tc.tool, content=result))
                 # EVERY submit_result that rode along (a provider can emit more
                 # than one) needs a matching tool_result, or the transcript is

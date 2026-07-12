@@ -86,3 +86,6 @@ class _DeferredHandler:
 
     async def call(self, *, arguments, idempotency_key):
         raise ToolkitError(f"toolkit '{self._toolkit_id}' is not executable in this slice: {self._reason}")
+
+    async def aclose(self) -> None:
+        return None

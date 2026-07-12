@@ -14,6 +14,7 @@ import asyncio
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -117,6 +118,43 @@ def _build_runtime(
     return MockAgentRuntime.from_yaml(mock_fixture)
 
 
+async def _start_with_cleanup(
+    con: sqlite3.Connection,
+    graph: CompiledGraph,
+    runtime: AgentRuntime,
+    *,
+    org_id: str,
+    workflow_id: str,
+    input_payload: dict[str, Any],
+) -> str:
+    try:
+        return await start_run(
+            con,
+            graph,
+            runtime,
+            org_id=org_id,
+            workflow_id=workflow_id,
+            triggered_by="cli-user",
+            input_payload=input_payload,
+        )
+    finally:
+        await runtime.aclose()
+
+
+async def _resume_with_cleanup(
+    con: sqlite3.Connection,
+    graph: CompiledGraph,
+    runtime: AgentRuntime,
+    run_id: str,
+    hitl_id: str,
+    response: dict[str, Any],
+) -> None:
+    try:
+        await resume_hitl(con, graph, runtime, run_id, hitl_id, response)
+    finally:
+        await runtime.aclose()
+
+
 @click.group()
 def main() -> None:
     pass
@@ -176,10 +214,18 @@ def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: 
     doc = load_workflow_yaml(file)
     graph = compile_workflow(doc)
     workflow_id = get_or_create_workflow(con, graph, org_id=org, created_by="cli-user")
+    input_payload = json.loads(input_json)
     runtime = _build_runtime(con, graph, backend, mock_fixture)
 
     run_id = asyncio.run(
-        start_run(con, graph, runtime, org_id=org, workflow_id=workflow_id, triggered_by="cli-user", input_payload=json.loads(input_json))
+        _start_with_cleanup(
+            con,
+            graph,
+            runtime,
+            org_id=org,
+            workflow_id=workflow_id,
+            input_payload=input_payload,
+        )
     )
     _print_run_status(con, run_id)
 
@@ -242,7 +288,12 @@ def run_watch(run_id: str, backend: str, mock_fixture: str | None) -> None:
                 graph = _compiled_graph_for_run(con, row)
             if runtime is None:
                 runtime = _build_runtime(con, graph, backend, mock_fixture)
-            asyncio.run(resume_hitl(con, graph, runtime, run_id, hitl["id"], {"answer": answer}))
+            asyncio.run(
+                _resume_with_cleanup(
+                    con, graph, runtime, run_id, hitl["id"], {"answer": answer}
+                )
+            )
+            runtime = None
         # loop again: the resume may have produced new messages, completed
         # the run, or raised another HITL pause elsewhere.
 
@@ -267,9 +318,14 @@ def run_hitl_respond(run_id: str, hitl_id: str, response_json: str, backend: str
     if run_row is None:
         raise click.ClickException(f"run '{run_id}' not found")
     graph = _compiled_graph_for_run(con, run_row)
+    response = json.loads(response_json)
     runtime = _build_runtime(con, graph, backend, mock_fixture)
 
-    asyncio.run(resume_hitl(con, graph, runtime, run_id, hitl_id, json.loads(response_json)))
+    asyncio.run(
+        _resume_with_cleanup(
+            con, graph, runtime, run_id, hitl_id, response
+        )
+    )
     _print_run_status(con, run_id)
 
 

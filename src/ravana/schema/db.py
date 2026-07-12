@@ -94,7 +94,9 @@ CREATE TABLE IF NOT EXISTS workflow_node (
     sub_workflow_id TEXT REFERENCES workflow(id),
     on_enter        TEXT,
     join_policy     TEXT NOT NULL DEFAULT 'any',
+    toolkit_ids     TEXT NOT NULL DEFAULT '[]',
     hitl_config     TEXT,
+    output_schema   TEXT,
     PRIMARY KEY (workflow_id, id),
     CONSTRAINT workflow_node_backing_xor CHECK (
         (agent_id IS NOT NULL AND sub_workflow_id IS NULL) OR
@@ -138,6 +140,7 @@ CREATE TABLE IF NOT EXISTS node_execution (
     run_id              TEXT NOT NULL REFERENCES run(id),
     node_id             TEXT NOT NULL,
     attempt             INTEGER NOT NULL DEFAULT 1,
+    logical_visit_id    TEXT NOT NULL DEFAULT '',
     status              TEXT NOT NULL DEFAULT 'QUEUED',
     leased_by           TEXT,
     leased_until        TEXT,
@@ -222,9 +225,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at    TEXT NOT NULL
 );
 
--- Idempotency ledger (§3.6/§8): one row per logical tool call, keyed by the
--- content-addressed idempotency_key the gateway computes. A retry that
--- reissues the same call (same run/node/tool/args -> same key) finds the
+-- Idempotency ledger (§3.6/§8): one row per logical tool invocation, keyed by
+-- the visit-scoped idempotency_key the gateway computes. A retry that
+-- reissues the same call position in the same logical node visit finds the
 -- prior SUCCEEDED row and returns its stored result instead of executing the
 -- side effect again — this is what makes "connectors MUST dedupe" real. The
 -- key is the PRIMARY KEY so the dedup check is a point lookup.
@@ -239,6 +242,30 @@ CREATE TABLE IF NOT EXISTS tool_invocation (
     created_at      TEXT NOT NULL
 );
 """
+
+_ADDITIVE_MIGRATIONS: dict[str, dict[str, str]] = {
+    "workflow_node": {
+        "toolkit_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "output_schema": "TEXT",
+    },
+    "node_execution": {
+        "logical_visit_id": "TEXT NOT NULL DEFAULT ''",
+    },
+}
+
+
+def _apply_additive_migrations(con: sqlite3.Connection) -> None:
+    """Add columns introduced after the initial local schema.
+
+    Phase 0 uses SQLite without a migration framework, but `ravana init` is
+    intentionally idempotent. Keeping small additive upgrades here prevents a
+    pre-existing `.ravana/state.db` from silently missing new invariants.
+    """
+    for table, columns in _ADDITIVE_MIGRATIONS.items():
+        existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+        for column, definition in columns.items():
+            if column not in existing:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
@@ -258,5 +285,6 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     """Create the schema (idempotent — CREATE TABLE IF NOT EXISTS throughout)."""
     con = connect(db_path)
     con.executescript(SCHEMA_SQL)
+    _apply_additive_migrations(con)
     con.commit()
     return con

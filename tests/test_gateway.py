@@ -28,6 +28,7 @@ from ravana.runtime.providers.base import (
     ProviderError,
     ProviderRequest,
     ProviderResponse,
+    ProviderTarget,
     Tool,
 )
 from ravana.schema.loader import load_workflow_yaml
@@ -90,7 +91,7 @@ class FakeAdapter:
     requests: list[ProviderRequest] = field(default_factory=list)
     _i: int = 0
 
-    def capabilities(self, model: str) -> set[Capability]:
+    def capabilities(self, target: ProviderTarget) -> set[Capability]:
         return self.caps
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
@@ -100,6 +101,9 @@ class FakeAdapter:
         resp = self.responses[min(self._i, len(self.responses) - 1)]
         self._i += 1
         return resp
+
+    async def aclose(self) -> None:
+        return None
 
 
 def _submit(payload: dict[str, Any]) -> ProviderResponse:
@@ -120,8 +124,18 @@ def graph():
 
 
 def _run(gateway: LLMGateway, agent_id: str, state: dict[str, Any] | None = None):
+    node_id = next(
+        node.id for node in gateway._graph.nodes_by_id.values() if node.agent == agent_id
+    )
     return asyncio.run(
-        gateway.run_turn(run_id="r1", node_id="n1", attempt=1, agent_id=agent_id, shared_state=state or {})
+        gateway.run_turn(
+            run_id="r1",
+            node_id=node_id,
+            attempt=1,
+            logical_visit_id="visit-1",
+            agent_id=agent_id,
+            shared_state=state or {},
+        )
     )
 
 
@@ -217,6 +231,70 @@ def test_guided_agent_with_toolkits_uses_tool_loop_not_guided(graph):
     assert SUBMIT_RESULT in offered  # tool loop, not the guided one-shot
     assert {"code_interpreter", "git_connector"} <= offered  # dev's toolkits surfaced
     assert result.structured_payload == {"system_spec": {}}
+
+
+def test_strategy_selection_is_endpoint_aware_for_one_adapter():
+    doc = WorkflowDoc.model_validate(
+        {
+            "apiVersion": "ravana/v1",
+            "kind": "Workflow",
+            "metadata": {"name": "endpoint-caps", "version": 1},
+            "spec": {
+                "agents": [
+                    {
+                        "id": "guided",
+                        "name": "Guided",
+                        "llm": {
+                            "provider": "local",
+                            "model": "same-model",
+                            "endpoint": "http://guided/v1",
+                        },
+                        "system_prompt": "p",
+                    },
+                    {
+                        "id": "native",
+                        "name": "Native",
+                        "llm": {
+                            "provider": "local",
+                            "model": "same-model",
+                            "endpoint": "http://native/v1",
+                        },
+                        "system_prompt": "p",
+                    },
+                ],
+                "graph": {
+                    "entry": "n1",
+                    "nodes": [
+                        {"id": "n1", "agent": "guided"},
+                        {"id": "n2", "agent": "native"},
+                    ],
+                    "edges": [],
+                },
+            },
+        }
+    )
+    graph = compile_workflow(doc)
+
+    class EndpointAdapter(FakeAdapter):
+        def capabilities(self, target):
+            if target.endpoint == "http://guided/v1":
+                return {Capability.GUIDED_DECODING, Capability.NATIVE_STRUCTURED_OUTPUT}
+            return {Capability.NATIVE_STRUCTURED_OUTPUT}
+
+    adapter = EndpointAdapter(
+        name="local", responses=[_guided_text({"ok": True}), _submit({"ok": True})]
+    )
+    gateway = LLMGateway(graph, {"local": adapter})
+
+    _run(gateway, "guided")
+    _run(gateway, "native")
+
+    assert adapter.requests[0].endpoint == "http://guided/v1"
+    assert adapter.requests[0].output_schema is not None
+    assert adapter.requests[0].tools == []
+    assert adapter.requests[1].endpoint == "http://native/v1"
+    assert adapter.requests[1].output_schema is None
+    assert any(tool.name == SUBMIT_RESULT for tool in adapter.requests[1].tools)
 
 
 def test_agent_toolkits_offered_alongside_submit_result(graph):
@@ -549,13 +627,23 @@ def test_within_turn_tool_loop_then_submit(graph):
     assert [t for t, _ in seen] == ["web_search"]  # the real tool ran before submit_result
     assert result.tool_call_count == 1
     assert result.structured_payload == {"requirement_clarity": "HIGH"}
-    # The executed tool is recorded WITH the same content-addressed key that
+    # The executed tool is recorded WITH the same logical-invocation key that
     # was passed to execute (§3.6) — one key, computed once, before execution.
     from ravana.runtime.idempotency import compute_idempotency_key
 
-    expected_key = compute_idempotency_key("r1", "n1", "web_search", {"q": "x"})
+    expected_key = compute_idempotency_key(
+        "r1", "pm_intake", "visit-1", 1, "web_search", {"q": "x"}
+    )
     assert seen == [("web_search", expected_key)]
-    assert result.tool_calls == [{"tool": "web_search", "arguments": {"q": "x"}, "idempotency_key": expected_key}]
+    assert result.tool_calls == [
+        {
+            "tool": "web_search",
+            "arguments": {"q": "x"},
+            "logical_visit_id": "visit-1",
+            "tool_call_ordinal": 1,
+            "idempotency_key": expected_key,
+        }
+    ]
 
 
 def test_second_model_turn_sees_normalized_transcript(graph):
@@ -746,6 +834,22 @@ def test_redact_secrets_is_pattern_based_and_longest_first():
     assert "plainword" in redact_secrets("plainword")
 
 
+def test_structured_log_redaction_recurses_into_nested_values(capsys):
+    import json
+
+    from ravana.observability.logging import log_event
+
+    log_event(
+        "INFO",
+        "safe",
+        detail={"token": "sk-NESTED-LEAK", "items": [{"auth": "Bearer hidden-77"}]},
+    )
+    rendered = json.dumps(json.loads(capsys.readouterr().err))
+    assert "sk-NESTED-LEAK" not in rendered
+    assert "hidden-77" not in rendered
+    assert rendered.count("***REDACTED***") == 2
+
+
 def test_resolved_secret_holds_no_process_global_state():
     # Constructing a ResolvedSecret must not mutate any module-global registry
     # (the old design coupled the value object to logging and leaked rotated
@@ -784,6 +888,53 @@ def test_resolved_key_never_reaches_message_or_state(con):
         for row in con.execute(f"SELECT {cols} FROM {tbl} WHERE {'id' if tbl == 'run' else 'run_id'} = ?", (run_id,)):
             blobs.extend(str(v) for v in row)
     assert all("sk-must-not-persist" not in b for b in blobs)  # never persisted anywhere
+
+
+def test_provider_echoing_exact_key_fails_before_persistence(con):
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    secret = "zzz-ARBITRARY-KEY-MATERIAL"
+
+    class EchoingAdapter(FakeAdapter):
+        async def complete(self, request):
+            self.requests.append(request)
+            key = request.api_key.value()
+            return ProviderResponse(
+                text=f"provider echoed {key}",
+                tool_calls=[
+                    NormalizedToolCall(
+                        id="t1",
+                        tool=SUBMIT_RESULT,
+                        arguments={"nested": {"credential": key}},
+                    )
+                ],
+            )
+
+    graph = _keyed_agent_graph("secrets://openai_key")
+    adapter = EchoingAdapter(name="openai")
+    gateway = LLMGateway(
+        graph,
+        {"openai": adapter},
+        secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": secret}),
+    )
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    run_id = asyncio.run(
+        start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id)
+    )
+
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()[
+        "status"
+    ] == "FAILED"
+    assert con.execute(
+        "SELECT COUNT(*) AS c FROM message WHERE run_id = ?", (run_id,)
+    ).fetchone()["c"] == 0
+    error = con.execute(
+        "SELECT error FROM node_execution WHERE run_id = ?", (run_id,)
+    ).fetchone()["error"]
+    assert secret not in error
+    assert "credential material" in error
 
 
 def test_raw_key_in_api_key_ref_is_rejected_at_schema():
@@ -892,7 +1043,14 @@ def test_concurrent_turns_never_swap_credentials():
                     {"id": "a1", "name": "A1", "llm": {"provider": "openai", "model": "m1", "api_key_ref": "secrets://k1"}, "system_prompt": "p"},
                     {"id": "a2", "name": "A2", "llm": {"provider": "openai", "model": "m2", "api_key_ref": "secrets://k2"}, "system_prompt": "p"},
                 ],
-                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a1"}], "edges": []},
+                "graph": {
+                    "entry": "n1",
+                    "nodes": [
+                        {"id": "n1", "agent": "a1"},
+                        {"id": "n2", "agent": "a2"},
+                    ],
+                    "edges": [],
+                },
             },
         }
     )
@@ -911,8 +1069,22 @@ def test_concurrent_turns_never_swap_credentials():
 
     async def both():
         await asyncio.gather(
-            gateway.run_turn(run_id="r1", node_id="n1", attempt=1, agent_id="a1", shared_state={}),
-            gateway.run_turn(run_id="r1", node_id="n2", attempt=1, agent_id="a2", shared_state={}),
+            gateway.run_turn(
+                run_id="r1",
+                node_id="n1",
+                attempt=1,
+                logical_visit_id="visit-a1",
+                agent_id="a1",
+                shared_state={},
+            ),
+            gateway.run_turn(
+                run_id="r1",
+                node_id="n2",
+                attempt=1,
+                logical_visit_id="visit-a2",
+                agent_id="a2",
+                shared_state={},
+            ),
         )
 
     asyncio.run(both())
@@ -1142,13 +1314,59 @@ def test_anthropic_adapter_builds_client_with_resolved_key(monkeypatch):
 
     monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeClient)
     adapter = AnthropicAdapter()
-    adapter._resolve_client(ResolvedSecret("sk-one"))
-    adapter._resolve_client(ResolvedSecret("sk-two"))
-    adapter._resolve_client(ResolvedSecret("sk-one"))  # NEW object, same value — cache hit
-    adapter._resolve_client(None)  # env fallback: no api_key kwarg
+    asyncio.run(adapter._resolve_client(ResolvedSecret("sk-one")))
+    asyncio.run(adapter._resolve_client(ResolvedSecret("sk-two")))
+    asyncio.run(adapter._resolve_client(ResolvedSecret("sk-one")))  # NEW object, same value — cache hit
+    asyncio.run(adapter._resolve_client(None))  # env fallback: no api_key kwarg
     assert len(made) == 3
     assert made[0]["api_key"] == "sk-one" and made[1]["api_key"] == "sk-two"
     assert "api_key" not in made[2]
+
+
+def test_async_client_cache_closes_on_eviction_and_shutdown():
+    from ravana.runtime.providers.base import AsyncClientCache
+
+    closed: list[str] = []
+
+    class Client:
+        def __init__(self, name):
+            self.name = name
+
+        async def aclose(self):
+            closed.append(self.name)
+
+    async def exercise():
+        cache = AsyncClientCache[str](max_size=2)
+        await cache.get_or_create("a", lambda: Client("a"))
+        await cache.get_or_create("b", lambda: Client("b"))
+        await cache.get_or_create("c", lambda: Client("c"))
+        assert len(cache) == 2
+        assert closed == ["a"]
+        await cache.aclose()
+        assert len(cache) == 0
+
+    asyncio.run(exercise())
+    assert set(closed) == {"a", "b", "c"}
+
+
+def test_gateway_shutdown_closes_adapter_and_tool_executor(graph):
+    closed: list[str] = []
+
+    class Adapter(FakeAdapter):
+        async def aclose(self):
+            closed.append("adapter")
+
+    class Executor(_SurfacingExec):
+        async def execute(self, **kwargs):
+            return "ok"
+
+        async def aclose(self):
+            closed.append("tools")
+
+    adapter = Adapter(name="anthropic", responses=[_submit({"done": True})])
+    gateway = LLMGateway(graph, {"anthropic": adapter}, tool_executor=Executor())
+    asyncio.run(gateway.aclose())
+    assert closed == ["adapter", "tools"]
 
 
 def test_openai_missing_credential_is_normalized_and_falls_back(monkeypatch):
@@ -1206,9 +1424,11 @@ def test_sdk_internal_retries_are_disabled(monkeypatch):
     monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeAnthropicClient)
     monkeypatch.setattr(openai, "AsyncOpenAI", FakeOpenAIClient)
 
-    AnthropicAdapter()._resolve_client(None)
-    OpenAICompatibleAdapter(name="local")._resolve_client(
-        ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a/v1")
+    asyncio.run(AnthropicAdapter()._resolve_client(None))
+    asyncio.run(
+        OpenAICompatibleAdapter(name="local")._resolve_client(
+            ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a/v1")
+        )
     )
     assert made["anthropic"]["max_retries"] == 0
     assert made["openai"]["max_retries"] == 0
@@ -1340,9 +1560,9 @@ def test_openai_adapter_caches_client_per_endpoint():
 
     try:
         adapter = OpenAICompatibleAdapter(name="local")  # no injected client -> lazy per-endpoint construction
-        adapter._resolve_client(_req("http://a:11434/v1", "k1"))
-        adapter._resolve_client(_req("http://b:11434/v1", "k2"))
-        adapter._resolve_client(_req("http://a:11434/v1", "k1"))
+        asyncio.run(adapter._resolve_client(_req("http://a:11434/v1", "k1")))
+        asyncio.run(adapter._resolve_client(_req("http://b:11434/v1", "k2")))
+        asyncio.run(adapter._resolve_client(_req("http://a:11434/v1", "k1")))
     finally:
         openai.AsyncOpenAI = orig
 
@@ -1369,7 +1589,11 @@ def test_hosted_openai_omits_api_key_so_sdk_reads_env():
     openai.AsyncOpenAI = FakeClient
     try:
         adapter = OpenAICompatibleAdapter(name="openai")
-        adapter._resolve_client(ProviderRequest(model="gpt-4o", system="", messages=[UserMessage(text="x")]))
+        asyncio.run(
+            adapter._resolve_client(
+                ProviderRequest(model="gpt-4o", system="", messages=[UserMessage(text="x")])
+            )
+        )
     finally:
         openai.AsyncOpenAI = orig
 
@@ -1396,8 +1620,15 @@ def test_local_runtime_without_key_gets_placeholder():
     openai.AsyncOpenAI = FakeClient
     try:
         adapter = OpenAICompatibleAdapter(name="local")
-        adapter._resolve_client(
-            ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://localhost:11434/v1")
+        asyncio.run(
+            adapter._resolve_client(
+                ProviderRequest(
+                    model="m",
+                    system="",
+                    messages=[UserMessage(text="x")],
+                    endpoint="http://localhost:11434/v1",
+                )
+            )
         )
     finally:
         openai.AsyncOpenAI = orig

@@ -80,16 +80,21 @@ def persist_workflow(con: sqlite3.Connection, graph: CompiledGraph, org_id: str,
     )
 
     for node in doc.spec.graph.nodes:
+        contract = graph.contract_for_node(node.id) if node.agent else None
         con.execute(
-            """INSERT INTO workflow_node (id, workflow_id, agent_id, sub_workflow_id, on_enter, join_policy, hitl_config)
-               VALUES (?,?,?,?,?,?,?)""",
+            """INSERT INTO workflow_node
+               (id, workflow_id, agent_id, sub_workflow_id, on_enter, join_policy,
+                toolkit_ids, hitl_config, output_schema)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (
                 node.id, workflow_id,
                 agent_db_ids.get(node.agent) if node.agent else None,
                 None,  # sub_workflow_id: not resolvable without a workflow name->id registry; out of scope for 0a
                 node.on_enter,
                 node.join,
-                dumps(_agent_hitl_config(doc, node.agent)),
+                dumps(list(contract.toolkits)) if contract else dumps([]),
+                dumps(contract.hitl.model_dump() if contract and contract.hitl else None),
+                dumps(contract.output_schema if contract else None),
             ),
         )
 
@@ -107,12 +112,3 @@ def persist_workflow(con: sqlite3.Connection, graph: CompiledGraph, org_id: str,
         after={"name": doc.metadata.name, "version": doc.metadata.version},
     )
     return workflow_id
-
-
-def _agent_hitl_config(doc, agent_id: str | None) -> dict | None:
-    if agent_id is None:
-        return None
-    agent = next((a for a in doc.spec.agents if a.id == agent_id), None)
-    if agent is None or agent.hitl is None:
-        return None
-    return agent.hitl.model_dump()

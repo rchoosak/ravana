@@ -87,6 +87,13 @@ def test_engine_delays_grow_exponentially_across_retries(con):
     assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "COMPLETED"
     # 1st consecutive failure: exp=1s; 2nd: exp=2s — grew, not flat.
     sleeper.assert_delays(1.0, 2.0)
+    visits = {
+        row["logical_visit_id"]
+        for row in con.execute(
+            "SELECT logical_visit_id FROM node_execution WHERE run_id = ?", (run_id,)
+        )
+    }
+    assert len(visits) == 1  # all retry attempts belong to one logical visit
 
 
 def _cyclic_two_node_doc() -> WorkflowDoc:
@@ -145,6 +152,16 @@ def test_backoff_keys_on_consecutive_failures_not_lifetime_attempts(con):
     # One failure => one backoff, and it's a FIRST-failure delay (exp=1s),
     # NOT backoff_delay(3) (exp=4s) off the lifetime attempt.
     sleeper.assert_delays(1.0)
+    worker_visits = [
+        row["logical_visit_id"]
+        for row in con.execute(
+            """SELECT logical_visit_id FROM node_execution
+               WHERE run_id = ? AND node_id = 'worker' ORDER BY attempt""",
+            (run_id,),
+        )
+    ]
+    assert len(set(worker_visits[:2])) == 2  # two successful graph entries
+    assert worker_visits[2] == worker_visits[3]  # retry keeps visit identity
 
 
 def test_no_sleep_before_a_guaranteed_budget_failure(con):

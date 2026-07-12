@@ -88,8 +88,8 @@ def _missing_safety_net(graph: CompiledGraph) -> list[Issue]:
         has_unconditional = any(e.condition is None for e in conditional)
         if has_unconditional:
             continue  # an unconditional edge always fires, covered
-        agent = graph.agents_by_id.get(node.agent) if node.agent else None
-        if agent is not None and agent.hitl is not None and agent.hitl.enabled:
+        contract = graph.contract_for_node(node_id) if node.agent else None
+        if contract is not None and contract.hitl is not None and contract.hitl.enabled:
             continue  # HITL can catch the no-match case, covered
         issues.append(
             Issue(
@@ -124,10 +124,10 @@ def _broadcast_merge_conflicts(graph: CompiledGraph) -> list[Issue]:
             node = graph.nodes_by_id.get(target)
             if node is None or node.agent is None:
                 continue
-            agent = graph.agents_by_id.get(node.agent)
-            if agent is None or agent.output_schema is None:
+            contract = graph.contract_for_node(target)
+            if contract.output_schema is None:
                 continue
-            for key in agent.output_schema.get("properties", {}):
+            for key in contract.output_schema.get("properties", {}):
                 field_schema = state_fields.get(key)
                 if field_schema is not None and field_schema.merge == "overwrite":
                     overwrite_keys.setdefault(key, []).append(target)
