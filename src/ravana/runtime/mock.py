@@ -47,6 +47,7 @@ class MockAgentRuntime:
         run_id: str,
         node_id: str,
         attempt: int,
+        logical_visit_id: str,
         agent_id: str,
         shared_state: dict[str, Any],
     ) -> AgentTurnResult:
@@ -69,3 +70,6 @@ class MockAgentRuntime:
             tool_call_count=entry.get("tool_call_count", len(entry.get("tool_calls", []))),
             repair_count=entry.get("repair_count", 0),
         )
+
+    async def aclose(self) -> None:
+        return None

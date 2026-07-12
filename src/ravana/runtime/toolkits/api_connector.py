@@ -1,5 +1,5 @@
 """Generic HTTP `api_connector` toolkit (§1.7). `config.base_url` is the
-target; the content-addressed idempotency key is forwarded as
+target; the logical-invocation idempotency key is forwarded as
 `Idempotency-Key` so a remote that honors it dedupes the side effect too.
 
 Per §8(c) the connector does NOT resolve secrets itself — it "receives
@@ -16,10 +16,16 @@ injection without a network round-trip.
 
 from __future__ import annotations
 
+import inspect
 import json
 from typing import Any, Callable
 
-from ravana.runtime.secrets import ResolvedSecret
+from ravana.runtime.secrets import (
+    ResolvedSecret,
+    SecretLeakError,
+    ensure_secret_free,
+    redact_secrets,
+)
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 
 # §8(a): the connector's declared input schema. Result is a plain string
@@ -51,9 +57,10 @@ class ApiConnectorHandler:
         get_auth_token: Callable[[], ResolvedSecret | None] = lambda: None,
         client: Any | None = None,
     ):
-        self._base_url = config.get("base_url")
-        if not self._base_url:
+        base_url = config.get("base_url")
+        if not isinstance(base_url, str) or not base_url:
             raise ToolkitError("api_connector requires config.base_url")
+        self._base_url = base_url
         self.description = (
             f"Make an HTTP request to the API at {self._base_url}. Set 'method' and a "
             "base_url-relative 'path' (must start with '/'; absolute URLs are rejected). "
@@ -63,6 +70,7 @@ class ApiConnectorHandler:
         # token at dispatch. The connector never holds the auth_ref or resolver.
         self._get_auth_token = get_auth_token
         self._client = client  # injected in tests; real client built lazily
+        self._owns_client = client is None
 
     def is_side_effecting(self, arguments: dict[str, Any]) -> bool:
         return _method_of(arguments) not in _READ_ONLY_METHODS
@@ -73,6 +81,17 @@ class ApiConnectorHandler:
 
             self._client = httpx.AsyncClient(base_url=self._base_url)
         return self._client
+
+    async def aclose(self) -> None:
+        if not self._owns_client or self._client is None:
+            return
+        client, self._client = self._client, None
+        close = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if close is None:
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
 
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str) -> str:
         # Validate BEFORE resolving the token or building headers, so a
@@ -90,9 +109,22 @@ class ApiConnectorHandler:
         # handler-lifetime cache, so token rotation is picked up per call. The
         # provider returns a ResolvedSecret (or None); it opens to plaintext
         # only here, at the HTTP boundary.
-        token = self._get_auth_token()
-        if token is not None:
-            headers["Authorization"] = f"Bearer {token.value()}"
+        token: ResolvedSecret | None = None
+        token_value: str | None = None
+        token_error: ToolkitError | None = None
+        try:
+            token = self._get_auth_token()
+            token_value = token.value() if token is not None else None
+        except Exception as exc:  # noqa: BLE001 - credential failure is fatal
+            token_error = ToolkitError(
+                f"api_connector credential resolution failed ({type(exc).__name__})",
+                kind=ToolFailureKind.FATAL,
+            )
+        if token_error is not None:
+            raise token_error
+        if token_value is not None:
+            headers["Authorization"] = f"Bearer {token_value}"
+        secret_values = (token_value,) if token_value is not None else ()
 
         client = self._resolve_client()
         try:
@@ -108,12 +140,26 @@ class ApiConnectorHandler:
             # terminal boundary fails the run hard instead of a wrong-type
             # transient retry re-running broken code.
             kind = _classify_exception(exc)
+            safe_error = redact_secrets(str(exc), values=secret_values)
             if kind is None:
-                raise
-            raise ToolkitError(f"api_connector request to {path} failed: {exc}", kind=kind) from exc
+                if safe_error == str(exc):
+                    raise
+                try:
+                    safe_exception = type(exc)(safe_error)
+                except Exception:  # noqa: BLE001
+                    safe_exception = RuntimeError(
+                        f"api_connector request failed ({type(exc).__name__}): {safe_error}"
+                    )
+                raise safe_exception from None
+            raise ToolkitError(
+                f"api_connector request to {path} failed: {safe_error}", kind=kind
+            ) from None
 
         status = getattr(response, "status_code", None)
-        body = _body_text(response)
+        try:
+            body = _body_text(response, secret_values=secret_values)
+        except SecretLeakError as exc:
+            raise ToolkitError(str(exc), kind=ToolFailureKind.FATAL) from None
         if status is not None and status >= 400:
             raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}", kind=_classify_status(status))
         return body
@@ -136,12 +182,16 @@ def _classify_exception(exc: Exception) -> ToolFailureKind | None:
     try:
         import httpx
     except ImportError:  # pragma: no cover - httpx is a direct dependency
-        httpx = None
-    if httpx is not None and isinstance(exc, httpx.HTTPStatusError):
+        return (
+            ToolFailureKind.TRANSIENT
+            if isinstance(exc, (OSError, TimeoutError))
+            else None
+        )
+    if isinstance(exc, httpx.HTTPStatusError):
         return _classify_status(exc.response.status_code)
     if isinstance(exc, (OSError, TimeoutError)):
         return ToolFailureKind.TRANSIENT
-    if httpx is not None and isinstance(exc, httpx.TransportError):
+    if isinstance(exc, httpx.TransportError):
         return ToolFailureKind.TRANSIENT
     return None
 
@@ -176,8 +226,18 @@ def _reject_offbase_path(path: str) -> None:
         raise ToolkitError(f"api_connector: path must start with '/' ({path!r})")
 
 
-def _body_text(response: Any) -> str:
+def _body_text(response: Any, *, secret_values: tuple[str, ...] = ()) -> str:
     try:
-        return json.dumps(response.json())
+        payload = response.json()
+        ensure_secret_free(
+            payload, context="api_connector response", values=secret_values
+        )
+        return json.dumps(payload)
+    except SecretLeakError:
+        raise
     except Exception:  # noqa: BLE001
-        return getattr(response, "text", "")
+        text = getattr(response, "text", "")
+        ensure_secret_free(
+            text, context="api_connector response", values=secret_values
+        )
+        return text

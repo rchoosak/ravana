@@ -7,9 +7,11 @@ strategy/loop logic) knowing which produced a turn.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Callable, Generic, Protocol, TypeVar
 
 from ravana.runtime.secrets import ResolvedSecret, redact_secrets
 
@@ -21,6 +23,15 @@ class Capability(str, Enum):
 
     GUIDED_DECODING = "guided_decoding"
     NATIVE_STRUCTURED_OUTPUT = "native_structured_output"
+
+
+@dataclass(frozen=True)
+class ProviderTarget:
+    """The immutable target whose capabilities the gateway is selecting for."""
+
+    provider: str
+    model: str
+    endpoint: str | None = None
 
 
 @dataclass
@@ -149,22 +160,66 @@ def classify_retryable(exc: Exception) -> bool:
     return not isinstance(exc, _PERMANENT_EXC_TYPES)
 
 
-# A per-adapter client-cache ceiling. Clients are keyed by resolved credential
-# (§8c per-agent routing), so a genuinely-rotating resolver (Vault, Phase 2)
-# would otherwise grow the cache without bound. Env-based keys are stable per
-# process, so in Phase 0b this ceiling is never reached — it's a defensive cap.
-# (Closing the evicted client's connection pool needs an async aclose(); that
-# lands with Phase 1 connection management. The count is what's bounded here.)
 _MAX_CACHED_CLIENTS = 32
+_CacheKey = TypeVar("_CacheKey")
 
 
-def _bound_client_cache(clients: dict[Any, Any]) -> None:
-    """Evict the oldest cached client (dicts preserve insertion order) before
-    inserting a new one past the ceiling, so key rotation can't grow the cache
-    without limit."""
-    while len(clients) >= _MAX_CACHED_CLIENTS:
-        oldest = next(iter(clients))
-        del clients[oldest]
+async def _close_client(client: Any) -> None:
+    """Close either SDK spelling (`aclose` or `close`), sync or async."""
+    cleanup_error: RuntimeError | None = None
+    try:
+        close = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if close is None:
+            return
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # noqa: BLE001 - SDK cleanup methods vary
+        cleanup_error = RuntimeError(f"provider client cleanup failed ({type(exc).__name__})")
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
+class AsyncClientCache(Generic[_CacheKey]):
+    """Bounded, concurrency-safe ownership of provider SDK clients.
+
+    Adapters supply only a key and construction function. The cache owns the
+    lifecycle invariant: one client per key, close on eviction, close all at
+    adapter shutdown.
+    """
+
+    def __init__(self, max_size: int = _MAX_CACHED_CLIENTS):
+        if max_size < 1:
+            raise ValueError("client cache max_size must be positive")
+        self._max_size = max_size
+        self._clients: dict[_CacheKey, Any] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_or_create(self, key: _CacheKey, factory: Callable[[], Any]) -> Any:
+        async with self._lock:
+            if key in self._clients:
+                return self._clients[key]
+            while len(self._clients) >= self._max_size:
+                oldest = next(iter(self._clients))
+                await _close_client(self._clients.pop(oldest))
+            client = factory()
+            self._clients[key] = client
+            return client
+
+    async def aclose(self) -> None:
+        first_error: Exception | None = None
+        async with self._lock:
+            while self._clients:
+                _key, client = self._clients.popitem()
+                try:
+                    await _close_client(client)
+                except Exception as exc:  # fixed-shape by _close_client
+                    first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+
+    def __len__(self) -> int:
+        return len(self._clients)
 
 
 def to_provider_error(
@@ -188,6 +243,8 @@ def to_provider_error(
 class ProviderAdapter(Protocol):
     name: str
 
-    def capabilities(self, model: str) -> set[Capability]: ...
+    def capabilities(self, target: ProviderTarget) -> set[Capability]: ...
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse: ...
+
+    async def aclose(self) -> None: ...

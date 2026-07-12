@@ -23,12 +23,13 @@ from __future__ import annotations
 from typing import Any
 
 from ravana.runtime.providers.base import (
+    AsyncClientCache,
     Capability,
     NormalizedToolCall,
-    _bound_client_cache,
-    to_provider_error,
     ProviderRequest,
     ProviderResponse,
+    ProviderTarget,
+    to_provider_error,
 )
 from ravana.runtime.secrets import ResolvedSecret
 
@@ -58,12 +59,13 @@ class AnthropicAdapter:
         # agents may hold different per-agent credentials (§1.4/§8c).
         # ResolvedSecret hashes by value, so re-resolution of the same key
         # reuses the cached client.
-        self._clients: dict[ResolvedSecret | None, Any] = {}
+        self._clients = AsyncClientCache[ResolvedSecret | None]()
 
-    def _resolve_client(self, api_key: ResolvedSecret | None) -> Any:
+    async def _resolve_client(self, api_key: ResolvedSecret | None) -> Any:
         if self._explicit_client is not None:
             return self._explicit_client
-        if api_key not in self._clients:
+
+        def build_client() -> Any:
             import anthropic
 
             # max_retries=0: the GATEWAY owns retry policy (§3.6). The SDK's
@@ -75,11 +77,14 @@ class AnthropicAdapter:
                 # §8c: already resolved by the gateway from llm.api_key_ref —
                 # this adapter never sees the pointer, only the credential.
                 kwargs["api_key"] = api_key.value()
-            _bound_client_cache(self._clients)
-            self._clients[api_key] = anthropic.AsyncAnthropic(**kwargs)
-        return self._clients[api_key]
+            return anthropic.AsyncAnthropic(**kwargs)
 
-    def capabilities(self, model: str) -> set[Capability]:
+        return await self._clients.get_or_create(api_key, build_client)
+
+    async def aclose(self) -> None:
+        await self._clients.aclose()
+
+    def capabilities(self, target: ProviderTarget) -> set[Capability]:
         # Anthropic offers provider-guaranteed conformance via forced
         # tool-calling, not token-level guided decoding.
         return {Capability.NATIVE_STRUCTURED_OUTPUT}
@@ -91,7 +96,7 @@ class AnthropicAdapter:
         # fallback chain. A client that can't be built is permanent for this
         # entry; the next fallback entry (different provider) may work.
         try:
-            client = self._resolve_client(request.api_key)
+            client = await self._resolve_client(request.api_key)
         except Exception as exc:  # noqa: BLE001
             raise to_provider_error(
                 "anthropic client init failed", exc, retryable=False, secret=request.api_key
@@ -119,7 +124,9 @@ class AnthropicAdapter:
             # §3.6 taxonomy: classified retryable/permanent in one shared place
             # (a missing credential arrives as the SDK's TypeError — no
             # status_code — and classifies permanent, not transient).
-            raise to_provider_error("anthropic completion failed", exc) from exc
+            raise to_provider_error(
+                "anthropic completion failed", exc, secret=request.api_key
+            ) from exc
 
         text_parts: list[str] = []
         tool_calls: list[NormalizedToolCall] = []

@@ -20,21 +20,27 @@ OpenAI API declares only native structured output.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 from ravana.runtime.providers.base import (
+    AsyncClientCache,
     Capability,
     NormalizedToolCall,
-    _bound_client_cache,
-    to_provider_error,
     ProviderRequest,
     ProviderResponse,
+    ProviderTarget,
+    to_provider_error,
 )
 from ravana.runtime.secrets import ResolvedSecret
 
 
 class OpenAICompatibleAdapter:
-    def __init__(self, name: str = "openai", client: Any | None = None, guided_decoding: bool = False):
+    def __init__(
+        self,
+        name: str = "openai",
+        client: Any | None = None,
+        guided_decoding: bool | Callable[[ProviderTarget], bool] = False,
+    ):
         self.name = name
         self._guided = guided_decoding
         self._explicit_client = client  # an injected client (tests) is used verbatim
@@ -45,19 +51,21 @@ class OpenAICompatibleAdapter:
         # silently sent every agent's traffic to whichever endpoint happened
         # to be resolved first. ResolvedSecret hashes by value, so
         # re-resolution of the same key reuses the cached client.
-        self._clients: dict[tuple[str | None, ResolvedSecret | None], Any] = {}
+        self._clients = AsyncClientCache[tuple[str | None, ResolvedSecret | None]]()
 
-    def capabilities(self, model: str) -> set[Capability]:
+    def capabilities(self, target: ProviderTarget) -> set[Capability]:
         caps = {Capability.NATIVE_STRUCTURED_OUTPUT}
-        if self._guided:
+        guided = self._guided(target) if callable(self._guided) else self._guided
+        if guided:
             caps.add(Capability.GUIDED_DECODING)
         return caps
 
-    def _resolve_client(self, request: ProviderRequest) -> Any:
+    async def _resolve_client(self, request: ProviderRequest) -> Any:
         if self._explicit_client is not None:
             return self._explicit_client
         key = (request.endpoint, request.api_key)
-        if key not in self._clients:
+
+        def build_client() -> Any:
             from openai import AsyncOpenAI
 
             # max_retries=0: the GATEWAY owns retry policy (§3.6). The SDK's
@@ -79,9 +87,12 @@ class OpenAICompatibleAdapter:
             # else: hosted OpenAI with no per-agent key — pass no api_key so the
             # SDK falls back to OPENAI_API_KEY from the environment. (Passing a
             # dummy key here would defeat that fallback and misauthenticate.)
-            _bound_client_cache(self._clients)
-            self._clients[key] = AsyncOpenAI(**kwargs)
-        return self._clients[key]
+            return AsyncOpenAI(**kwargs)
+
+        return await self._clients.get_or_create(key, build_client)
+
+    async def aclose(self) -> None:
+        await self._clients.aclose()
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         # Client construction is INSIDE the normalization boundary: with no
@@ -90,7 +101,7 @@ class OpenAICompatibleAdapter:
         # that can't be built is a config error — permanent for this entry,
         # but the next fallback entry (different provider/key) may work.
         try:
-            client = self._resolve_client(request)
+            client = await self._resolve_client(request)
         except Exception as exc:  # noqa: BLE001
             raise to_provider_error(
                 "openai-compatible client init failed", exc, retryable=False, secret=request.api_key

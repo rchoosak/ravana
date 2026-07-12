@@ -7,8 +7,17 @@ issues for a graph that still fails to compile cleanly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
-from ravana.schema.models import AgentConfig, GraphEdge, GraphNode, SkillConfig, ToolkitConfig, WorkflowDoc
+from ravana.schema.models import (
+    AgentConfig,
+    GraphEdge,
+    GraphNode,
+    HITLConfig,
+    SkillConfig,
+    ToolkitConfig,
+    WorkflowDoc,
+)
 
 TERMINAL = "__terminal__"
 
@@ -17,6 +26,20 @@ class CompileError(Exception):
     """Raised when a workflow has structural errors severe enough that the
     engine cannot run it at all (as opposed to a `validate` warning, which is
     advisory)."""
+
+
+@dataclass(frozen=True)
+class NodeExecutionContract:
+    """Task-specific behavior resolved at the node seam.
+
+    AgentConfig remains the reusable persona and capability ceiling. A node
+    can narrow tool grants and override output/HITL behavior without cloning
+    the persona; legacy workflows inherit the agent defaults.
+    """
+
+    toolkits: tuple[str, ...]
+    hitl: HITLConfig | None
+    output_schema: dict[str, Any] | None
 
 
 @dataclass
@@ -50,6 +73,16 @@ class CompiledGraph:
         if node.agent is None:
             raise CompileError(f"node '{node_id}' has no agent (sub-workflow nodes aren't runnable in Phase 0a)")
         return self.agents_by_id[node.agent]
+
+    def contract_for_node(self, node_id: str) -> NodeExecutionContract:
+        node = self.node(node_id)
+        agent = self.agent_for_node(node_id)
+        explicit = node.model_fields_set
+        return NodeExecutionContract(
+            toolkits=tuple(agent.toolkits if node.toolkits is None else node.toolkits),
+            hitl=agent.hitl if "hitl" not in explicit else node.hitl,
+            output_schema=agent.output_schema if "output_schema" not in explicit else node.output_schema,
+        )
 
     def outgoing(self, node_id: str) -> tuple[list[GraphEdge], GraphEdge | None]:
         """(conditional edges in priority order, the default edge or None)."""
@@ -102,6 +135,17 @@ def compile_workflow(doc: WorkflowDoc) -> CompiledGraph:
     for node in spec.graph.nodes:
         if node.agent is not None and node.agent not in agents_by_id:
             raise CompileError(f"node '{node.id}' references unknown agent '{node.agent}'")
+        if node.agent is not None and node.toolkits is not None:
+            agent_toolkits = set(agents_by_id[node.agent].toolkits)
+            unauthorized = sorted(set(node.toolkits) - agent_toolkits)
+            if unauthorized:
+                raise CompileError(
+                    f"node '{node.id}' grants toolkits {unauthorized} outside agent "
+                    f"'{node.agent}' allow-list"
+                )
+            unknown = sorted(set(node.toolkits) - set(toolkits_by_id))
+            if unknown:
+                raise CompileError(f"node '{node.id}' references unknown toolkit(s) {unknown}")
 
     for agent in spec.agents:
         for tk in agent.toolkits:

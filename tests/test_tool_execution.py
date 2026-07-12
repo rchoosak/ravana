@@ -189,6 +189,28 @@ def test_api_connector_declares_input_schema(graph):
     assert "path" in schema["required"]
 
 
+def test_api_connector_closes_the_client_it_constructs(monkeypatch):
+    import httpx
+
+    from ravana.runtime.toolkits.api_connector import ApiConnectorHandler
+
+    made = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.closed = False
+            made.append(self)
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    handler = ApiConnectorHandler({"base_url": "https://api.test"})
+    handler._resolve_client()
+    asyncio.run(handler.aclose())
+    assert made and made[0].closed
+
+
 def test_api_connector_shapes_request_with_auth_and_idempotency_header(graph):
     fake = FakeHttpClient(FakeResponse(200, {"created": "ticket-42"}))
     resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "ghp_realtoken"})
@@ -217,6 +239,38 @@ def test_api_connector_raises_on_http_error(graph):
         asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
 
 
+def test_api_connector_rejects_success_body_that_echoes_exact_token(graph):
+    secret = 'zzz-"QUOTED"-TOKEN'
+    fake = FakeHttpClient(FakeResponse(200, {"nested": {"token": secret}}))
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": secret})
+    handlers = build_registry(graph, resolver, clients={"git_connector": fake})
+
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(
+            handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k")
+        )
+    assert exc_info.value.kind is ToolFailureKind.FATAL
+    assert secret not in str(exc_info.value)
+    assert "credential material" in str(exc_info.value)
+
+
+def test_api_connector_hides_resolver_exception_text(graph):
+    class LeakyResolver:
+        def resolve(self, ref):
+            raise RuntimeError("resolver exposed zzz-UNPATTERNED-SECRET")
+
+    handlers = build_registry(
+        graph, LeakyResolver(), clients={"git_connector": FakeHttpClient()}
+    )
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(
+            handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k")
+        )
+    assert exc_info.value.kind is ToolFailureKind.FATAL
+    assert "zzz-UNPATTERNED-SECRET" not in str(exc_info.value)
+    assert "RuntimeError" in str(exc_info.value)
+
+
 @pytest.mark.parametrize(
     ("status", "kind"),
     [
@@ -234,7 +288,7 @@ def test_api_connector_classifies_http_failures(graph, status, kind):
     # §3.6 taxonomy on tool failures: transient (retry attempt w/ backoff),
     # fatal (auth — fails the run), or model-addressable (fed back).
     fake = FakeHttpClient(FakeResponse(status, {"error": "x"}))
-    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "tool-test-token"})
     handlers = build_registry(graph, resolver, clients={"git_connector": fake})
     with pytest.raises(ToolkitError) as exc_info:
         asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))

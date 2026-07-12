@@ -11,9 +11,10 @@ import asyncio
 from ravana.compiler.graph import compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.engine.loop import start_run
+from ravana.runtime.base import AgentTurnResult
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.schema.models import WorkflowDoc
-from ravana.schema.util import loads
+from ravana.schema.util import dumps, loads
 
 
 def _single_node_workflow(edges: list[dict] | None = None) -> WorkflowDoc:
@@ -47,6 +48,130 @@ def test_implicit_terminal_node_completes_the_run(con):
     assert len(terminate_events) == 1
 
 
+def test_successful_turn_commit_is_atomic(con):
+    """If the COMMIT event write fails, message/status/state must all roll back."""
+    graph = compile_workflow(_single_node_workflow())
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    con.executescript(
+        """
+        CREATE TRIGGER abort_turn_commit
+        BEFORE INSERT ON state_transition_log
+        WHEN NEW.event_type = 'COMMIT'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected commit failure');
+        END;
+        """
+    )
+    runtime = MockAgentRuntime(
+        {"only": [{"structured_payload": {"should_not_persist": True}}]}
+    )
+
+    run_id = asyncio.run(
+        start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id)
+    )
+
+    run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    execution = con.execute(
+        "SELECT * FROM node_execution WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    assert run["status"] == "FAILED"
+    assert loads(run["shared_state"]) == {}
+    assert run["state_version"] == 0
+    assert execution["status"] == "FAILED"
+    assert con.execute(
+        "SELECT COUNT(*) AS c FROM message WHERE run_id = ?", (run_id,)
+    ).fetchone()["c"] == 0
+    assert con.execute(
+        """SELECT COUNT(*) AS c FROM state_transition_log
+           WHERE run_id = ? AND event_type = 'COMMIT'""",
+        (run_id,),
+    ).fetchone()["c"] == 0
+
+
+def test_successful_turn_merges_against_state_committed_while_agent_runs(con):
+    graph = compile_workflow(_single_node_workflow())
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+
+    class ConcurrentCommitRuntime:
+        async def run_turn(
+            self,
+            *,
+            run_id: str,
+            node_id: str,
+            attempt: int,
+            logical_visit_id: str,
+            agent_id: str,
+            shared_state: dict,
+        ) -> AgentTurnResult:
+            latest = loads(
+                con.execute(
+                    "SELECT shared_state FROM run WHERE id = ?", (run_id,)
+                ).fetchone()["shared_state"]
+            )
+            latest["parallel_branch"] = "committed"
+            con.execute(
+                """UPDATE run SET shared_state = ?, state_version = state_version + 1
+                   WHERE id = ?""",
+                (dumps(latest), run_id),
+            )
+            con.commit()
+            return AgentTurnResult(structured_payload={"agent_branch": "committed"})
+
+        async def aclose(self) -> None:
+            return None
+
+    run_id = asyncio.run(
+        start_run(
+            con,
+            graph,
+            ConcurrentCommitRuntime(),
+            org_id="test",
+            workflow_id=workflow_id,
+        )
+    )
+
+    run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert loads(run["shared_state"]) == {
+        "parallel_branch": "committed",
+        "agent_branch": "committed",
+    }
+    assert run["state_version"] == 2
+
+
+def test_engine_fails_closed_before_persisting_secret_bearing_output(con):
+    graph = compile_workflow(_single_node_workflow())
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    runtime = MockAgentRuntime(
+        {
+            "only": [
+                {
+                    "content": "provider echoed sk-DO-NOT-PERSIST",
+                    "structured_payload": {"nested": ["sk-DO-NOT-PERSIST"]},
+                }
+            ]
+        }
+    )
+
+    run_id = asyncio.run(
+        start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id)
+    )
+    run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    error = con.execute(
+        "SELECT error FROM node_execution WHERE run_id = ?", (run_id,)
+    ).fetchone()["error"]
+    assert run["status"] == "FAILED"
+    assert "sk-DO-NOT-PERSIST" not in error
+    assert con.execute(
+        "SELECT COUNT(*) AS c FROM message WHERE run_id = ?", (run_id,)
+    ).fetchone()["c"] == 0
+    assert "sk-DO-NOT-PERSIST" not in run["shared_state"]
+    assert con.execute(
+        """SELECT COUNT(*) AS c FROM state_transition_log
+           WHERE run_id = ? AND event_type = 'COMMIT'""",
+        (run_id,),
+    ).fetchone()["c"] == 0
+
+
 def test_non_transient_turn_error_fails_the_run_cleanly(con):
     """A non-transient error from run_turn (e.g. the gateway surfacing a
     deferred toolkit, a submit_result-id collision, or an unexpected bug) must
@@ -56,7 +181,9 @@ def test_non_transient_turn_error_fails_the_run_cleanly(con):
     from ravana.runtime.toolkits.base import ToolkitError
 
     class ExplodingRuntime:
-        async def run_turn(self, *, run_id, node_id, attempt, agent_id, shared_state):
+        async def run_turn(
+            self, *, run_id, node_id, attempt, logical_visit_id, agent_id, shared_state
+        ):
             raise ToolkitError("toolkit 'code_interpreter' is not executable in this build")
 
     graph = compile_workflow(_single_node_workflow())
@@ -138,7 +265,17 @@ def test_tool_calls_get_a_stable_idempotency_key(con):
     # identical key (that's the whole point of the fix).
     from ravana.runtime.idempotency import compute_idempotency_key
 
-    expected = compute_idempotency_key(run_id, "only", "git_push", tool_call["arguments"])
+    execution = con.execute(
+        "SELECT logical_visit_id FROM node_execution WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    expected = compute_idempotency_key(
+        run_id,
+        "only",
+        execution["logical_visit_id"],
+        1,
+        "git_push",
+        tool_call["arguments"],
+    )
     assert tool_calls[0]["idempotency_key"] == expected
 
 

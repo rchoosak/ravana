@@ -31,9 +31,10 @@ from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
 from ravana.observability.logging import log_event
 from ravana.runtime.backoff import RetrySleep, backoff_delay
-from ravana.runtime.base import AgentRuntime, TransientAgentError
+from ravana.runtime.base import AgentRuntime, AgentTurnResult, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
-from ravana.runtime.secrets import redact_secrets
+from ravana.runtime.secrets import ensure_secret_free, redact_secrets
+from ravana.schema.models import HITLConfig
 from ravana.schema.util import dumps, loads, new_id, now_iso
 
 _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
@@ -164,6 +165,20 @@ def _total_tokens(con: sqlite3.Connection, run_id: str) -> int:
         "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS t FROM node_execution WHERE run_id = ?", (run_id,)
     ).fetchone()
     return row["t"]
+
+
+def _logical_visit_for_dispatch(con: sqlite3.Connection, run_id: str, node_id: str) -> str:
+    """Stable identity across retries/HITL resume, fresh on graph re-entry."""
+    latest = con.execute(
+        """SELECT status, logical_visit_id FROM node_execution
+           WHERE run_id = ? AND node_id = ? ORDER BY attempt DESC LIMIT 1""",
+        (run_id, node_id),
+    ).fetchone()
+    if latest is not None and latest["status"] in ("FAILED", "WAITING_HUMAN"):
+        existing = latest["logical_visit_id"]
+        if existing:
+            return existing
+    return new_id()
 
 
 async def start_run(
@@ -370,12 +385,22 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
         "SELECT COALESCE(MAX(attempt), 0) + 1 AS n FROM node_execution WHERE run_id = ? AND node_id = ?",
         (ctx.run_id, node_id),
     ).fetchone()["n"]
+    logical_visit_id = _logical_visit_for_dispatch(con, ctx.run_id, node_id)
 
     node_execution_id = new_id()
     con.execute(
-        """INSERT INTO node_execution (id, run_id, node_id, attempt, status, started_at)
-           VALUES (?,?,?,?,?,?)""",
-        (node_execution_id, ctx.run_id, node_id, attempt, "RUNNING", now_iso()),
+        """INSERT INTO node_execution
+           (id, run_id, node_id, attempt, logical_visit_id, status, started_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (
+            node_execution_id,
+            ctx.run_id,
+            node_id,
+            attempt,
+            logical_visit_id,
+            "RUNNING",
+            now_iso(),
+        ),
     )
     con.commit()
 
@@ -389,7 +414,20 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
 
     try:
         result = await ctx.runtime.run_turn(
-            run_id=ctx.run_id, node_id=node_id, attempt=attempt, agent_id=agent.id, shared_state=shared_state
+            run_id=ctx.run_id,
+            node_id=node_id,
+            attempt=attempt,
+            logical_visit_id=logical_visit_id,
+            agent_id=agent.id,
+            shared_state=shared_state,
+        )
+        ensure_secret_free(
+            {
+                "content": result.content,
+                "structured_payload": result.structured_payload,
+                "tool_calls": result.tool_calls,
+            },
+            context="agent turn output",
         )
     except TransientAgentError as exc:
         con.execute(
@@ -430,46 +468,163 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
         _fail_run(ctx, node_id, f"node '{node_id}' failed: {exc}")
         return
 
-    con.execute(
-        """UPDATE node_execution SET status = 'SUCCEEDED', finished_at = ?, input_tokens = ?, output_tokens = ?,
-           tool_call_count = ?, repair_count = ? WHERE id = ?""",
-        (now_iso(), result.input_tokens, result.output_tokens, result.tool_call_count, result.repair_count, node_execution_id),
-    )
-
-    for tool_call in result.tool_calls:
-        # §3.6: content-addressed, stable across retries by construction —
-        # attached here (once, at persistence time) rather than left for
-        # every caller of message.tool_calls to recompute.
-        tool_call.setdefault(
-            "idempotency_key",
-            compute_idempotency_key(ctx.run_id, node_id, tool_call.get("tool", ""), tool_call.get("arguments", {})),
-        )
-
-    con.execute(
-        """INSERT INTO message (id, run_id, node_id, sender_agent_id, role, content, structured_payload, tool_calls, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (
-            new_id(), ctx.run_id, node_id, _agent_db_id(con, ctx.workflow_id, node_id), "agent",
-            result.content, dumps(result.structured_payload), dumps(result.tool_calls), now_iso(),
-        ),
-    )
-    con.commit()
-
-    # §3.4's within-turn guards and §9's cost cap: checked after the turn is
-    # fully recorded (so there's always an audit trail of what happened),
-    # before the output is allowed to affect routing.
+    # §3.4's within-turn guards and §9's cost cap are decided before the
+    # durability transaction. A rejected turn is still recorded for audit,
+    # but its delta never reaches shared state or routing.
     if result.tool_call_count > guards.max_tool_calls_per_turn:
-        _fail_run(ctx, node_id, f"node '{node_id}' exceeded max_tool_calls_per_turn ({guards.max_tool_calls_per_turn})")
+        _fail_run(
+            ctx,
+            node_id,
+            f"node '{node_id}' exceeded max_tool_calls_per_turn ({guards.max_tool_calls_per_turn})",
+            result=result,
+            logical_visit_id=logical_visit_id,
+        )
         return
     if result.repair_count > guards.max_output_repairs:
-        _fail_run(ctx, node_id, f"node '{node_id}' exceeded max_output_repairs ({guards.max_output_repairs})")
+        _fail_run(
+            ctx,
+            node_id,
+            f"node '{node_id}' exceeded max_output_repairs ({guards.max_output_repairs})",
+            result=result,
+            logical_visit_id=logical_visit_id,
+        )
         return
-    if guards.max_tokens_total is not None and _total_tokens(con, ctx.run_id) > guards.max_tokens_total:
-        _fail_run(ctx, node_id, f"run exceeded guards.max_tokens_total ({guards.max_tokens_total})")
+    projected_tokens = _total_tokens(con, ctx.run_id) + result.input_tokens + result.output_tokens
+    if guards.max_tokens_total is not None and projected_tokens > guards.max_tokens_total:
+        _fail_run(
+            ctx,
+            node_id,
+            f"run exceeded guards.max_tokens_total ({guards.max_tokens_total})",
+            result=result,
+            logical_visit_id=logical_visit_id,
+        )
         return
 
-    shared_state = _commit_state(ctx, shared_state, node_execution_id, "COMMIT", from_node=node_id, delta=result.structured_payload)
+    try:
+        shared_state = _commit_turn(
+            ctx,
+            node_execution_id,
+            node_id,
+            logical_visit_id,
+            result,
+        )
+    except Exception as exc:  # noqa: BLE001 - transaction rolls back as a unit
+        _fail_run(ctx, node_id, f"node '{node_id}' commit failed ({type(exc).__name__}): {exc}")
+        return
     _route(ctx, node_id, node_execution_id, shared_state)
+
+
+def _prepare_tool_calls(
+    run_id: str,
+    node_id: str,
+    logical_visit_id: str,
+    tool_calls: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    prepared: list[dict[str, Any]] = []
+    for fallback_ordinal, original in enumerate(tool_calls, start=1):
+        tool_call = dict(original)
+        visit_id = str(tool_call.setdefault("logical_visit_id", logical_visit_id))
+        ordinal = int(tool_call.setdefault("tool_call_ordinal", fallback_ordinal))
+        tool_call.setdefault(
+            "idempotency_key",
+            compute_idempotency_key(
+                run_id,
+                node_id,
+                visit_id,
+                ordinal,
+                tool_call.get("tool", ""),
+                tool_call.get("arguments", {}),
+            ),
+        )
+        prepared.append(tool_call)
+    return prepared
+
+
+def _insert_turn_message(
+    ctx: _RunCtx,
+    node_id: str,
+    result: AgentTurnResult,
+    tool_calls: list[dict[str, Any]],
+) -> None:
+    ctx.con.execute(
+        """INSERT INTO message
+           (id, run_id, node_id, sender_agent_id, role, content,
+            structured_payload, tool_calls, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (
+            new_id(),
+            ctx.run_id,
+            node_id,
+            _agent_db_id(ctx.con, ctx.workflow_id, node_id),
+            "agent",
+            result.content,
+            dumps(result.structured_payload),
+            dumps(tool_calls),
+            now_iso(),
+        ),
+    )
+
+
+def _commit_turn(
+    ctx: _RunCtx,
+    node_execution_id: str,
+    node_id: str,
+    logical_visit_id: str,
+    result: AgentTurnResult,
+) -> dict[str, Any]:
+    """The successful-turn durability seam: all writes commit or none do."""
+    con = ctx.con
+    tool_calls = _prepare_tool_calls(
+        ctx.run_id, node_id, logical_visit_id, result.tool_calls
+    )
+    for _ in range(3):
+        run = _get_run(con, ctx.run_id)
+        latest_state = loads(run["shared_state"])
+        merged = merge_delta(
+            latest_state, result.structured_payload, ctx.graph.doc.spec.state
+        )
+        version_before = run["state_version"]
+        version_after = version_before + 1
+        try:
+            con.execute(
+                """UPDATE node_execution
+                   SET status = 'SUCCEEDED', finished_at = ?, input_tokens = ?,
+                       output_tokens = ?, tool_call_count = ?, repair_count = ?
+                   WHERE id = ?""",
+                (
+                    now_iso(),
+                    result.input_tokens,
+                    result.output_tokens,
+                    result.tool_call_count,
+                    result.repair_count,
+                    node_execution_id,
+                ),
+            )
+            _insert_turn_message(ctx, node_id, result, tool_calls)
+            cursor = con.execute(
+                """UPDATE run SET shared_state = ?, state_version = ?
+                   WHERE id = ? AND state_version = ?""",
+                (dumps(merged), version_after, ctx.run_id, version_before),
+            )
+            if cursor.rowcount == 0:
+                con.rollback()
+                continue
+            _log_event(
+                con,
+                ctx.run_id,
+                node_execution_id,
+                "COMMIT",
+                from_node=node_id,
+                state_diff=result.structured_payload,
+                state_version_before=version_before,
+                state_version_after=version_after,
+            )
+            con.commit()
+            return merged
+        except Exception:
+            con.rollback()
+            raise
+    raise RuntimeError("state_version CAS conflict after 3 retries")
 
 
 def _commit_state(
@@ -528,9 +683,9 @@ def _route(ctx: _RunCtx, node_id: str, node_execution_id: str, shared_state: dic
             _fire_edge(ctx, edge.from_, edge, node_execution_id)
             return
 
-    agent = ctx.graph.agent_for_node(node_id)
-    if agent.hitl and agent.hitl.enabled and eval_condition(agent.hitl.trigger_condition, shared_state):
-        _raise_hitl(ctx, node_id, node_execution_id, agent)
+    contract = ctx.graph.contract_for_node(node_id)
+    if contract.hitl and contract.hitl.enabled and eval_condition(contract.hitl.trigger_condition, shared_state):
+        _raise_hitl(ctx, node_id, node_execution_id, contract.hitl)
         return
 
     if default is not None:
@@ -572,38 +727,80 @@ def _fire_edge(ctx: _RunCtx, from_node: str, edge, node_execution_id: str) -> No
     con.commit()
 
 
-def _raise_hitl(ctx: _RunCtx, node_id: str, node_execution_id: str, agent) -> None:
+def _raise_hitl(ctx: _RunCtx, node_id: str, node_execution_id: str, hitl: HITLConfig) -> None:
     con = ctx.con
     con.execute("UPDATE node_execution SET status = 'WAITING_HUMAN', finished_at = ? WHERE id = ?", (now_iso(), node_execution_id))
     hitl_id = new_id()
     con.execute(
         """INSERT INTO hitl_request (id, run_id, node_id, question, assignee, status, created_at)
            VALUES (?,?,?,?,?,?,?)""",
-        (hitl_id, ctx.run_id, node_id, agent.hitl.prompt_template or "Human input required", agent.hitl.assignee, "PENDING", now_iso()),
+        (
+            hitl_id,
+            ctx.run_id,
+            node_id,
+            hitl.prompt_template or "Human input required",
+            hitl.assignee,
+            "PENDING",
+            now_iso(),
+        ),
     )
     _log_event(con, ctx.run_id, node_execution_id, "HITL_RAISED", from_node=node_id)
     con.commit()
-    log_event("INFO", f"HITL raised on node '{node_id}'", run_id=ctx.run_id, node_execution_id=node_execution_id, assignee=agent.hitl.assignee)
+    log_event(
+        "INFO",
+        f"HITL raised on node '{node_id}'",
+        run_id=ctx.run_id,
+        node_execution_id=node_execution_id,
+        assignee=hitl.assignee,
+    )
 
 
-def _fail_run(ctx: _RunCtx, node_id: str, error: str) -> None:
+def _fail_run(
+    ctx: _RunCtx,
+    node_id: str,
+    error: str,
+    *,
+    result: AgentTurnResult | None = None,
+    logical_visit_id: str | None = None,
+) -> None:
     con = ctx.con
     # §8 backstop: error text may quote an SDK/HTTP exception that echoes an
     # injected credential — scrub known secret values before persisting.
     error = redact_secrets(error)
-    con.execute(
-        """UPDATE node_execution SET status = 'FAILED', error = ?, finished_at = ?
-           WHERE run_id = ? AND node_id = ? AND attempt = (
-               SELECT MAX(attempt) FROM node_execution WHERE run_id = ? AND node_id = ?
-           )""",
-        (error, now_iso(), ctx.run_id, node_id, ctx.run_id, node_id),
-    )
-    con.execute("UPDATE run SET status = 'FAILED', ended_at = ? WHERE id = ?", (now_iso(), ctx.run_id))
     node_execution_id_row = con.execute(
-        "SELECT id FROM node_execution WHERE run_id = ? AND node_id = ? ORDER BY attempt DESC LIMIT 1",
+        """SELECT id, logical_visit_id FROM node_execution
+           WHERE run_id = ? AND node_id = ? ORDER BY attempt DESC LIMIT 1""",
         (ctx.run_id, node_id),
     ).fetchone()
     ne_id = node_execution_id_row["id"] if node_execution_id_row else None
+    if result is not None and ne_id is not None:
+        con.execute(
+            """UPDATE node_execution
+               SET status = 'FAILED', error = ?, finished_at = ?, input_tokens = ?,
+                   output_tokens = ?, tool_call_count = ?, repair_count = ?
+               WHERE id = ?""",
+            (
+                error,
+                now_iso(),
+                result.input_tokens,
+                result.output_tokens,
+                result.tool_call_count,
+                result.repair_count,
+                ne_id,
+            ),
+        )
+        visit_id = logical_visit_id or node_execution_id_row["logical_visit_id"] or new_id()
+        tool_calls = _prepare_tool_calls(ctx.run_id, node_id, visit_id, result.tool_calls)
+        _insert_turn_message(ctx, node_id, result, tool_calls)
+    else:
+        con.execute(
+            """UPDATE node_execution SET status = 'FAILED', error = ?, finished_at = ?
+               WHERE run_id = ? AND node_id = ? AND attempt = (
+                   SELECT MAX(attempt) FROM node_execution WHERE run_id = ? AND node_id = ?
+               )""",
+            (error, now_iso(), ctx.run_id, node_id, ctx.run_id, node_id),
+        )
+    con.execute("UPDATE run SET status = 'FAILED', ended_at = ? WHERE id = ?", (now_iso(), ctx.run_id))
     _log_event(con, ctx.run_id, ne_id, "FAIL", from_node=node_id)
     con.commit()
     log_event("ERROR", error, run_id=ctx.run_id, node_execution_id=ne_id)

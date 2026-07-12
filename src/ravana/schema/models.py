@@ -121,6 +121,12 @@ class GraphNode(BaseModel):
     agent: str | None = None
     sub_workflow: str | None = None
     on_enter: str | None = None
+    # Per-node execution contract. Omitted fields inherit AgentConfig defaults;
+    # an explicit null clears HITL/output_schema. `toolkits`, when set, is a
+    # least-privilege subset of the agent's allow-list.
+    toolkits: list[str] | None = None
+    hitl: HITLConfig | None = None
+    output_schema: dict[str, Any] | None = None
     # §3.8: "any" (default) — every arriving edge dispatches this node
     # independently; "all" — arrivals accumulate and the node dispatches once
     # per wave, when every inbound source has delivered (or at quiescence).

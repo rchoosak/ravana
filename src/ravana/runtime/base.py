@@ -47,6 +47,9 @@ class AgentRuntime(Protocol):
         run_id: str,
         node_id: str,
         attempt: int,
+        logical_visit_id: str,
         agent_id: str,
         shared_state: dict[str, Any],
     ) -> AgentTurnResult: ...
+
+    async def aclose(self) -> None: ...

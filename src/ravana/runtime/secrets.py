@@ -11,9 +11,10 @@ at the logging layer.
 from __future__ import annotations
 
 import re
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar, cast
 
 _SCHEME = "secrets://"
+_T = TypeVar("_T")
 
 
 class SecretResolver(Protocol):
@@ -22,6 +23,10 @@ class SecretResolver(Protocol):
 
 class SecretNotFound(Exception):
     pass
+
+
+class SecretLeakError(Exception):
+    """Credential material crossed an output seam; fail closed before persist."""
 
 
 class ResolvedSecret:
@@ -93,10 +98,48 @@ def redact_secrets(text: str, *, values: tuple[str, ...] = ()) -> str:
     return _SECRET_PATTERNS.sub("***REDACTED***", text)
 
 
+def redact_data(value: _T, *, values: tuple[str, ...] = ()) -> _T:
+    """Recursively scrub strings in JSON-like structured data."""
+    if isinstance(value, str):
+        return cast(_T, redact_secrets(value, values=values))
+    if isinstance(value, dict):
+        return cast(
+            _T,
+            {
+                redact_data(key, values=values): redact_data(item, values=values)
+                for key, item in value.items()
+            },
+        )
+    if isinstance(value, list):
+        return cast(_T, [redact_data(item, values=values) for item in value])
+    if isinstance(value, tuple):
+        return cast(_T, tuple(redact_data(item, values=values) for item in value))
+    return value
+
+
+def contains_secret(value: Any, *, values: tuple[str, ...] = ()) -> bool:
+    """Whether a JSON-like value contains an exact or known-pattern secret."""
+    if isinstance(value, str):
+        return redact_secrets(value, values=values) != value
+    if isinstance(value, dict):
+        return any(
+            contains_secret(key, values=values) or contains_secret(item, values=values)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(contains_secret(item, values=values) for item in value)
+    return False
+
+
+def ensure_secret_free(value: Any, *, context: str, values: tuple[str, ...] = ()) -> None:
+    """Reject credential-bearing output without changing its domain value."""
+    if contains_secret(value, values=values):
+        raise SecretLeakError(f"{context} contained credential material; output rejected")
+
+
 def redact_record(record: dict[str, Any]) -> dict[str, Any]:
-    """redact_secrets over every string value in a flat log record — so a
-    secret in a `**extra` field is scrubbed too, not just the message."""
-    return {k: redact_secrets(v) if isinstance(v, str) else v for k, v in record.items()}
+    """Recursively redact a structured log record, including nested extras."""
+    return redact_data(record)
 
 
 class EnvSecretResolver:
