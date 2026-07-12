@@ -50,18 +50,29 @@ class AnthropicAdapter:
     name = "anthropic"
 
     def __init__(self, client: Any | None = None):
-        self._client = client  # injected (tests) or built lazily in complete()
+        self._explicit_client = client  # an injected client (tests) is used verbatim
+        # Real clients cached per resolved api_key (None = the SDK's own
+        # ANTHROPIC_API_KEY env fallback), mirroring the OpenAI adapter — two
+        # agents may hold different per-agent credentials (§1.4/§8c).
+        self._clients: dict[str | None, Any] = {}
 
-    def _resolve_client(self) -> Any:
-        if self._client is None:
+    def _resolve_client(self, api_key: str | None = None) -> Any:
+        if self._explicit_client is not None:
+            return self._explicit_client
+        if api_key not in self._clients:
             import anthropic
 
             # max_retries=0: the GATEWAY owns retry policy (§3.6). The SDK's
             # default (2 internal retries) would stack with the gateway's
             # per-entry retry — up to 6 HTTP attempts per entry — and its
             # sleeps bypass the injected backoff waiter entirely.
-            self._client = anthropic.AsyncAnthropic(max_retries=0)
-        return self._client
+            kwargs: dict[str, Any] = {"max_retries": 0}
+            if api_key:
+                # §8c: already resolved by the gateway from llm.api_key_ref —
+                # this adapter never sees the pointer, only the credential.
+                kwargs["api_key"] = api_key
+            self._clients[api_key] = anthropic.AsyncAnthropic(**kwargs)
+        return self._clients[api_key]
 
     def capabilities(self, model: str) -> set[Capability]:
         # Anthropic offers provider-guaranteed conformance via forced
@@ -75,7 +86,7 @@ class AnthropicAdapter:
         # fallback chain. A client that can't be built is permanent for this
         # entry; the next fallback entry (different provider) may work.
         try:
-            client = self._resolve_client()
+            client = self._resolve_client(request.api_key)
         except Exception as exc:  # noqa: BLE001
             raise to_provider_error("anthropic client init failed", exc, retryable=False) from exc
 

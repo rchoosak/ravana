@@ -33,6 +33,7 @@ from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgen
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
+from ravana.runtime.secrets import SecretResolver
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.providers.base import (
     AssistantMessage,
@@ -150,6 +151,7 @@ class LLMGateway:
         adapters: dict[str, ProviderAdapter],
         tool_executor: ToolExecutor | None = None,
         retry_sleep: RetrySleep = asyncio.sleep,
+        secret_resolver: SecretResolver | None = None,
     ):
         self._graph = graph
         self._adapters = adapters
@@ -157,6 +159,12 @@ class LLMGateway:
         # §3.6 backoff waiter for same-entry retries; injectable so tests
         # record requested delays instead of actually waiting.
         self._retry_sleep = retry_sleep
+        # §8c: resolves `llm.api_key_ref` pointers to real keys at dispatch —
+        # the gateway (the Agent Runtime layer) does the resolving; adapters
+        # only ever receive the resolved value. None is fine for workflows
+        # whose agents declare no api_key_ref (SDK env vars serve them).
+        self._secret_resolver = secret_resolver
+        self._resolved_keys: dict[str, str] = {}
         # §3.4: strategy is decided once per (provider, model), not re-derived
         # every call. Capabilities are static, so this memo is the "decided at
         # registration" contract without a separate registration step.
@@ -171,6 +179,26 @@ class LLMGateway:
             # (chain moves on), just never same-entry retried.
             raise ProviderError(f"no adapter registered for provider '{provider}'", retryable=False)
         return adapter
+
+    def _resolve_api_key(self, llm: LLMConfig) -> str | None:
+        """§8c: turn the entry's `api_key_ref` pointer into the real key,
+        memoized per ref. A resolution failure is a config error, permanent
+        BY ENTRY (a retry can't conjure the secret) — but the next fallback
+        entry may use a different ref/provider, so it raises ProviderError
+        (chain moves on) rather than a hard error."""
+        ref = llm.api_key_ref
+        if ref is None:
+            return None  # no per-agent key: the SDK's own env var serves this entry
+        if ref not in self._resolved_keys:
+            if self._secret_resolver is None:
+                raise ProviderError(
+                    f"llm.api_key_ref '{ref}' declared but no secret resolver is wired", retryable=False
+                )
+            try:
+                self._resolved_keys[ref] = self._secret_resolver.resolve(ref)
+            except Exception as exc:  # noqa: BLE001 - resolution failure is a permanent entry failure
+                raise ProviderError(f"resolving llm.api_key_ref '{ref}' failed: {exc}", retryable=False) from exc
+        return self._resolved_keys[ref]
 
     def _strategy_for(self, adapter: ProviderAdapter, model: str) -> _Strategy:
         key = (adapter.name, model)
@@ -283,7 +311,8 @@ class LLMGateway:
         while True:
             request = ProviderRequest(
                 model=llm.model, system=system, messages=messages, output_schema=output_schema,
-                temperature=llm.temperature, max_tokens=llm.max_tokens, endpoint=llm.endpoint, api_key_ref=llm.api_key_ref,
+                temperature=llm.temperature, max_tokens=llm.max_tokens, endpoint=llm.endpoint,
+                api_key=self._resolve_api_key(llm),
             )
             response = await adapter.complete(request)
             input_tokens += response.input_tokens
@@ -366,7 +395,7 @@ class LLMGateway:
                 temperature=llm.temperature,
                 max_tokens=llm.max_tokens,
                 endpoint=llm.endpoint,
-                api_key_ref=llm.api_key_ref,
+                api_key=self._resolve_api_key(llm),
             )
             response = await adapter.complete(request)
             input_tokens += response.input_tokens

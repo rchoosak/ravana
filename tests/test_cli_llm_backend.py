@@ -54,6 +54,9 @@ def test_build_llm_gateway_wires_graph_toolkits(sdlc_graph, con):
     # The gateway's executor surfaces an agent's declared toolkits as tools.
     specs = gateway._tools.tools_for(["git_connector"])
     assert [t.name for t in specs] == ["git_connector"]
+    # §8c: the SAME resolver serves toolkit auth_refs AND llm.api_key_refs —
+    # the gateway can resolve per-agent LLM keys at dispatch.
+    assert gateway._secret_resolver is not None
 
 
 def test_build_runtime_mock_requires_fixture(sdlc_graph, con):

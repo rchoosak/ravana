@@ -84,7 +84,10 @@ class ProviderRequest:
     temperature: float | None = None  # adapters MUST drop this for models that reject non-default sampling params
     max_tokens: int | None = None
     endpoint: str | None = None
-    api_key_ref: str | None = None
+    # The RESOLVED credential (§8c: the gateway resolves `llm.api_key_ref`
+    # through the secret resolver at dispatch; adapters never see the pointer).
+    # None = no per-agent key — the SDK falls back to its own env var.
+    api_key: str | None = None
 
 
 @dataclass

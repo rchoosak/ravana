@@ -95,16 +95,16 @@ def _adapters_for_graph(graph: CompiledGraph) -> dict[str, ProviderAdapter]:
 
 
 def _build_llm_gateway(con: sqlite3.Connection, graph: CompiledGraph) -> LLMGateway:
-    # Toolkit auth_refs resolve from the environment (§8c, EnvSecretResolver);
-    # the registry injects lazy credential providers, so a secret is only read
-    # if its toolkit is actually called. LLM provider credentials, by contrast,
-    # still come from each provider SDK's own env var (ANTHROPIC_API_KEY, etc.)
-    # / the api_key_ref pass-through in the adapters — resolving llm.api_key_ref
-    # through EnvSecretResolver too is a tracked follow-up.
+    # §8c: ONE resolver serves both credential kinds. Toolkit auth_refs
+    # resolve through the registry's lazy providers (a secret is only read if
+    # its toolkit is actually called), and the gateway resolves each agent's
+    # llm.api_key_ref at dispatch — adapters receive resolved keys, never the
+    # pointers. An agent with no api_key_ref falls back to the provider SDK's
+    # own env var (ANTHROPIC_API_KEY / OPENAI_API_KEY).
     resolver = EnvSecretResolver()
     handlers = build_registry(graph, resolver)
     executor = RavanaToolExecutor(con, handlers)
-    return LLMGateway(graph, _adapters_for_graph(graph), tool_executor=executor)
+    return LLMGateway(graph, _adapters_for_graph(graph), tool_executor=executor, secret_resolver=resolver)
 
 
 def _build_runtime(

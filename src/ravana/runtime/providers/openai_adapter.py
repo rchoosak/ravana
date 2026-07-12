@@ -36,11 +36,12 @@ class OpenAICompatibleAdapter:
         self.name = name
         self._guided = guided_decoding
         self._explicit_client = client  # an injected client (tests) is used verbatim
-        # Real clients are cached per (endpoint, api_key_ref) so one adapter
+        # Real clients are cached per (endpoint, api_key) so one adapter
         # instance can serve agents pointing at different local/hosted
-        # endpoints — the per-agent routing §1.4 promises. Caching a single
-        # first-seen client (the earlier bug) silently sent every agent's
-        # traffic to whichever endpoint happened to be resolved first.
+        # endpoints or holding different credentials — the per-agent routing
+        # §1.4 promises. Caching a single first-seen client (the earlier bug)
+        # silently sent every agent's traffic to whichever endpoint happened
+        # to be resolved first.
         self._clients: dict[tuple[str | None, str | None], Any] = {}
 
     def capabilities(self, model: str) -> set[Capability]:
@@ -52,7 +53,7 @@ class OpenAICompatibleAdapter:
     def _resolve_client(self, request: ProviderRequest) -> Any:
         if self._explicit_client is not None:
             return self._explicit_client
-        key = (request.endpoint, request.api_key_ref)
+        key = (request.endpoint, request.api_key)
         if key not in self._clients:
             from openai import AsyncOpenAI
 
@@ -63,17 +64,17 @@ class OpenAICompatibleAdapter:
             kwargs: dict[str, Any] = {"max_retries": 0}
             if request.endpoint:
                 kwargs["base_url"] = request.endpoint  # routes to Ollama/vLLM/etc.
-            if request.api_key_ref:
-                # Stubbed pass-through until secrets-manager wiring turns the
-                # ref into a real key (§8, tracked follow-up).
-                kwargs["api_key"] = request.api_key_ref
+            if request.api_key:
+                # §8c: already resolved by the gateway from llm.api_key_ref —
+                # this adapter never sees the pointer, only the credential.
+                kwargs["api_key"] = request.api_key
             elif request.endpoint:
                 # A local runtime usually requires a nonempty key but ignores
                 # its value — supply a placeholder so the SDK doesn't error.
                 kwargs["api_key"] = "not-needed-for-local"
-            # else: hosted OpenAI with no ref — pass no api_key so the SDK falls
-            # back to OPENAI_API_KEY from the environment. (Passing a dummy key
-            # here would defeat that fallback and misauthenticate — P1c.)
+            # else: hosted OpenAI with no per-agent key — pass no api_key so the
+            # SDK falls back to OPENAI_API_KEY from the environment. (Passing a
+            # dummy key here would defeat that fallback and misauthenticate.)
             self._clients[key] = AsyncOpenAI(**kwargs)
         return self._clients[key]
 
