@@ -124,20 +124,35 @@ Goal: swap the mock backend for real providers and real tool execution, on a gra
 
 ---
 
+## Cloud Product Requirements (Phases 1-3)
+
+The hosted path must support the same workflow semantics as Local/Embedded while changing who owns execution and how it scales:
+
+- [ ] **Multi-user / multi-workflow control plane**: authenticated users belong to an `org_id`; organizations can author and publish many versioned workflows, start concurrent runs, inspect history, and respond to HITL without sharing credentials or data across tenants. Every Run remains pinned to the workflow version it started with.
+- [ ] **Two repository execution modes**: (a) fully cloud execution clones a repository with a short-lived Git provider installation token into an ephemeral sandbox; (b) hybrid execution dispatches signed jobs over an outbound-only connection to an organization-managed Local Runner for private/on-prem repositories. Neither mode executes agent code in the API process or against a user's live checkout.
+- [ ] **Durable distributed execution**: stateless Orchestrators and workers claim leases, survive deploys/crashes, enforce per-org concurrency/rate limits, and keep HITL waits durable for hours or days.
+- [ ] **Auditable usage metering**: append-only usage events record organization/user/run/node/provider/model, input/output/cached tokens, tool and sandbox compute, storage/egress, a pricing-version snapshot, and a unique source id for deduplication. `node_execution` token/cost fields remain operational rollups, not the billing source of truth.
+- [ ] **Commercial billing and governance**: plans, quotas, prepaid credits or metered invoicing, budget alerts/hard caps, refunds/credits, and provider-invoice reconciliation. Platform-funded model usage and BYOK usage are priced separately because Ravana bears different costs.
+
+---
+
 ## Phase 1 — Self-hosted (single instance) & UI
 
-Goal: `docker compose up` gives a team the Ravana Console with all three UI surfaces (§1.5) and real concurrency.
+Goal: `docker compose up` gives one authenticated team the Ravana Console with all three UI surfaces (§1.5), real concurrency, cloud-safe repository execution, and the usage data foundation required for later billing.
 
 - [ ] **Data layer**: Postgres DDL from §2.2 (the real thing, not the SQLite translation); Alembic migrations from here on; one-time import path from a Phase-0 `.ravana/state.db` so early local runs aren't stranded
 - [ ] **Orchestrator scaling**: `node_execution` lease claiming (`UPDATE ... WHERE status='QUEUED'` / `FOR UPDATE SKIP LOCKED`); `state_version` CAS commit with merge-policy-aware retry (§3.5) now actually exercised; broadcast-edge parallel dispatch; Redis Streams as the lease/HITL transport
 - [ ] **Scheduler tick to unblock `queue`d concurrency runs** (§3.7 — 0a strands them `PENDING`; the Phase 1 scheduler owns dispatching a queued run when its group's active run reaches a terminal status). Also re-verify §3.8's join quiescence rule under multi-worker dispatch — "queue empty" needs a distributed equivalent (no leasable/leased node_executions for the run)
 - [ ] **Maintain `run.current_nodes`** (§2.2 — reserved-but-unmaintained in 0a; the Operator view needs it)
 - [ ] **Control-plane API**: FastAPI implementing the full §7 contract (agents/toolkits/workflows/runs/hitl/audit-log), SSE `/runs/{id}/stream`, `DRAFT`→`PUBLISHED` lifecycle + `/publish`, full `/validate`
+- [ ] **Identity foundation**: authenticated users, organizations, memberships, and API/service identities. Phase 1 may operate as a single-org deployment, but request context and tenant-owned records carry or inherit `org_id` from the start so Phase 2 does not retrofit identity into every boundary.
 - [ ] **Ravana Console**: React Flow graph editor (Design), generated intake form (Runs → New Run), operator/monitoring view with live stream + HITL respond (Runs → [a run]), version-history tab off `/audit-log`
 - [ ] **Sandbox**: `code_interpreter` optionally routes to a managed provider (E2B/Modal) — config-driven per Toolkit, not yet the default
+- [ ] **Cloud repository execution**: GitHub/GitLab App installation flow; exchange installation access for short-lived clone credentials; create one isolated repository workspace per Run inside the sandbox; hand results back only as a PR/patch.
 - [ ] **Connector SDK**: documented + contract-test harness, opened to third-party toolkit authors
 - [ ] **HITL**: Slack notification integration
 - [ ] **Observability**: OpenTelemetry spans per `node_execution` attempt begin here (full dashboards can wait for Phase 2's Grafana setup)
+- [ ] **Usage metering foundation**: append-only `usage_event` persistence emitted for every provider attempt (including retries/failures), tool call, sandbox allocation, and durable artifact. Capture provider request/source ids and immutable pricing-version snapshots; expose per-run usage totals but do not charge customers yet.
 - [ ] **Testing**: docker-compose based integration environment for CI
 
 ---
@@ -147,14 +162,16 @@ Goal: `docker compose up` gives a team the Ravana Console with all three UI surf
 Goal: multi-team, multi-domain org running Ravana on Kubernetes with real tenancy.
 
 - [ ] Kubernetes Helm chart (API / orchestrator / worker pool / sandbox pool as independently-scaled deployments, per §10.3's diagram)
-- [ ] `org_id` enforcement across every query and API auth check (multi-tenancy stops being theoretical)
+- [ ] `org_id` enforcement across every query and API auth check, backed by cross-tenant isolation tests (multi-tenancy stops being theoretical)
 - [ ] RBAC roles (Workflow Author / Operator / Viewer) and auth middleware
 - [ ] Vault/KMS integration replacing any placeholder secret resolution
 - [ ] Managed sandbox becomes the default backend (not opt-in) — multi-tenant workflows are now the norm, per §8
+- [ ] **Hybrid Local Runner**: organization-scoped runner registration, outbound-only authenticated job stream, signed/leased jobs, heartbeat/revocation, capability labels, and result/artifact upload. A disconnected runner leaves work resumable/reclaimable rather than losing the Run.
 - [ ] Golden-run regression suite + eval harness gating `publish` (§11)
 - [ ] pgvector long-term memory (§1.3)
 - [ ] Workflow composition / sub-workflows (§1.8): `workflow_node.sub_workflow_id`, nested-run dispatch, `output_map` commit — build only once a real cross-workflow reuse need shows up
 - [ ] Per-org backpressure **and** per-credential rate limiting (§9) — the two are different failure modes, both needed
+- [ ] **Usage governance and reconciliation**: per-org/project/user usage views; budget alerts and hard caps checked before dispatch; actual usage reconciled after provider response; pricing catalog distinguishes platform credentials from BYOK and retains historical versions.
 - [ ] Loki + mandatory `run_id`/`node_execution_id` correlation across infra logs (§9)
 - [ ] Stuck-run detection/alerting on `WAITING_HUMAN` timeout and heartbeat-less `RUNNING`
 
@@ -168,6 +185,6 @@ Goal: multi-region throughput, and a Managed Cloud tier that's an actual busines
 - [ ] Supervisor/dynamic LLM routing (§3.3) — an LLM-chosen `next_node` for topologies that don't reduce to boolean conditions
 - [ ] Community Toolkit marketplace (submission/review process, registry, versioning)
 - [ ] Data governance: enforce the `pii: true` state-key flag end-to-end, build a right-to-delete flow that redacts flagged content while preserving non-PII audit rows
-- [ ] Billing/usage metering: roll up `node_execution.estimated_cost_usd` per `org_id` per billing period into a metered-billing integration (e.g. Stripe)
+- [ ] **Commercial billing**: aggregate immutable `usage_event`s by `org_id` and billing period; apply plan allowances/credits/markups/tax policy; generate customer-visible line items; synchronize subscriptions, invoices, payments, credits, and webhook reconciliation with a metered-billing provider (e.g. Stripe). Failed/retried work is charged or credited by an explicit product policy, never silently omitted.
 - [ ] SOC2 compliance program (operational, not architectural — start the clock early since certification timelines are long)
 - [ ] Multi-region deployment topology
