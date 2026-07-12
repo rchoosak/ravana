@@ -21,9 +21,15 @@ class WorkflowValidationError(Exception):
 def load_workflow_yaml(path: str | Path) -> WorkflowDoc:
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+    # str(exc) honors hide_input_in_errors (WorkflowDoc sets it), so the
+    # message names the offending field without echoing its value. Capture the
+    # message inside the except, but RAISE outside it: raising within the
+    # handler would set the wrapper's __context__ to the ValidationError (whose
+    # .errors()/.json() still hold the raw input) — `from None` only clears
+    # __cause__, not __context__. Raising after the block leaves both None.
+    message: str | None = None
     try:
         return WorkflowDoc.model_validate(raw)
     except ValidationError as exc:
-        # str(exc) honors hide_input_in_errors (WorkflowDoc sets it), so the
-        # message names the offending field without echoing its value.
-        raise WorkflowValidationError(str(exc)) from None
+        message = str(exc)
+    raise WorkflowValidationError(message)

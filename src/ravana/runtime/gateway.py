@@ -33,7 +33,7 @@ from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgen
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
-from ravana.runtime.secrets import ResolvedSecret, SecretResolver, ensure_resolved
+from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.providers.base import (
     AssistantMessage,
@@ -205,12 +205,11 @@ class LLMGateway:
         if self._secret_resolver is None:
             raise ProviderError(f"llm.api_key_ref '{ref}' declared but no secret resolver is wired", retryable=False)
         try:
-            # ensure_resolved wraps a custom resolver's raw-str return in
-            # ResolvedSecret, which validates non-empty at construction and
-            # self-redacts in repr — a "" resolution must not slip past the
-            # adapters' truthiness gates and silently swap in the SDK's
+            # SecretResolver.resolve returns ResolvedSecret (non-empty by
+            # construction, self-redacting), so a "" resolution can't slip
+            # past the adapters' truthiness gates and swap in the SDK's
             # ambient env credential.
-            return ensure_resolved(self._secret_resolver.resolve(ref))
+            return self._secret_resolver.resolve(ref)
         except Exception as exc:  # noqa: BLE001 - resolution failure is a permanent entry failure
             raise ProviderError(
                 f"resolving llm.api_key_ref '{ref}' failed ({type(exc).__name__})", retryable=False

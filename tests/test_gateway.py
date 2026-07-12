@@ -728,6 +728,64 @@ def _keyed_agent_graph(api_key_ref: str | None, fallback: dict | None = None):
     return _one_agent_graph(llm, name="keyref-test")
 
 
+def test_redact_secrets_is_pattern_based_and_longest_first():
+    from ravana.runtime.secrets import redact_secrets
+
+    # Pattern sweep catches credentials no caller had in hand (env keys, tokens
+    # in a pre-resolution error): recognizable prefixes + Bearer headers.
+    assert "sk-abc123" not in redact_secrets("openai said: sk-abc123 is bad")
+    assert "sk-ant-xyz" not in redact_secrets("anthropic: sk-ant-xyz")
+    assert "ghp_TOKEN123" not in redact_secrets("git push failed with ghp_TOKEN123")
+    assert "tok-77" not in redact_secrets("Authorization: Bearer tok-77")
+    # Explicit values (a caller with the exact secret) are scrubbed LONGEST
+    # FIRST, so a value that is a substring of another can't leave a partial
+    # leak (the abcdef -> ***def probe from the review).
+    assert redact_secrets("abcdef", values=("abc", "abcdef")) == "***REDACTED***"
+    # A value with no recognizable pattern that no caller declared is the
+    # documented gap of a pattern backstop — left as-is.
+    assert "plainword" in redact_secrets("plainword")
+
+
+def test_resolved_secret_holds_no_process_global_state():
+    # Constructing a ResolvedSecret must not mutate any module-global registry
+    # (the old design coupled the value object to logging and leaked rotated
+    # keys forever). redact_secrets is pattern-based and ignores it.
+    from ravana.runtime.secrets import ResolvedSecret, redact_secrets
+
+    ResolvedSecret("zzz-no-pattern-value")
+    assert "zzz-no-pattern-value" in redact_secrets("zzz-no-pattern-value")  # not registered anywhere
+
+
+def test_resolved_key_never_reaches_message_or_state(con):
+    # §8: secrets are "never written to message/state_transition_log". The
+    # guarantee is BY CONSTRUCTION — the resolved key flows only into the
+    # provider request's api_key, never into structured_payload/content/delta.
+    # Prove it end-to-end: after a full turn, the key value appears in NO
+    # message row, shared_state, or state_transition_log row.
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    graph = _keyed_agent_graph("secrets://openai_key")
+    adapter = FakeAdapter(name="openai", responses=[_submit({"done": "ok"})])
+    gateway = LLMGateway(
+        graph, {"openai": adapter}, secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "sk-must-not-persist"})
+    )
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    run_id = asyncio.run(start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id))
+
+    assert adapter.requests[0].api_key.value() == "sk-must-not-persist"  # it DID reach the request
+    blobs: list[str] = []
+    for tbl, cols in (
+        ("message", "content, structured_payload, tool_calls"),
+        ("run", "shared_state"),
+        ("state_transition_log", "state_diff, condition_evaluated"),
+    ):
+        for row in con.execute(f"SELECT {cols} FROM {tbl} WHERE {'id' if tbl == 'run' else 'run_id'} = ?", (run_id,)):
+            blobs.extend(str(v) for v in row)
+    assert all("sk-must-not-persist" not in b for b in blobs)  # never persisted anywhere
+
+
 def test_raw_key_in_api_key_ref_is_rejected_at_schema():
     # §8: api_key_ref is a POINTER. A pasted raw credential must fail at
     # compile/validate — BEFORE persist.py ever writes it into the workflow
@@ -889,7 +947,11 @@ spec:
     err = exc_info.value
     assert "sk-PASTED-IN-YAML" not in str(err)
     assert not hasattr(err, "errors")  # no structured surface carrying raw input
-    assert err.__cause__ is None  # chain severed: the original ValidationError is unreachable
+    # Both exception-chain links severed — raising OUTSIDE the except clears
+    # __context__ too (not just __cause__), so the pydantic ValidationError
+    # (whose .errors()/.json() still hold the raw input) is unreachable.
+    assert err.__cause__ is None
+    assert err.__context__ is None
     assert "api_key_ref" in str(err)  # still names the offending field
 
 
@@ -943,13 +1005,16 @@ def test_api_key_ref_with_no_resolver_wired_is_a_permanent_entry_failure():
 
 
 def test_empty_resolved_secret_fails_the_entry_not_swaps_credentials():
-    # Review finding: adapters gate on truthiness, so a ref resolving to ""
-    # would silently fall back to the SDK's AMBIENT env key — replacing the
-    # configured credential instead of failing. An empty resolution must fail
-    # the entry (permanent) and let the fallback serve.
+    # An empty credential must never slip past truthiness gates and silently
+    # swap in the SDK's AMBIENT env key. The single contract is ResolvedSecret,
+    # whose constructor rejects empty — so a resolver attempting one raises at
+    # resolve, the gateway treats it as a permanent entry failure, and the
+    # fallback serves. No swapped credential ever reaches a provider.
+    from ravana.runtime.secrets import ResolvedSecret
+
     class EmptyResolver:
-        def resolve(self, ref: str) -> str:
-            return ""  # a custom resolver misbehaving
+        def resolve(self, ref: str) -> ResolvedSecret:
+            return ResolvedSecret("")  # raises ValueError at construction
 
     graph = _keyed_agent_graph("secrets://openai_key", fallback={"provider": "anthropic", "model": "m2"})
     primary = FakeAdapter(name="openai", responses=[_submit({"done": True})])
@@ -1005,25 +1070,27 @@ def test_resolved_secret_value_semantics():
     assert a.value() == "sk-same"
 
 
-def test_resolved_keys_are_memoized_per_dispatch_not_per_process():
-    # §8c "resolved at DISPATCH time": within one turn (repair loop => several
-    # request builds) the secret is read once, but each new dispatch
-    # re-resolves — so a rotated credential is picked up on the next turn
-    # instead of being pinned for the gateway's lifetime (review finding).
+def test_key_is_resolved_fresh_each_dispatch_no_shared_memo():
+    # §8c "resolved at DISPATCH time": resolution is a per-entry-try local with
+    # NO gateway-level memo, so each dispatch re-reads the secret and a rotated
+    # credential is picked up on the next turn instead of being pinned for the
+    # gateway's lifetime (review finding).
+    from ravana.runtime.secrets import ResolvedSecret
+
     graph = _keyed_agent_graph("secrets://openai_key")
     calls: list[str] = []
 
-    class CountingResolver:
-        def resolve(self, ref: str) -> str:
+    class RotatingResolver:
+        def resolve(self, ref: str) -> ResolvedSecret:
             calls.append(ref)
-            return f"sk-generation-{len(calls)}"
+            return ResolvedSecret(f"sk-generation-{len(calls)}")
 
     adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
-    gateway = LLMGateway(graph, {"openai": adapter}, secret_resolver=CountingResolver())
+    gateway = LLMGateway(graph, {"openai": adapter}, secret_resolver=RotatingResolver())
     _run(gateway, "a")
-    assert calls == ["secrets://openai_key"]  # once within the first dispatch
+    assert calls == ["secrets://openai_key"]  # once for the first dispatch's single entry-try
     _run(gateway, "a")
-    assert calls == ["secrets://openai_key"] * 2  # re-resolved on the NEXT dispatch
+    assert calls == ["secrets://openai_key"] * 2  # re-resolved fresh on the NEXT dispatch
     assert adapter.requests[-1].api_key.value() == "sk-generation-2"  # rotation picked up
 
 

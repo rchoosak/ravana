@@ -25,6 +25,7 @@ from typing import Any
 from ravana.runtime.providers.base import (
     Capability,
     NormalizedToolCall,
+    _bound_client_cache,
     to_provider_error,
     ProviderRequest,
     ProviderResponse,
@@ -78,6 +79,7 @@ class OpenAICompatibleAdapter:
             # else: hosted OpenAI with no per-agent key — pass no api_key so the
             # SDK falls back to OPENAI_API_KEY from the environment. (Passing a
             # dummy key here would defeat that fallback and misauthenticate.)
+            _bound_client_cache(self._clients)
             self._clients[key] = AsyncOpenAI(**kwargs)
         return self._clients[key]
 
@@ -90,7 +92,9 @@ class OpenAICompatibleAdapter:
         try:
             client = self._resolve_client(request)
         except Exception as exc:  # noqa: BLE001
-            raise to_provider_error("openai-compatible client init failed", exc, retryable=False) from exc
+            raise to_provider_error(
+                "openai-compatible client init failed", exc, retryable=False, secret=request.api_key
+            ) from exc
 
         messages = [{"role": "system", "content": request.system}, *_to_openai_messages(request.messages)]
         kwargs: dict[str, Any] = {"model": request.model, "messages": messages}
@@ -120,7 +124,7 @@ class OpenAICompatibleAdapter:
             completion = await client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
             # §3.6 taxonomy: classified retryable/permanent in one shared place.
-            raise to_provider_error("openai-compatible completion failed", exc) from exc
+            raise to_provider_error("openai-compatible completion failed", exc, secret=request.api_key) from exc
 
         choice = completion.choices[0]
         msg = choice.message

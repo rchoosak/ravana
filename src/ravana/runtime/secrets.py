@@ -10,16 +10,10 @@ at the logging layer.
 
 from __future__ import annotations
 
-from typing import Protocol
+import re
+from typing import Any, Protocol
 
 _SCHEME = "secrets://"
-
-# §8's redaction backstop: every secret value that enters the process through
-# ResolvedSecret is remembered here, so redact_secrets() can scrub it from any
-# text bound for persistence or logs — an SDK exception that embeds the key we
-# injected into it, say. Process-local; the values already live in memory on
-# the clients themselves.
-_KNOWN_SECRET_VALUES: set[str] = set()
 
 
 class SecretResolver(Protocol):
@@ -31,18 +25,23 @@ class SecretNotFound(Exception):
 
 
 class ResolvedSecret:
-    """A resolved credential as a value object — the ONE place the rules
-    about plaintext secrets live, instead of scattering them per call site:
+    """A resolved credential as a pure value object — the ONE place the rules
+    about a plaintext credential live, instead of scattering them per call
+    site:
 
     - validates non-empty at construction (an empty credential would slip
       past truthiness gates and silently swap in a different ambient key);
     - never reveals itself: repr/str show a redaction marker, so a debug log
       or pytest assertion diff cannot leak it (§8);
-    - registers its value for redact_secrets(), §8's log/persistence backstop;
-    - equality/hash by value, so client caches keyed on the credential
-      behave correctly across re-resolution;
+    - equality/hash by value, so client caches keyed on the credential behave
+      correctly across re-resolution;
     - `.value()` is the single, intentional access to the plaintext.
-    """
+
+    Deliberately holds NO process-global state: it does not register itself in
+    a redaction set (the old design coupled the value object to logging, gave
+    tests hidden shared state, and pinned rotated keys in memory forever). §8's
+    active backstop is `redact_secrets`, which works on *patterns*, not a
+    registry of every value ever resolved."""
 
     __slots__ = ("_value",)
 
@@ -50,7 +49,6 @@ class ResolvedSecret:
         if not value or not value.strip():
             raise ValueError("refusing an empty credential")
         self._value = value
-        _KNOWN_SECRET_VALUES.add(value)
 
     def value(self) -> str:
         return self._value
@@ -67,23 +65,38 @@ class ResolvedSecret:
         return hash(self._value)
 
 
-def redact_secrets(text: str) -> str:
-    """§8's ACTIVE redaction backstop ("logging must actively redact ...").
-    Replaces every known resolved-secret value appearing in `text` — applied
-    wherever free-form error text crosses into persistence (node_execution
-    .error, the tool ledger) or the log stream, because an SDK/HTTP exception
-    can echo the very credential the runtime injected into it."""
-    for value in _KNOWN_SECRET_VALUES:
-        if value in text:
-            text = text.replace(value, "***REDACTED***")
-    return text
+# §8's active redaction backstop: "logging must actively redact anything
+# matching a known secret PATTERN as a backstop." Pattern-based (not a registry
+# of resolved values) so it also catches credentials the runtime never
+# resolved itself — an SDK's own env key echoed in an exception, a token in a
+# resolver error raised before any ResolvedSecret was built. Longest
+# alternatives first (sk-ant- before sk-) so the more specific match wins.
+_SECRET_PATTERNS = re.compile(
+    r"Bearer\s+[A-Za-z0-9._~+/=\-]+"           # Authorization: Bearer <token>
+    r"|sk-ant-[A-Za-z0-9_\-]+"                  # Anthropic
+    r"|sk-[A-Za-z0-9_\-]+"                      # OpenAI
+    r"|gh[posur]_[A-Za-z0-9]+"                  # GitHub PAT/OAuth/…
+    r"|github_pat_[A-Za-z0-9_]+"                # GitHub fine-grained PAT
+)
 
 
-def ensure_resolved(value: "ResolvedSecret | str") -> "ResolvedSecret":
-    """Normalize a resolver's return: the protocol says ResolvedSecret, but a
-    custom resolver may still hand back a raw str — wrap it so the invariants
-    (non-empty, redaction registration) hold regardless."""
-    return value if isinstance(value, ResolvedSecret) else ResolvedSecret(value)
+def redact_secrets(text: str, *, values: tuple[str, ...] = ()) -> str:
+    """Scrub secrets from free-form text bound for a log or persisted error.
+    Two layers: (1) any explicitly-known `values` — a caller with the exact
+    credential in scope (an adapter wrapping an SDK exception) passes it, and
+    they are replaced longest-first so a value that is a substring of another
+    can't leave a partial leak; (2) the §8 known-pattern sweep, which covers
+    credentials no caller had in hand. A value with no recognizable pattern
+    that no caller declares is the documented gap of a pattern backstop."""
+    for value in sorted({v for v in values if v}, key=len, reverse=True):
+        text = text.replace(value, "***REDACTED***")
+    return _SECRET_PATTERNS.sub("***REDACTED***", text)
+
+
+def redact_record(record: dict[str, Any]) -> dict[str, Any]:
+    """redact_secrets over every string value in a flat log record — so a
+    secret in a `**extra` field is scrubbed too, not just the message."""
+    return {k: redact_secrets(v) if isinstance(v, str) else v for k, v in record.items()}
 
 
 class EnvSecretResolver:

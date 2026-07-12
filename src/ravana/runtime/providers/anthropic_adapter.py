@@ -25,6 +25,7 @@ from typing import Any
 from ravana.runtime.providers.base import (
     Capability,
     NormalizedToolCall,
+    _bound_client_cache,
     to_provider_error,
     ProviderRequest,
     ProviderResponse,
@@ -74,6 +75,7 @@ class AnthropicAdapter:
                 # §8c: already resolved by the gateway from llm.api_key_ref —
                 # this adapter never sees the pointer, only the credential.
                 kwargs["api_key"] = api_key.value()
+            _bound_client_cache(self._clients)
             self._clients[api_key] = anthropic.AsyncAnthropic(**kwargs)
         return self._clients[api_key]
 
@@ -91,7 +93,9 @@ class AnthropicAdapter:
         try:
             client = self._resolve_client(request.api_key)
         except Exception as exc:  # noqa: BLE001
-            raise to_provider_error("anthropic client init failed", exc, retryable=False) from exc
+            raise to_provider_error(
+                "anthropic client init failed", exc, retryable=False, secret=request.api_key
+            ) from exc
 
         kwargs: dict[str, Any] = {
             "model": request.model,

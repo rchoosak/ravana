@@ -48,7 +48,7 @@ class ApiConnectorHandler:
     def __init__(
         self,
         config: dict[str, Any],
-        get_auth_token: Callable[[], str | None] = lambda: None,
+        get_auth_token: Callable[[], ResolvedSecret | None] = lambda: None,
         client: Any | None = None,
     ):
         self._base_url = config.get("base_url")
@@ -87,11 +87,12 @@ class ApiConnectorHandler:
 
         headers: dict[str, str] = {"Idempotency-Key": idempotency_key}
         # Re-resolved by the provider at EVERY dispatch (§8c) — no
-        # handler-lifetime cache, so token rotation is picked up per call.
-        # ResolvedSecret opens to plaintext only here, at the HTTP boundary.
+        # handler-lifetime cache, so token rotation is picked up per call. The
+        # provider returns a ResolvedSecret (or None); it opens to plaintext
+        # only here, at the HTTP boundary.
         token = self._get_auth_token()
         if token is not None:
-            headers["Authorization"] = f"Bearer {token.value() if isinstance(token, ResolvedSecret) else token}"
+            headers["Authorization"] = f"Bearer {token.value()}"
 
         client = self._resolve_client()
         try:

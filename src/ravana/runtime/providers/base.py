@@ -149,14 +149,39 @@ def classify_retryable(exc: Exception) -> bool:
     return not isinstance(exc, _PERMANENT_EXC_TYPES)
 
 
-def to_provider_error(prefix: str, exc: Exception, *, retryable: bool | None = None) -> ProviderError:
+# A per-adapter client-cache ceiling. Clients are keyed by resolved credential
+# (§8c per-agent routing), so a genuinely-rotating resolver (Vault, Phase 2)
+# would otherwise grow the cache without bound. Env-based keys are stable per
+# process, so in Phase 0b this ceiling is never reached — it's a defensive cap.
+# (Closing the evicted client's connection pool needs an async aclose(); that
+# lands with Phase 1 connection management. The count is what's bounded here.)
+_MAX_CACHED_CLIENTS = 32
+
+
+def _bound_client_cache(clients: dict[Any, Any]) -> None:
+    """Evict the oldest cached client (dicts preserve insertion order) before
+    inserting a new one past the ceiling, so key rotation can't grow the cache
+    without limit."""
+    while len(clients) >= _MAX_CACHED_CLIENTS:
+        oldest = next(iter(clients))
+        del clients[oldest]
+
+
+def to_provider_error(
+    prefix: str, exc: Exception, *, retryable: bool | None = None, secret: ResolvedSecret | None = None
+) -> ProviderError:
     """The one place an SDK exception becomes a normalized, classified
     ProviderError — both adapters call this instead of hand-rolling the wrap.
     The exception text is redacted (§8): an SDK error can echo the very
     credential the runtime injected into the client, and this message flows
-    onward into node_execution.error and the log stream."""
+    onward into node_execution.error and the log stream. `secret` is the
+    credential this call had in scope — passed so it's scrubbed by exact value
+    even if it doesn't match a known pattern; the pattern sweep is the backstop
+    for anything the caller didn't have in hand."""
+    values = (secret.value(),) if secret is not None else ()
     return ProviderError(
-        f"{prefix}: {redact_secrets(str(exc))}", retryable=classify_retryable(exc) if retryable is None else retryable
+        f"{prefix}: {redact_secrets(str(exc), values=values)}",
+        retryable=classify_retryable(exc) if retryable is None else retryable,
     )
 
 

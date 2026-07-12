@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from ravana.compiler.graph import CompiledGraph
-from ravana.runtime.secrets import ResolvedSecret, SecretResolver, ensure_resolved
+from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.api_connector import ApiConnectorHandler
 from ravana.runtime.toolkits.base import ToolkitError, ToolkitHandler
 
@@ -63,7 +63,7 @@ def _auth_provider(resolver: SecretResolver, auth_ref: str | None):
         return lambda: None
 
     def provider() -> ResolvedSecret:
-        return ensure_resolved(resolver.resolve(auth_ref))
+        return resolver.resolve(auth_ref)
 
     return provider
 
