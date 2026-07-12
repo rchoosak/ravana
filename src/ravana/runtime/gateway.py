@@ -164,7 +164,7 @@ class LLMGateway:
         # only ever receive the resolved value. None is fine for workflows
         # whose agents declare no api_key_ref (SDK env vars serve them).
         self._secret_resolver = secret_resolver
-        self._resolved_keys: dict[str, str] = {}
+        self._api_keys_by_ref: dict[str, str] = {}
         # §3.4: strategy is decided once per (provider, model), not re-derived
         # every call. Capabilities are static, so this memo is the "decided at
         # registration" contract without a separate registration step.
@@ -189,16 +189,23 @@ class LLMGateway:
         ref = llm.api_key_ref
         if ref is None:
             return None  # no per-agent key: the SDK's own env var serves this entry
-        if ref not in self._resolved_keys:
+        if ref not in self._api_keys_by_ref:
             if self._secret_resolver is None:
                 raise ProviderError(
                     f"llm.api_key_ref '{ref}' declared but no secret resolver is wired", retryable=False
                 )
             try:
-                self._resolved_keys[ref] = self._secret_resolver.resolve(ref)
+                resolved = self._secret_resolver.resolve(ref)
             except Exception as exc:  # noqa: BLE001 - resolution failure is a permanent entry failure
                 raise ProviderError(f"resolving llm.api_key_ref '{ref}' failed: {exc}", retryable=False) from exc
-        return self._resolved_keys[ref]
+            if not resolved or not resolved.strip():
+                # Defense in depth (EnvSecretResolver already rejects empty): a
+                # custom resolver returning "" must not slip past the adapters'
+                # truthiness gates and silently swap in the SDK's ambient env
+                # credential — fail the entry like a missing secret.
+                raise ProviderError(f"llm.api_key_ref '{ref}' resolved to an empty value", retryable=False)
+            self._api_keys_by_ref[ref] = resolved
+        return self._api_keys_by_ref[ref]
 
     def _strategy_for(self, adapter: ProviderAdapter, model: str) -> _Strategy:
         key = (adapter.name, model)
@@ -304,16 +311,24 @@ class LLMGateway:
             run_id=run_id, node_id=node_id, agent=agent, llm=llm, adapter=adapter, system=system, output_schema=output_schema
         )
 
+    def _request_for(self, llm: LLMConfig, *, system: str, messages: list[Message], **extras: Any) -> ProviderRequest:
+        """One place that turns an LLMConfig entry into a ProviderRequest —
+        the llm-derived fields (model/sampling/endpoint/resolved key, §8c)
+        travel together; per-call shape (tools, force_tool, output_schema)
+        rides in `extras`."""
+        return ProviderRequest(
+            model=llm.model, system=system, messages=messages,
+            temperature=llm.temperature, max_tokens=llm.max_tokens,
+            endpoint=llm.endpoint, api_key=self._resolve_api_key(llm),
+            **extras,
+        )
+
     async def _run_guided(self, *, node_id, llm, adapter, system, output_schema):
         guards = self._graph.doc.spec.graph.guards
         messages: list[Message] = [UserMessage(text="Respond with your final structured output as JSON.")]
         input_tokens = output_tokens = repair_count = 0
         while True:
-            request = ProviderRequest(
-                model=llm.model, system=system, messages=messages, output_schema=output_schema,
-                temperature=llm.temperature, max_tokens=llm.max_tokens, endpoint=llm.endpoint,
-                api_key=self._resolve_api_key(llm),
-            )
+            request = self._request_for(llm, system=system, messages=messages, output_schema=output_schema)
             response = await adapter.complete(request)
             input_tokens += response.input_tokens
             output_tokens += response.output_tokens
@@ -386,16 +401,9 @@ class LLMGateway:
             # free-text reasoning (§3.4.2). Forcing at exhaustion still
             # guarantees the turn terminates rather than looping or going quiet.
             force_submit = tool_call_count >= guards.max_tool_calls_per_turn
-            request = ProviderRequest(
-                model=llm.model,
-                system=system,
-                messages=messages,
-                tools=offered_tools,
-                force_tool=SUBMIT_RESULT if force_submit else None,
-                temperature=llm.temperature,
-                max_tokens=llm.max_tokens,
-                endpoint=llm.endpoint,
-                api_key=self._resolve_api_key(llm),
+            request = self._request_for(
+                llm, system=system, messages=messages,
+                tools=offered_tools, force_tool=SUBMIT_RESULT if force_submit else None,
             )
             response = await adapter.complete(request)
             input_tokens += response.input_tokens

@@ -87,7 +87,9 @@ class ProviderRequest:
     # The RESOLVED credential (§8c: the gateway resolves `llm.api_key_ref`
     # through the secret resolver at dispatch; adapters never see the pointer).
     # None = no per-agent key — the SDK falls back to its own env var.
-    api_key: str | None = None
+    # repr=False: the plaintext key must not ride the dataclass repr into
+    # debug logs or pytest assertion diffs (§8: secrets never logged).
+    api_key: str | None = field(default=None, repr=False)
 
 
 @dataclass

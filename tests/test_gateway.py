@@ -421,21 +421,37 @@ def test_fatal_tool_error_is_a_hard_failure(graph):
         _run(gateway, "pm")
 
 
-def _single_node_gateway_graph(output_schema: dict | None = None, toolkits: list[str] | None = None):
-    """Minimal one-node workflow compiled for engine+gateway e2e tests."""
+def _one_agent_graph(
+    llm: dict,
+    *,
+    name: str = "gw-test",
+    toolkits: list[str] | None = None,
+    output_schema: dict | None = None,
+):
+    """THE single-agent workflow envelope every gateway test variant shares:
+    one agent 'a', one node 'only', no edges — only the `llm` dict (and
+    optional toolkits/output_schema) differs per test."""
+    agent: dict = {"id": "a", "name": "A", "llm": llm, "system_prompt": "p"}
+    if output_schema is not None:
+        agent["output_schema"] = output_schema
     spec: dict = {
-        "agents": [{"id": "a", "name": "A", "llm": {"provider": "anthropic", "model": "m"}, "system_prompt": "p"}],
+        "agents": [agent],
         "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
     }
-    if output_schema is not None:
-        spec["agents"][0]["output_schema"] = output_schema
     if toolkits:
         spec["toolkits"] = [{"id": t, "type": "web_search"} for t in toolkits]
-        spec["agents"][0]["toolkits"] = toolkits
+        agent["toolkits"] = toolkits
     doc = WorkflowDoc.model_validate(
-        {"apiVersion": "ravana/v1", "kind": "Workflow", "metadata": {"name": "gw-e2e", "version": 1}, "spec": spec}
+        {"apiVersion": "ravana/v1", "kind": "Workflow", "metadata": {"name": name, "version": 1}, "spec": spec}
     )
     return compile_workflow(doc)
+
+
+def _single_node_gateway_graph(output_schema: dict | None = None, toolkits: list[str] | None = None):
+    """Minimal one-node workflow compiled for engine+gateway e2e tests."""
+    return _one_agent_graph(
+        {"provider": "anthropic", "model": "m"}, name="gw-e2e", toolkits=toolkits, output_schema=output_schema
+    )
 
 
 def test_engine_retries_a_transient_tool_failure_with_backoff(con):
@@ -683,25 +699,10 @@ def _fallback_chain_graph(name: str, primary_provider: str, fallback_provider: s
     """Single-node workflow whose agent runs on `primary_provider` (hosted
     shape: no endpoint, no api_key_ref) with one fallback entry — the shared
     testbed for the credential/SDK-boundary probes."""
-    doc = WorkflowDoc.model_validate(
-        {
-            "apiVersion": "ravana/v1",
-            "kind": "Workflow",
-            "metadata": {"name": name, "version": 1},
-            "spec": {
-                "agents": [
-                    {
-                        "id": "a",
-                        "name": "A",
-                        "llm": {"provider": primary_provider, "model": "m", "fallback": [{"provider": fallback_provider, "model": "m2"}]},
-                        "system_prompt": "p",
-                    }
-                ],
-                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
-            },
-        }
+    return _one_agent_graph(
+        {"provider": primary_provider, "model": "m", "fallback": [{"provider": fallback_provider, "model": "m2"}]},
+        name=name,
     )
-    return compile_workflow(doc)
 
 
 def _assert_falls_back_cleanly(cred_graph, primary, primary_name: str, fallback_name: str):
@@ -724,18 +725,7 @@ def _keyed_agent_graph(api_key_ref: str | None, fallback: dict | None = None):
         llm["api_key_ref"] = api_key_ref
     if fallback:
         llm["fallback"] = [fallback]
-    doc = WorkflowDoc.model_validate(
-        {
-            "apiVersion": "ravana/v1",
-            "kind": "Workflow",
-            "metadata": {"name": "keyref-test", "version": 1},
-            "spec": {
-                "agents": [{"id": "a", "name": "A", "llm": llm, "system_prompt": "p"}],
-                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
-            },
-        }
-    )
-    return compile_workflow(doc)
+    return _one_agent_graph(llm, name="keyref-test")
 
 
 def test_api_key_ref_is_resolved_and_lands_in_the_request():
@@ -785,6 +775,49 @@ def test_api_key_ref_with_no_resolver_wired_is_a_permanent_entry_failure():
     with pytest.raises(RuntimeError, match="failed permanently"):
         _run(gateway, "a")
     assert len(adapter.requests) == 0
+
+
+def test_empty_resolved_secret_fails_the_entry_not_swaps_credentials():
+    # Review finding: adapters gate on truthiness, so a ref resolving to ""
+    # would silently fall back to the SDK's AMBIENT env key — replacing the
+    # configured credential instead of failing. An empty resolution must fail
+    # the entry (permanent) and let the fallback serve.
+    class EmptyResolver:
+        def resolve(self, ref: str) -> str:
+            return ""  # a custom resolver misbehaving
+
+    graph = _keyed_agent_graph("secrets://openai_key", fallback={"provider": "anthropic", "model": "m2"})
+    primary = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    fallback = FakeAdapter(name="anthropic", responses=[_submit({"done": True})])
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(
+        graph, {"openai": primary, "anthropic": fallback}, retry_sleep=sleeper, secret_resolver=EmptyResolver()
+    )
+    result = _run(gateway, "a")
+    assert result.structured_payload == {"done": True}
+    assert len(primary.requests) == 0  # the entry never ran with a swapped credential
+    assert len(fallback.requests) == 1
+    assert sleeper.delays == []  # permanent: no backoff
+
+
+def test_env_resolver_rejects_set_but_empty_secret():
+    # Same class of bug at the source: EnvSecretResolver refuses an env var
+    # that is set but empty (covers toolkit auth_refs too, not just LLM keys).
+    from ravana.runtime.secrets import EnvSecretResolver, SecretNotFound
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "   "})
+    with pytest.raises(SecretNotFound, match="set but empty"):
+        resolver.resolve("secrets://openai_key")
+
+
+def test_resolved_api_key_never_appears_in_request_repr():
+    # §8: secrets are never logged. The dataclass repr (debug logs, pytest
+    # assertion diffs) must not carry the resolved plaintext key.
+    from ravana.runtime.providers.base import UserMessage
+
+    request = ProviderRequest(model="m", system="s", messages=[UserMessage(text="x")], api_key="sk-super-secret")
+    assert "sk-super-secret" not in repr(request)
+    assert "sk-super-secret" not in str(request)
 
 
 def test_resolved_keys_are_memoized_per_ref():
@@ -914,7 +947,7 @@ def test_sdk_internal_retries_are_disabled(monkeypatch):
     monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeAnthropicClient)
     monkeypatch.setattr(openai, "AsyncOpenAI", FakeOpenAIClient)
 
-    AnthropicAdapter()._resolve_client()
+    AnthropicAdapter()._resolve_client(None)
     OpenAICompatibleAdapter(name="local")._resolve_client(
         ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a/v1")
     )

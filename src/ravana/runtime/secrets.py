@@ -39,7 +39,14 @@ class EnvSecretResolver:
                 f"secret '{ref}' not found — set {env_key} in the environment "
                 "(Vault/KMS backing is a Phase 2 item, §8)"
             )
-        return environ[env_key]
+        value = environ[env_key]
+        if not value.strip():
+            # Set-but-empty is NOT a usable secret. Returning "" would make
+            # truthiness-gated consumers silently swap in a DIFFERENT
+            # credential (the SDK's ambient env key) or send unauthenticated
+            # requests — fail closed instead, same as missing.
+            raise SecretNotFound(f"secret '{ref}' is set but empty ({env_key}) — refusing an empty credential")
+        return value
 
 
 def _os_environ() -> dict[str, str]:

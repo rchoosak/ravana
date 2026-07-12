@@ -56,7 +56,7 @@ class AnthropicAdapter:
         # agents may hold different per-agent credentials (§1.4/§8c).
         self._clients: dict[str | None, Any] = {}
 
-    def _resolve_client(self, api_key: str | None = None) -> Any:
+    def _resolve_client(self, api_key: str | None) -> Any:
         if self._explicit_client is not None:
             return self._explicit_client
         if api_key not in self._clients:
