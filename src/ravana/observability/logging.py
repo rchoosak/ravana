@@ -12,6 +12,7 @@ import json
 import sys
 from typing import Any
 
+from ravana.runtime.secrets import redact_secrets
 from ravana.schema.util import now_iso
 
 
@@ -19,7 +20,10 @@ def log_event(level: str, message: str, *, run_id: str | None = None, node_execu
     record = {
         "timestamp": now_iso(),
         "level": level,
-        "message": message,
+        # §8's logging backstop: "logging must actively redact anything
+        # matching a known secret pattern" — every resolved-secret value is
+        # scrubbed here, whatever upstream code composed into the message.
+        "message": redact_secrets(message),
         "run_id": run_id,
         "node_execution_id": node_execution_id,
         **extra,

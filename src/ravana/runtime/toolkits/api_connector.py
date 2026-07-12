@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
+from ravana.runtime.secrets import ResolvedSecret
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 
 # §8(a): the connector's declared input schema. Result is a plain string
@@ -85,9 +86,12 @@ class ApiConnectorHandler:
         _reject_offbase_path(path)  # §8-security: never let a model-supplied path escape base_url with the token
 
         headers: dict[str, str] = {"Idempotency-Key": idempotency_key}
+        # Re-resolved by the provider at EVERY dispatch (§8c) — no
+        # handler-lifetime cache, so token rotation is picked up per call.
+        # ResolvedSecret opens to plaintext only here, at the HTTP boundary.
         token = self._get_auth_token()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token.value() if isinstance(token, ResolvedSecret) else token}"
 
         client = self._resolve_client()
         try:

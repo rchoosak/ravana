@@ -29,6 +29,7 @@ from ravana.runtime.providers.base import (
     ProviderRequest,
     ProviderResponse,
 )
+from ravana.runtime.secrets import ResolvedSecret
 
 
 class OpenAICompatibleAdapter:
@@ -41,8 +42,9 @@ class OpenAICompatibleAdapter:
         # endpoints or holding different credentials — the per-agent routing
         # §1.4 promises. Caching a single first-seen client (the earlier bug)
         # silently sent every agent's traffic to whichever endpoint happened
-        # to be resolved first.
-        self._clients: dict[tuple[str | None, str | None], Any] = {}
+        # to be resolved first. ResolvedSecret hashes by value, so
+        # re-resolution of the same key reuses the cached client.
+        self._clients: dict[tuple[str | None, ResolvedSecret | None], Any] = {}
 
     def capabilities(self, model: str) -> set[Capability]:
         caps = {Capability.NATIVE_STRUCTURED_OUTPUT}

@@ -14,9 +14,16 @@ from typing import Protocol
 
 _SCHEME = "secrets://"
 
+# §8's redaction backstop: every secret value that enters the process through
+# ResolvedSecret is remembered here, so redact_secrets() can scrub it from any
+# text bound for persistence or logs — an SDK exception that embeds the key we
+# injected into it, say. Process-local; the values already live in memory on
+# the clients themselves.
+_KNOWN_SECRET_VALUES: set[str] = set()
+
 
 class SecretResolver(Protocol):
-    def resolve(self, ref: str) -> str: ...
+    def resolve(self, ref: str) -> "ResolvedSecret": ...
 
 
 class SecretNotFound(Exception):
@@ -31,6 +38,7 @@ class ResolvedSecret:
       past truthiness gates and silently swap in a different ambient key);
     - never reveals itself: repr/str show a redaction marker, so a debug log
       or pytest assertion diff cannot leak it (§8);
+    - registers its value for redact_secrets(), §8's log/persistence backstop;
     - equality/hash by value, so client caches keyed on the credential
       behave correctly across re-resolution;
     - `.value()` is the single, intentional access to the plaintext.
@@ -42,6 +50,7 @@ class ResolvedSecret:
         if not value or not value.strip():
             raise ValueError("refusing an empty credential")
         self._value = value
+        _KNOWN_SECRET_VALUES.add(value)
 
     def value(self) -> str:
         return self._value
@@ -58,12 +67,31 @@ class ResolvedSecret:
         return hash(self._value)
 
 
+def redact_secrets(text: str) -> str:
+    """§8's ACTIVE redaction backstop ("logging must actively redact ...").
+    Replaces every known resolved-secret value appearing in `text` — applied
+    wherever free-form error text crosses into persistence (node_execution
+    .error, the tool ledger) or the log stream, because an SDK/HTTP exception
+    can echo the very credential the runtime injected into it."""
+    for value in _KNOWN_SECRET_VALUES:
+        if value in text:
+            text = text.replace(value, "***REDACTED***")
+    return text
+
+
+def ensure_resolved(value: "ResolvedSecret | str") -> "ResolvedSecret":
+    """Normalize a resolver's return: the protocol says ResolvedSecret, but a
+    custom resolver may still hand back a raw str — wrap it so the invariants
+    (non-empty, redaction registration) hold regardless."""
+    return value if isinstance(value, ResolvedSecret) else ResolvedSecret(value)
+
+
 class EnvSecretResolver:
     def __init__(self, environ: dict[str, str] | None = None):
         # Injectable for tests; defaults to os.environ at call time.
         self._environ = environ
 
-    def resolve(self, ref: str) -> str:
+    def resolve(self, ref: str) -> ResolvedSecret:
         if not ref.startswith(_SCHEME):
             raise SecretNotFound(f"auth_ref '{ref}' must use the {_SCHEME} scheme")
         name = ref[len(_SCHEME):]
@@ -74,14 +102,13 @@ class EnvSecretResolver:
                 f"secret '{ref}' not found — set {env_key} in the environment "
                 "(Vault/KMS backing is a Phase 2 item, §8)"
             )
-        value = environ[env_key]
-        if not value.strip():
-            # Set-but-empty is NOT a usable secret. Returning "" would make
-            # truthiness-gated consumers silently swap in a DIFFERENT
-            # credential (the SDK's ambient env key) or send unauthenticated
-            # requests — fail closed instead, same as missing.
-            raise SecretNotFound(f"secret '{ref}' is set but empty ({env_key}) — refusing an empty credential")
-        return value
+        try:
+            # ResolvedSecret owns the non-empty invariant (set-but-empty would
+            # make truthiness-gated consumers silently swap in a DIFFERENT
+            # ambient credential); this just adds the env context to the error.
+            return ResolvedSecret(environ[env_key])
+        except ValueError as exc:
+            raise SecretNotFound(f"secret '{ref}' is set but empty ({env_key}) — refusing an empty credential") from exc
 
 
 def _os_environ() -> dict[str, str]:

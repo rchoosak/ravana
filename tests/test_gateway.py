@@ -778,6 +778,121 @@ def test_resolver_exception_text_never_reaches_db_or_stderr(con, capsys):
     assert "sk-THE-ACTUAL-SECRET-VALUE" not in captured.out
 
 
+def test_sdk_exception_echoing_injected_key_is_redacted_everywhere(con, capsys):
+    # Review probe: an SDK client-init exception can echo the very key the
+    # runtime injected ("ProviderError ... sk-LEAK-ME"). §8's ACTIVE redaction
+    # backstop must scrub the known secret value from the ProviderError
+    # message, node_execution.error, and the stderr log stream.
+    import openai
+
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    class EchoingClientCtor:
+        def __init__(self, **kwargs):
+            raise RuntimeError(f"bad proxy for key {kwargs.get('api_key')}")  # SDK echoes the key
+
+    graph = _keyed_agent_graph("secrets://openai_key")  # no fallback: chain ends permanent
+    adapter = OpenAICompatibleAdapter(name="openai")  # real adapter, lazy ctor
+    gateway = LLMGateway(
+        graph, {"openai": adapter},
+        secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "sk-LEAK-ME"}),
+    )
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+
+    orig = openai.AsyncOpenAI
+    openai.AsyncOpenAI = EchoingClientCtor
+    try:
+        run_id = asyncio.run(start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id))
+    finally:
+        openai.AsyncOpenAI = orig
+
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "FAILED"
+    errors = [r["error"] or "" for r in con.execute("SELECT error FROM node_execution WHERE run_id = ?", (run_id,))]
+    assert all("sk-LEAK-ME" not in e for e in errors)  # never persisted
+    assert any("***REDACTED***" in e for e in errors)  # the scrub actually fired
+    captured = capsys.readouterr()
+    assert "sk-LEAK-ME" not in captured.err and "sk-LEAK-ME" not in captured.out  # never logged
+
+
+def test_concurrent_turns_never_swap_credentials():
+    # Review probe: the per-dispatch memo was SHARED gateway state — one
+    # run_turn's clear() could swap another's credential mid-turn (key-1,
+    # key-2, key-2). Resolution is now a per-try local: interleaved turns each
+    # keep their own key end-to-end.
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    doc = WorkflowDoc.model_validate(
+        {
+            "apiVersion": "ravana/v1",
+            "kind": "Workflow",
+            "metadata": {"name": "concurrent-keys", "version": 1},
+            "spec": {
+                "agents": [
+                    {"id": "a1", "name": "A1", "llm": {"provider": "openai", "model": "m1", "api_key_ref": "secrets://k1"}, "system_prompt": "p"},
+                    {"id": "a2", "name": "A2", "llm": {"provider": "openai", "model": "m2", "api_key_ref": "secrets://k2"}, "system_prompt": "p"},
+                ],
+                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a1"}], "edges": []},
+            },
+        }
+    )
+    graph = compile_workflow(doc)
+
+    class YieldingAdapter(FakeAdapter):
+        async def complete(self, request):
+            await asyncio.sleep(0)  # force interleaving between concurrent turns
+            return await super().complete(request)
+
+    adapter = YieldingAdapter(name="openai", responses=[_submit({"done": True})])
+    gateway = LLMGateway(
+        graph, {"openai": adapter},
+        secret_resolver=EnvSecretResolver({"RAVANA_SECRET_K1": "sk-one", "RAVANA_SECRET_K2": "sk-two"}),
+    )
+
+    async def both():
+        await asyncio.gather(
+            gateway.run_turn(run_id="r1", node_id="n1", attempt=1, agent_id="a1", shared_state={}),
+            gateway.run_turn(run_id="r1", node_id="n2", attempt=1, agent_id="a2", shared_state={}),
+        )
+
+    asyncio.run(both())
+    by_model = {r.model: r.api_key.value() for r in adapter.requests}
+    assert by_model == {"m1": "sk-one", "m2": "sk-two"}  # each turn kept its own credential
+
+
+def test_loader_boundary_never_exposes_pasted_secret_in_structured_errors(tmp_path):
+    # Review finding: hide_input_in_errors covers str(error) but pydantic's
+    # ValidationError.errors()/.json() still embed the raw input. The load
+    # boundary wraps validation failures in WorkflowValidationError — message
+    # only, no structured surface, no __cause__ back to the original.
+    from ravana.schema.loader import WorkflowValidationError, load_workflow_yaml as load
+
+    bad = tmp_path / "leaky.yaml"
+    bad.write_text(
+        """
+apiVersion: ravana/v1
+kind: Workflow
+metadata: {name: leaky, version: 1}
+spec:
+  agents:
+    - id: a
+      name: A
+      llm: {provider: openai, model: m, api_key_ref: sk-PASTED-IN-YAML}
+      system_prompt: p
+  graph: {entry: only, nodes: [{id: only, agent: a}], edges: []}
+"""
+    )
+    with pytest.raises(WorkflowValidationError) as exc_info:
+        load(bad)
+    err = exc_info.value
+    assert "sk-PASTED-IN-YAML" not in str(err)
+    assert not hasattr(err, "errors")  # no structured surface carrying raw input
+    assert err.__cause__ is None  # chain severed: the original ValidationError is unreachable
+    assert "api_key_ref" in str(err)  # still names the offending field
+
+
 def test_api_key_ref_is_resolved_and_lands_in_the_request():
     # §8c: the gateway resolves the pointer; the adapter's request carries the
     # REAL key, never the secrets:// ref.

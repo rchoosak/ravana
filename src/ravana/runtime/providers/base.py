@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
-from ravana.runtime.secrets import ResolvedSecret
+from ravana.runtime.secrets import ResolvedSecret, redact_secrets
 
 
 class Capability(str, Enum):
@@ -151,8 +151,13 @@ def classify_retryable(exc: Exception) -> bool:
 
 def to_provider_error(prefix: str, exc: Exception, *, retryable: bool | None = None) -> ProviderError:
     """The one place an SDK exception becomes a normalized, classified
-    ProviderError — both adapters call this instead of hand-rolling the wrap."""
-    return ProviderError(f"{prefix}: {exc}", retryable=classify_retryable(exc) if retryable is None else retryable)
+    ProviderError — both adapters call this instead of hand-rolling the wrap.
+    The exception text is redacted (§8): an SDK error can echo the very
+    credential the runtime injected into the client, and this message flows
+    onward into node_execution.error and the log stream."""
+    return ProviderError(
+        f"{prefix}: {redact_secrets(str(exc))}", retryable=classify_retryable(exc) if retryable is None else retryable
+    )
 
 
 class ProviderAdapter(Protocol):
