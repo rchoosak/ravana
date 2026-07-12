@@ -32,4 +32,8 @@ def load_workflow_yaml(path: str | Path) -> WorkflowDoc:
         return WorkflowDoc.model_validate(raw)
     except ValidationError as exc:
         message = str(exc)
+    # The wrapper's traceback retains this frame. Drop the parsed YAML before
+    # raising so traceback inspection cannot recover a rejected pasted secret
+    # from `tb_frame.f_locals["raw"]`.
+    raw = None
     raise WorkflowValidationError(message)
