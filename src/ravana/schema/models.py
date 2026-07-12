@@ -17,6 +17,19 @@ ToolkitType = Literal["web_search", "code_interpreter", "db", "api_connector", "
 
 TERMINAL = "__terminal__"
 
+_SECRET_SCHEME = "secrets://"
+
+
+def _require_secret_pointer(value: str | None) -> str | None:
+    """§8: `auth_ref`/`api_key_ref` are POINTERS, never raw secrets. Enforced
+    at the schema so a pasted raw key fails at compile/validate — BEFORE it is
+    persisted into the workflow tables or echoed into any error message."""
+    if value is not None and not value.startswith(_SECRET_SCHEME):
+        raise ValueError(
+            f"must be a {_SECRET_SCHEME} pointer, never a raw credential (§8) — got a non-pointer value (redacted)"
+        )
+    return value
+
 
 class ConcurrencyConfig(BaseModel):
     group: str
@@ -37,10 +50,17 @@ class StateConfig(BaseModel):
 
 
 class ToolkitConfig(BaseModel):
+    # hide_input_in_errors: a failed auth_ref validation must not echo the
+    # pasted value back — it may BE the raw secret the validator exists to
+    # keep out of persistence and logs (§8).
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     id: str
     type: ToolkitType
     config: dict[str, Any] = Field(default_factory=dict)
     auth_ref: str | None = None
+
+    _pointer = field_validator("auth_ref")(_require_secret_pointer)
 
 
 class SkillConfig(BaseModel):
@@ -51,13 +71,22 @@ class SkillConfig(BaseModel):
 
 
 class LLMFallbackEntry(BaseModel):
+    # hide_input_in_errors: see ToolkitConfig — a rejected api_key_ref may BE
+    # a pasted raw secret; never echo it in the validation error (§8).
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     provider: str
     model: str
     endpoint: str | None = None
     api_key_ref: str | None = None
 
+    _pointer = field_validator("api_key_ref")(_require_secret_pointer)
+
 
 class LLMConfig(BaseModel):
+    # hide_input_in_errors: see ToolkitConfig (§8).
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     provider: str
     model: str
     temperature: float = 0.2
@@ -65,6 +94,8 @@ class LLMConfig(BaseModel):
     endpoint: str | None = None
     api_key_ref: str | None = None
     fallback: list[LLMFallbackEntry] = Field(default_factory=list)
+
+    _pointer = field_validator("api_key_ref")(_require_secret_pointer)
 
 
 class HITLConfig(BaseModel):
@@ -167,6 +198,14 @@ class WorkflowMetadata(BaseModel):
 
 
 class WorkflowDoc(BaseModel):
+    # hide_input_in_errors applies from the OUTERMOST validating model, so it
+    # must live here for `WorkflowDoc.model_validate(...)` errors to omit
+    # input echoes. A workflow file can have a raw secret pasted anywhere
+    # (that is exactly the mistake the §8 pointer validators reject), and the
+    # validation error must not repeat it into terminals/logs. The error's
+    # `loc` path still names the offending field.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     apiVersion: str
     kind: Literal["Workflow"]
     metadata: WorkflowMetadata

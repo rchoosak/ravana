@@ -33,6 +33,7 @@ from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgen
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
+from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.providers.base import (
     AssistantMessage,
@@ -150,6 +151,7 @@ class LLMGateway:
         adapters: dict[str, ProviderAdapter],
         tool_executor: ToolExecutor | None = None,
         retry_sleep: RetrySleep = asyncio.sleep,
+        secret_resolver: SecretResolver | None = None,
     ):
         self._graph = graph
         self._adapters = adapters
@@ -157,6 +159,13 @@ class LLMGateway:
         # §3.6 backoff waiter for same-entry retries; injectable so tests
         # record requested delays instead of actually waiting.
         self._retry_sleep = retry_sleep
+        # §8c: resolves `llm.api_key_ref` pointers to real keys at dispatch —
+        # the gateway (the Agent Runtime layer) does the resolving; adapters
+        # only ever receive the resolved value. None is fine for workflows
+        # whose agents declare no api_key_ref (SDK env vars serve them).
+        # Deliberately NO key memo here: resolution is per entry-try (see
+        # _resolve_api_key) so there is no shared mutable credential state.
+        self._secret_resolver = secret_resolver
         # §3.4: strategy is decided once per (provider, model), not re-derived
         # every call. Capabilities are static, so this memo is the "decided at
         # registration" contract without a separate registration step.
@@ -171,6 +180,40 @@ class LLMGateway:
             # (chain moves on), just never same-entry retried.
             raise ProviderError(f"no adapter registered for provider '{provider}'", retryable=False)
         return adapter
+
+    def _resolve_api_key(self, llm: LLMConfig) -> ResolvedSecret | None:
+        """§8c: turn the entry's `api_key_ref` pointer into the real key.
+        Resolved FRESH once per entry-try (called at the top of _run_one_llm)
+        with NO gateway-level memo: "resolved at dispatch time" means each
+        dispatch re-reads the secret — a rotated credential is picked up on
+        the next turn — and, with no shared mutable state, concurrent
+        run_turn()s cannot swap each other's credentials mid-turn (review
+        probe: key-1/key-2 interleaving under a shared per-dispatch dict).
+        A resolution failure is a config error, permanent BY ENTRY (a retry
+        can't conjure the secret) — but the next fallback entry may use a
+        different ref/provider, so it raises ProviderError (chain moves on)
+        rather than a hard error.
+
+        Error messages are deliberately FIXED-SHAPE: they carry the ref (a
+        schema-enforced `secrets://` pointer, safe to echo) and the exception
+        TYPE — never the exception text, which a misbehaving resolver could
+        fill with the secret itself. These messages end up in
+        node_execution.error and stderr logs (§8: secrets never persisted)."""
+        ref = llm.api_key_ref
+        if ref is None:
+            return None  # no per-agent key: the SDK's own env var serves this entry
+        if self._secret_resolver is None:
+            raise ProviderError(f"llm.api_key_ref '{ref}' declared but no secret resolver is wired", retryable=False)
+        try:
+            # SecretResolver.resolve returns ResolvedSecret (non-empty by
+            # construction, self-redacting), so a "" resolution can't slip
+            # past the adapters' truthiness gates and swap in the SDK's
+            # ambient env credential.
+            return self._secret_resolver.resolve(ref)
+        except Exception as exc:  # noqa: BLE001 - resolution failure is a permanent entry failure
+            raise ProviderError(
+                f"resolving llm.api_key_ref '{ref}' failed ({type(exc).__name__})", retryable=False
+            ) from exc
 
     def _strategy_for(self, adapter: ProviderAdapter, model: str) -> _Strategy:
         key = (adapter.name, model)
@@ -262,6 +305,10 @@ class LLMGateway:
     ) -> AgentTurnResult:
         adapter = self._adapter_for(llm.provider)
         strategy = self._strategy_for(adapter, llm.model)
+        # §8c: resolve THIS entry's key once per try, as a local — the value
+        # flows down the call stack (no gateway-level shared credential state,
+        # so concurrent run_turn()s can never swap each other's keys mid-turn).
+        api_key = self._resolve_api_key(llm)
         # Guided decoding constrains the *entire* response to the output schema,
         # so the payload arrives as JSON in the message text (not a
         # submit_result tool call) and it's one-shot by construction — but that
@@ -271,20 +318,43 @@ class LLMGateway:
         # at the end), even on a guided-capable provider. Otherwise a guided
         # agent would silently never see its tools.
         if strategy.use_guided and not agent.toolkits:
-            return await self._run_guided(node_id=node_id, llm=llm, adapter=adapter, system=system, output_schema=output_schema)
+            return await self._run_guided(
+                node_id=node_id, llm=llm, adapter=adapter, system=system, output_schema=output_schema, api_key=api_key
+            )
         return await self._run_tool_loop(
-            run_id=run_id, node_id=node_id, agent=agent, llm=llm, adapter=adapter, system=system, output_schema=output_schema
+            run_id=run_id, node_id=node_id, agent=agent, llm=llm, adapter=adapter, system=system,
+            output_schema=output_schema, api_key=api_key,
         )
 
-    async def _run_guided(self, *, node_id, llm, adapter, system, output_schema):
+    def _request_for(
+        self,
+        llm: LLMConfig,
+        *,
+        api_key: ResolvedSecret | None,
+        system: str,
+        messages: list[Message],
+        tools: list[Tool] | None = None,
+        force_tool: str | None = None,
+        output_schema: dict[str, Any] | None = None,
+    ) -> ProviderRequest:
+        """One place that turns an LLMConfig entry into a ProviderRequest —
+        the llm-derived fields (model/sampling/endpoint) travel together with
+        the per-try resolved key; the per-call shape is the three explicit,
+        type-checked options: `tools`+`force_tool` (the tool loop) or
+        `output_schema` (guided one-shot)."""
+        return ProviderRequest(
+            model=llm.model, system=system, messages=messages,
+            temperature=llm.temperature, max_tokens=llm.max_tokens,
+            endpoint=llm.endpoint, api_key=api_key,
+            tools=tools or [], force_tool=force_tool, output_schema=output_schema,
+        )
+
+    async def _run_guided(self, *, node_id, llm, adapter, system, output_schema, api_key):
         guards = self._graph.doc.spec.graph.guards
         messages: list[Message] = [UserMessage(text="Respond with your final structured output as JSON.")]
         input_tokens = output_tokens = repair_count = 0
         while True:
-            request = ProviderRequest(
-                model=llm.model, system=system, messages=messages, output_schema=output_schema,
-                temperature=llm.temperature, max_tokens=llm.max_tokens, endpoint=llm.endpoint, api_key_ref=llm.api_key_ref,
-            )
+            request = self._request_for(llm, api_key=api_key, system=system, messages=messages, output_schema=output_schema)
             response = await adapter.complete(request)
             input_tokens += response.input_tokens
             output_tokens += response.output_tokens
@@ -303,7 +373,7 @@ class LLMGateway:
             repair_count += 1
             messages.append(UserMessage(text=f"That output was invalid: {error}. Return valid JSON matching the schema."))
 
-    async def _run_tool_loop(self, *, run_id, node_id, agent, llm, adapter, system, output_schema):
+    async def _run_tool_loop(self, *, run_id, node_id, agent, llm, adapter, system, output_schema, api_key):
         guards = self._graph.doc.spec.graph.guards
         # §3.4.4: the agent's real toolkits are offered as callable tools
         # (name = toolkit id), plus the synthetic submit_result the turn
@@ -357,16 +427,9 @@ class LLMGateway:
             # free-text reasoning (§3.4.2). Forcing at exhaustion still
             # guarantees the turn terminates rather than looping or going quiet.
             force_submit = tool_call_count >= guards.max_tool_calls_per_turn
-            request = ProviderRequest(
-                model=llm.model,
-                system=system,
-                messages=messages,
-                tools=offered_tools,
-                force_tool=SUBMIT_RESULT if force_submit else None,
-                temperature=llm.temperature,
-                max_tokens=llm.max_tokens,
-                endpoint=llm.endpoint,
-                api_key_ref=llm.api_key_ref,
+            request = self._request_for(
+                llm, api_key=api_key, system=system, messages=messages,
+                tools=offered_tools, force_tool=SUBMIT_RESULT if force_submit else None,
             )
             response = await adapter.complete(request)
             input_tokens += response.input_tokens

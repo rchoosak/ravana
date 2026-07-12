@@ -33,6 +33,7 @@ from ravana.observability.logging import log_event
 from ravana.runtime.backoff import RetrySleep, backoff_delay
 from ravana.runtime.base import AgentRuntime, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
+from ravana.runtime.secrets import redact_secrets
 from ravana.schema.util import dumps, loads, new_id, now_iso
 
 _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
@@ -393,7 +394,7 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
     except TransientAgentError as exc:
         con.execute(
             "UPDATE node_execution SET status = 'FAILED', error = ?, finished_at = ? WHERE id = ?",
-            (str(exc), now_iso(), node_execution_id),
+            (redact_secrets(str(exc)), now_iso(), node_execution_id),
         )
         con.commit()
         # §3.6: exponential backoff before the retry, keyed on the CONSECUTIVE
@@ -587,6 +588,9 @@ def _raise_hitl(ctx: _RunCtx, node_id: str, node_execution_id: str, agent) -> No
 
 def _fail_run(ctx: _RunCtx, node_id: str, error: str) -> None:
     con = ctx.con
+    # §8 backstop: error text may quote an SDK/HTTP exception that echoes an
+    # injected credential — scrub known secret values before persisting.
+    error = redact_secrets(error)
     con.execute(
         """UPDATE node_execution SET status = 'FAILED', error = ?, finished_at = ?
            WHERE run_id = ? AND node_id = ? AND attempt = (

@@ -421,21 +421,37 @@ def test_fatal_tool_error_is_a_hard_failure(graph):
         _run(gateway, "pm")
 
 
-def _single_node_gateway_graph(output_schema: dict | None = None, toolkits: list[str] | None = None):
-    """Minimal one-node workflow compiled for engine+gateway e2e tests."""
+def _one_agent_graph(
+    llm: dict,
+    *,
+    name: str = "gw-test",
+    toolkits: list[str] | None = None,
+    output_schema: dict | None = None,
+):
+    """THE single-agent workflow envelope every gateway test variant shares:
+    one agent 'a', one node 'only', no edges — only the `llm` dict (and
+    optional toolkits/output_schema) differs per test."""
+    agent: dict = {"id": "a", "name": "A", "llm": llm, "system_prompt": "p"}
+    if output_schema is not None:
+        agent["output_schema"] = output_schema
     spec: dict = {
-        "agents": [{"id": "a", "name": "A", "llm": {"provider": "anthropic", "model": "m"}, "system_prompt": "p"}],
+        "agents": [agent],
         "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
     }
-    if output_schema is not None:
-        spec["agents"][0]["output_schema"] = output_schema
     if toolkits:
         spec["toolkits"] = [{"id": t, "type": "web_search"} for t in toolkits]
-        spec["agents"][0]["toolkits"] = toolkits
+        agent["toolkits"] = toolkits
     doc = WorkflowDoc.model_validate(
-        {"apiVersion": "ravana/v1", "kind": "Workflow", "metadata": {"name": "gw-e2e", "version": 1}, "spec": spec}
+        {"apiVersion": "ravana/v1", "kind": "Workflow", "metadata": {"name": name, "version": 1}, "spec": spec}
     )
     return compile_workflow(doc)
+
+
+def _single_node_gateway_graph(output_schema: dict | None = None, toolkits: list[str] | None = None):
+    """Minimal one-node workflow compiled for engine+gateway e2e tests."""
+    return _one_agent_graph(
+        {"provider": "anthropic", "model": "m"}, name="gw-e2e", toolkits=toolkits, output_schema=output_schema
+    )
 
 
 def test_engine_retries_a_transient_tool_failure_with_backoff(con):
@@ -683,25 +699,10 @@ def _fallback_chain_graph(name: str, primary_provider: str, fallback_provider: s
     """Single-node workflow whose agent runs on `primary_provider` (hosted
     shape: no endpoint, no api_key_ref) with one fallback entry — the shared
     testbed for the credential/SDK-boundary probes."""
-    doc = WorkflowDoc.model_validate(
-        {
-            "apiVersion": "ravana/v1",
-            "kind": "Workflow",
-            "metadata": {"name": name, "version": 1},
-            "spec": {
-                "agents": [
-                    {
-                        "id": "a",
-                        "name": "A",
-                        "llm": {"provider": primary_provider, "model": "m", "fallback": [{"provider": fallback_provider, "model": "m2"}]},
-                        "system_prompt": "p",
-                    }
-                ],
-                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
-            },
-        }
+    return _one_agent_graph(
+        {"provider": primary_provider, "model": "m", "fallback": [{"provider": fallback_provider, "model": "m2"}]},
+        name=name,
     )
-    return compile_workflow(doc)
 
 
 def _assert_falls_back_cleanly(cred_graph, primary, primary_name: str, fallback_name: str):
@@ -714,6 +715,440 @@ def _assert_falls_back_cleanly(cred_graph, primary, primary_name: str, fallback_
     assert result.structured_payload == {"done": True}
     assert len(fallback.requests) == 1  # the fallback actually ran
     assert sleeper.delays == []  # permanent: no same-entry backoff wasted
+
+
+# --- §8c: llm.api_key_ref resolution ----------------------------------------
+def _keyed_agent_graph(api_key_ref: str | None, fallback: dict | None = None):
+    """Single-node workflow whose agent declares an llm.api_key_ref."""
+    llm: dict = {"provider": "openai", "model": "m"}
+    if api_key_ref:
+        llm["api_key_ref"] = api_key_ref
+    if fallback:
+        llm["fallback"] = [fallback]
+    return _one_agent_graph(llm, name="keyref-test")
+
+
+def test_redact_secrets_is_pattern_based_and_longest_first():
+    from ravana.runtime.secrets import redact_secrets
+
+    # Pattern sweep catches credentials no caller had in hand (env keys, tokens
+    # in a pre-resolution error): recognizable prefixes + Bearer headers.
+    assert "sk-abc123" not in redact_secrets("openai said: sk-abc123 is bad")
+    assert "sk-ant-xyz" not in redact_secrets("anthropic: sk-ant-xyz")
+    assert "ghp_TOKEN123" not in redact_secrets("git push failed with ghp_TOKEN123")
+    assert "tok-77" not in redact_secrets("Authorization: Bearer tok-77")
+    # Explicit values (a caller with the exact secret) are scrubbed LONGEST
+    # FIRST, so a value that is a substring of another can't leave a partial
+    # leak (the abcdef -> ***def probe from the review).
+    assert redact_secrets("abcdef", values=("abc", "abcdef")) == "***REDACTED***"
+    # A value with no recognizable pattern that no caller declared is the
+    # documented gap of a pattern backstop — left as-is.
+    assert "plainword" in redact_secrets("plainword")
+
+
+def test_resolved_secret_holds_no_process_global_state():
+    # Constructing a ResolvedSecret must not mutate any module-global registry
+    # (the old design coupled the value object to logging and leaked rotated
+    # keys forever). redact_secrets is pattern-based and ignores it.
+    from ravana.runtime.secrets import ResolvedSecret, redact_secrets
+
+    ResolvedSecret("zzz-no-pattern-value")
+    assert "zzz-no-pattern-value" in redact_secrets("zzz-no-pattern-value")  # not registered anywhere
+
+
+def test_resolved_key_never_reaches_message_or_state(con):
+    # §8: secrets are "never written to message/state_transition_log". The
+    # guarantee is BY CONSTRUCTION — the resolved key flows only into the
+    # provider request's api_key, never into structured_payload/content/delta.
+    # Prove it end-to-end: after a full turn, the key value appears in NO
+    # message row, shared_state, or state_transition_log row.
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    graph = _keyed_agent_graph("secrets://openai_key")
+    adapter = FakeAdapter(name="openai", responses=[_submit({"done": "ok"})])
+    gateway = LLMGateway(
+        graph, {"openai": adapter}, secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "sk-must-not-persist"})
+    )
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    run_id = asyncio.run(start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id))
+
+    assert adapter.requests[0].api_key.value() == "sk-must-not-persist"  # it DID reach the request
+    blobs: list[str] = []
+    for tbl, cols in (
+        ("message", "content, structured_payload, tool_calls"),
+        ("run", "shared_state"),
+        ("state_transition_log", "state_diff, condition_evaluated"),
+    ):
+        for row in con.execute(f"SELECT {cols} FROM {tbl} WHERE {'id' if tbl == 'run' else 'run_id'} = ?", (run_id,)):
+            blobs.extend(str(v) for v in row)
+    assert all("sk-must-not-persist" not in b for b in blobs)  # never persisted anywhere
+
+
+def test_raw_key_in_api_key_ref_is_rejected_at_schema():
+    # §8: api_key_ref is a POINTER. A pasted raw credential must fail at
+    # compile/validate — BEFORE persist.py ever writes it into the workflow
+    # tables — and the validation error must not echo the pasted value.
+    with pytest.raises(Exception) as exc_info:
+        _keyed_agent_graph("sk-PASTED-RAW-KEY")
+    assert "sk-PASTED-RAW-KEY" not in str(exc_info.value)  # never echoed back
+    assert "secrets://" in str(exc_info.value)  # points at the fix
+
+    # Fallback entries are validated too, not just the primary.
+    with pytest.raises(Exception):
+        _keyed_agent_graph("secrets://ok", fallback={"provider": "anthropic", "model": "m2", "api_key_ref": "sk-RAW"})
+
+
+def test_raw_key_in_toolkit_auth_ref_is_rejected_at_schema():
+    # Same §8 pointer rule for toolkit auth_refs.
+    from ravana.schema.models import ToolkitConfig
+
+    with pytest.raises(Exception) as exc_info:
+        ToolkitConfig(id="t", type="api_connector", auth_ref="ghp_PASTED-RAW-TOKEN")
+    assert "ghp_PASTED-RAW-TOKEN" not in str(exc_info.value)
+
+
+def test_resolver_exception_text_never_reaches_db_or_stderr(con, capsys):
+    # §8: a misbehaving resolver may put the SECRET ITSELF in its exception
+    # text. The gateway's fixed-shape error (ref + exception type only) must
+    # keep that text out of node_execution.error and the stderr log stream.
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+
+    class LeakyResolver:
+        def resolve(self, ref: str) -> str:
+            raise RuntimeError("resolver dump: sk-THE-ACTUAL-SECRET-VALUE")
+
+    graph = _keyed_agent_graph("secrets://openai_key")  # no fallback: chain ends permanent
+    adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    gateway = LLMGateway(graph, {"openai": adapter}, secret_resolver=LeakyResolver())
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    run_id = asyncio.run(start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id))
+
+    run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"  # permanent chain -> failed cleanly
+    errors = [r["error"] or "" for r in con.execute("SELECT error FROM node_execution WHERE run_id = ?", (run_id,))]
+    assert all("sk-THE-ACTUAL-SECRET-VALUE" not in e for e in errors)  # never persisted
+    assert any("secrets://openai_key" in e and "RuntimeError" in e for e in errors)  # still debuggable
+    captured = capsys.readouterr()
+    assert "sk-THE-ACTUAL-SECRET-VALUE" not in captured.err  # never logged
+    assert "sk-THE-ACTUAL-SECRET-VALUE" not in captured.out
+
+
+def test_sdk_exception_echoing_injected_key_is_redacted_everywhere(con, capsys):
+    # Review probe: an SDK client-init exception can echo the very key the
+    # runtime injected ("ProviderError ... sk-LEAK-ME"). §8's ACTIVE redaction
+    # backstop must scrub the known secret value from the ProviderError
+    # message, node_execution.error, and the stderr log stream.
+    import openai
+
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+    from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    class EchoingClientCtor:
+        def __init__(self, **kwargs):
+            raise RuntimeError(f"bad proxy for key {kwargs.get('api_key')}")  # SDK echoes the key
+
+    graph = _keyed_agent_graph("secrets://openai_key")  # no fallback: chain ends permanent
+    adapter = OpenAICompatibleAdapter(name="openai")  # real adapter, lazy ctor
+    gateway = LLMGateway(
+        graph, {"openai": adapter},
+        secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "sk-LEAK-ME"}),
+    )
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+
+    orig = openai.AsyncOpenAI
+    openai.AsyncOpenAI = EchoingClientCtor
+    try:
+        run_id = asyncio.run(start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id))
+    finally:
+        openai.AsyncOpenAI = orig
+
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "FAILED"
+    errors = [r["error"] or "" for r in con.execute("SELECT error FROM node_execution WHERE run_id = ?", (run_id,))]
+    assert all("sk-LEAK-ME" not in e for e in errors)  # never persisted
+    assert any("***REDACTED***" in e for e in errors)  # the scrub actually fired
+    captured = capsys.readouterr()
+    assert "sk-LEAK-ME" not in captured.err and "sk-LEAK-ME" not in captured.out  # never logged
+
+
+def test_concurrent_turns_never_swap_credentials():
+    # Review probe: the per-dispatch memo was SHARED gateway state — one
+    # run_turn's clear() could swap another's credential mid-turn (key-1,
+    # key-2, key-2). Resolution is now a per-try local: interleaved turns each
+    # keep their own key end-to-end.
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    doc = WorkflowDoc.model_validate(
+        {
+            "apiVersion": "ravana/v1",
+            "kind": "Workflow",
+            "metadata": {"name": "concurrent-keys", "version": 1},
+            "spec": {
+                "agents": [
+                    {"id": "a1", "name": "A1", "llm": {"provider": "openai", "model": "m1", "api_key_ref": "secrets://k1"}, "system_prompt": "p"},
+                    {"id": "a2", "name": "A2", "llm": {"provider": "openai", "model": "m2", "api_key_ref": "secrets://k2"}, "system_prompt": "p"},
+                ],
+                "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a1"}], "edges": []},
+            },
+        }
+    )
+    graph = compile_workflow(doc)
+
+    class YieldingAdapter(FakeAdapter):
+        async def complete(self, request):
+            await asyncio.sleep(0)  # force interleaving between concurrent turns
+            return await super().complete(request)
+
+    adapter = YieldingAdapter(name="openai", responses=[_submit({"done": True})])
+    gateway = LLMGateway(
+        graph, {"openai": adapter},
+        secret_resolver=EnvSecretResolver({"RAVANA_SECRET_K1": "sk-one", "RAVANA_SECRET_K2": "sk-two"}),
+    )
+
+    async def both():
+        await asyncio.gather(
+            gateway.run_turn(run_id="r1", node_id="n1", attempt=1, agent_id="a1", shared_state={}),
+            gateway.run_turn(run_id="r1", node_id="n2", attempt=1, agent_id="a2", shared_state={}),
+        )
+
+    asyncio.run(both())
+    by_model = {r.model: r.api_key.value() for r in adapter.requests}
+    assert by_model == {"m1": "sk-one", "m2": "sk-two"}  # each turn kept its own credential
+
+
+def test_loader_boundary_never_exposes_pasted_secret_in_structured_errors(tmp_path):
+    # Review finding: hide_input_in_errors covers str(error) but pydantic's
+    # ValidationError.errors()/.json() still embed the raw input. The load
+    # boundary wraps validation failures in WorkflowValidationError — message
+    # only, no structured surface, no __cause__ back to the original.
+    from ravana.schema.loader import WorkflowValidationError, load_workflow_yaml as load
+
+    bad = tmp_path / "leaky.yaml"
+    bad.write_text(
+        """
+apiVersion: ravana/v1
+kind: Workflow
+metadata: {name: leaky, version: 1}
+spec:
+  agents:
+    - id: a
+      name: A
+      llm: {provider: openai, model: m, api_key_ref: sk-PASTED-IN-YAML}
+      system_prompt: p
+  graph: {entry: only, nodes: [{id: only, agent: a}], edges: []}
+"""
+    )
+    with pytest.raises(WorkflowValidationError) as exc_info:
+        load(bad)
+    err = exc_info.value
+    assert "sk-PASTED-IN-YAML" not in str(err)
+    assert not hasattr(err, "errors")  # no structured surface carrying raw input
+    # Both exception-chain links severed — raising OUTSIDE the except clears
+    # __context__ too (not just __cause__), so the pydantic ValidationError
+    # (whose .errors()/.json() still hold the raw input) is unreachable.
+    assert err.__cause__ is None
+    assert err.__context__ is None
+    assert "api_key_ref" in str(err)  # still names the offending field
+
+
+def test_api_key_ref_is_resolved_and_lands_in_the_request():
+    # §8c: the gateway resolves the pointer; the adapter's request carries the
+    # REAL key, never the secrets:// ref.
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    graph = _keyed_agent_graph("secrets://openai_key")
+    adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    gateway = LLMGateway(
+        graph, {"openai": adapter},
+        secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "sk-real-key"}),
+    )
+    _run(gateway, "a")
+    assert adapter.requests[0].api_key.value() == "sk-real-key"  # resolved value
+    assert "secrets://" not in adapter.requests[0].api_key.value()  # never the pointer
+
+
+def test_missing_llm_secret_fails_the_entry_permanently_and_falls_back():
+    # A ref that doesn't resolve is a config error: permanent for THIS entry
+    # (no same-entry retry, no backoff), but the fallback (different provider,
+    # no ref -> SDK env) still serves the turn.
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    graph = _keyed_agent_graph("secrets://missing_key", fallback={"provider": "anthropic", "model": "m2"})
+    primary = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    fallback = FakeAdapter(name="anthropic", responses=[_submit({"done": True})])
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(
+        graph, {"openai": primary, "anthropic": fallback},
+        retry_sleep=sleeper, secret_resolver=EnvSecretResolver({}),  # empty env: resolution fails
+    )
+    result = _run(gateway, "a")
+    assert result.structured_payload == {"done": True}
+    assert len(primary.requests) == 0  # the entry never reached its provider
+    assert len(fallback.requests) == 1  # fallback served the turn
+    assert sleeper.delays == []  # permanent: no backoff wasted
+
+
+def test_api_key_ref_with_no_resolver_wired_is_a_permanent_entry_failure():
+    # Declaring a ref without wiring a resolver is a config error — permanent
+    # ProviderError (chain-visible), not a raw crash. With no fallback, the
+    # whole chain ended permanently => hard error.
+    graph = _keyed_agent_graph("secrets://openai_key")
+    adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    gateway = LLMGateway(graph, {"openai": adapter})  # no secret_resolver
+    with pytest.raises(RuntimeError, match="failed permanently"):
+        _run(gateway, "a")
+    assert len(adapter.requests) == 0
+
+
+def test_empty_resolved_secret_fails_the_entry_not_swaps_credentials():
+    # An empty credential must never slip past truthiness gates and silently
+    # swap in the SDK's AMBIENT env key. The single contract is ResolvedSecret,
+    # whose constructor rejects empty — so a resolver attempting one raises at
+    # resolve, the gateway treats it as a permanent entry failure, and the
+    # fallback serves. No swapped credential ever reaches a provider.
+    from ravana.runtime.secrets import ResolvedSecret
+
+    class EmptyResolver:
+        def resolve(self, ref: str) -> ResolvedSecret:
+            return ResolvedSecret("")  # raises ValueError at construction
+
+    graph = _keyed_agent_graph("secrets://openai_key", fallback={"provider": "anthropic", "model": "m2"})
+    primary = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    fallback = FakeAdapter(name="anthropic", responses=[_submit({"done": True})])
+    sleeper = RecordingSleep()
+    gateway = LLMGateway(
+        graph, {"openai": primary, "anthropic": fallback}, retry_sleep=sleeper, secret_resolver=EmptyResolver()
+    )
+    result = _run(gateway, "a")
+    assert result.structured_payload == {"done": True}
+    assert len(primary.requests) == 0  # the entry never ran with a swapped credential
+    assert len(fallback.requests) == 1
+    assert sleeper.delays == []  # permanent: no backoff
+
+
+def test_env_resolver_rejects_set_but_empty_secret():
+    # Same class of bug at the source: EnvSecretResolver refuses an env var
+    # that is set but empty (covers toolkit auth_refs too, not just LLM keys).
+    from ravana.runtime.secrets import EnvSecretResolver, SecretNotFound
+
+    resolver = EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "   "})
+    with pytest.raises(SecretNotFound, match="set but empty"):
+        resolver.resolve("secrets://openai_key")
+
+
+def test_resolved_api_key_never_appears_in_request_repr():
+    # §8: secrets are never logged. Neither the request's dataclass repr nor
+    # the ResolvedSecret's own repr/str (debug logs, pytest assertion diffs)
+    # may carry the plaintext key.
+    from ravana.runtime.providers.base import UserMessage
+    from ravana.runtime.secrets import ResolvedSecret
+
+    secret = ResolvedSecret("sk-super-secret")
+    assert "sk-super-secret" not in repr(secret) and "sk-super-secret" not in str(secret)
+    request = ProviderRequest(model="m", system="s", messages=[UserMessage(text="x")], api_key=secret)
+    assert "sk-super-secret" not in repr(request)
+    assert "sk-super-secret" not in str(request)
+
+
+def test_resolved_secret_value_semantics():
+    # The value object centralizes the credential rules: empty rejected at
+    # construction; equality/hash by value (cache identity across
+    # re-resolution); .value() is the only plaintext access.
+    from ravana.runtime.secrets import ResolvedSecret
+
+    with pytest.raises(ValueError, match="empty"):
+        ResolvedSecret("")
+    with pytest.raises(ValueError, match="empty"):
+        ResolvedSecret("   ")
+    a, b = ResolvedSecret("sk-same"), ResolvedSecret("sk-same")
+    assert a == b and hash(a) == hash(b)  # value identity, not object identity
+    assert a != ResolvedSecret("sk-other")
+    assert a.value() == "sk-same"
+
+
+def test_key_is_resolved_fresh_each_dispatch_no_shared_memo():
+    # §8c "resolved at DISPATCH time": resolution is a per-entry-try local with
+    # NO gateway-level memo, so each dispatch re-reads the secret and a rotated
+    # credential is picked up on the next turn instead of being pinned for the
+    # gateway's lifetime (review finding).
+    from ravana.runtime.secrets import ResolvedSecret
+
+    graph = _keyed_agent_graph("secrets://openai_key")
+    calls: list[str] = []
+
+    class RotatingResolver:
+        def resolve(self, ref: str) -> ResolvedSecret:
+            calls.append(ref)
+            return ResolvedSecret(f"sk-generation-{len(calls)}")
+
+    adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    gateway = LLMGateway(graph, {"openai": adapter}, secret_resolver=RotatingResolver())
+    _run(gateway, "a")
+    assert calls == ["secrets://openai_key"]  # once for the first dispatch's single entry-try
+    _run(gateway, "a")
+    assert calls == ["secrets://openai_key"] * 2  # re-resolved fresh on the NEXT dispatch
+    assert adapter.requests[-1].api_key.value() == "sk-generation-2"  # rotation picked up
+
+
+def test_agent_without_api_key_ref_sends_no_key():
+    # No ref => request.api_key is None and the SDK's own env fallback applies
+    # (the P1c behavior, preserved through resolution).
+    graph = _keyed_agent_graph(None)
+    adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    gateway = LLMGateway(graph, {"openai": adapter})
+    _run(gateway, "a")
+    assert adapter.requests[0].api_key is None
+
+
+def test_fallback_entry_resolves_its_own_api_key_ref():
+    # Each chain entry carries its own ref; the fallback's key is resolved
+    # independently of the (failing) primary's.
+    from ravana.runtime.secrets import EnvSecretResolver
+
+    graph = _keyed_agent_graph(
+        "secrets://primary_key", fallback={"provider": "anthropic", "model": "m2", "api_key_ref": "secrets://fallback_key"}
+    )
+    primary = FakeAdapter(name="openai", fail=True, fail_retryable=False)
+    fallback = FakeAdapter(name="anthropic", responses=[_submit({"done": True})])
+    gateway = LLMGateway(
+        graph, {"openai": primary, "anthropic": fallback},
+        secret_resolver=EnvSecretResolver(
+            {"RAVANA_SECRET_PRIMARY_KEY": "sk-a", "RAVANA_SECRET_FALLBACK_KEY": "sk-b"}
+        ),
+    )
+    _run(gateway, "a")
+    assert primary.requests[0].api_key.value() == "sk-a"
+    assert fallback.requests[0].api_key.value() == "sk-b"
+
+
+def test_anthropic_adapter_builds_client_with_resolved_key(monkeypatch):
+    # The resolved key reaches AsyncAnthropic(api_key=...); distinct keys get
+    # distinct cached clients; a RE-resolved secret with the same value reuses
+    # the cache (ResolvedSecret hashes by value); None falls to the SDK env.
+    import anthropic
+
+    from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
+    from ravana.runtime.secrets import ResolvedSecret
+
+    made: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            made.append(kwargs)
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeClient)
+    adapter = AnthropicAdapter()
+    adapter._resolve_client(ResolvedSecret("sk-one"))
+    adapter._resolve_client(ResolvedSecret("sk-two"))
+    adapter._resolve_client(ResolvedSecret("sk-one"))  # NEW object, same value — cache hit
+    adapter._resolve_client(None)  # env fallback: no api_key kwarg
+    assert len(made) == 3
+    assert made[0]["api_key"] == "sk-one" and made[1]["api_key"] == "sk-two"
+    assert "api_key" not in made[2]
 
 
 def test_openai_missing_credential_is_normalized_and_falls_back(monkeypatch):
@@ -771,7 +1206,7 @@ def test_sdk_internal_retries_are_disabled(monkeypatch):
     monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeAnthropicClient)
     monkeypatch.setattr(openai, "AsyncOpenAI", FakeOpenAIClient)
 
-    AnthropicAdapter()._resolve_client()
+    AnthropicAdapter()._resolve_client(None)
     OpenAICompatibleAdapter(name="local")._resolve_client(
         ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a/v1")
     )
@@ -894,11 +1329,20 @@ def test_openai_adapter_caches_client_per_endpoint():
 
     orig = openai.AsyncOpenAI
     openai.AsyncOpenAI = FakeClient
+    from ravana.runtime.secrets import ResolvedSecret
+
+    def _req(endpoint: str, key: str) -> ProviderRequest:
+        # A fresh ResolvedSecret each call: the cache must hit on VALUE, not
+        # object identity, since each dispatch re-resolves the secret.
+        return ProviderRequest(
+            model="m", system="", messages=[UserMessage(text="x")], endpoint=endpoint, api_key=ResolvedSecret(key)
+        )
+
     try:
         adapter = OpenAICompatibleAdapter(name="local")  # no injected client -> lazy per-endpoint construction
-        adapter._resolve_client(ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a:11434/v1", api_key_ref="k1"))
-        adapter._resolve_client(ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://b:11434/v1", api_key_ref="k2"))
-        adapter._resolve_client(ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a:11434/v1", api_key_ref="k1"))
+        adapter._resolve_client(_req("http://a:11434/v1", "k1"))
+        adapter._resolve_client(_req("http://b:11434/v1", "k2"))
+        adapter._resolve_client(_req("http://a:11434/v1", "k1"))
     finally:
         openai.AsyncOpenAI = orig
 
@@ -908,7 +1352,7 @@ def test_openai_adapter_caches_client_per_endpoint():
 
 
 def test_hosted_openai_omits_api_key_so_sdk_reads_env():
-    # P1c: hosted OpenAI (no endpoint, no api_key_ref) must NOT get a dummy key
+    # P1c: hosted OpenAI (no endpoint, no per-agent key) must NOT get a dummy key
     # — passing one blocks the SDK's OPENAI_API_KEY fallback and misauthenticates.
     from ravana.runtime.providers.base import UserMessage
     from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
@@ -935,7 +1379,7 @@ def test_hosted_openai_omits_api_key_so_sdk_reads_env():
 
 
 def test_local_runtime_without_key_gets_placeholder():
-    # A local endpoint with no api_key_ref still needs a nonempty key for the
+    # A local endpoint with no per-agent key still needs a nonempty key for the
     # SDK; the placeholder is supplied only in that case (contrast P1c).
     from ravana.runtime.providers.base import UserMessage
     from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter

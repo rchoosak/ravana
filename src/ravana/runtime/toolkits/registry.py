@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from ravana.compiler.graph import CompiledGraph
-from ravana.runtime.secrets import SecretResolver
+from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.api_connector import ApiConnectorHandler
 from ravana.runtime.toolkits.base import ToolkitError, ToolkitHandler
 
@@ -52,17 +52,18 @@ def build_registry(
 
 
 def _auth_provider(resolver: SecretResolver, auth_ref: str | None):
-    """A memoized, dispatch-time credential provider closing over the resolver
-    and ref — the connector receives only this callable, resolving the secret
-    on first use (or never, if the toolkit is never called)."""
+    """A dispatch-time credential provider closing over the resolver and ref —
+    the connector receives only this callable and resolves ON EVERY CALL
+    (§8c "at dispatch time"): no handler-lifetime memo, so a rotated/expired
+    token is picked up on the next tool call, matching the LLM path. A run
+    whose path never touches this toolkit still never reads its secret.
+    Returns ResolvedSecret so the §8 invariants (non-empty, self-redacting,
+    redaction-registered) hold for toolkit tokens too."""
     if auth_ref is None:
         return lambda: None
-    cache: dict[str, str] = {}
 
-    def provider() -> str:
-        if "token" not in cache:
-            cache["token"] = resolver.resolve(auth_ref)
-        return cache["token"]
+    def provider() -> ResolvedSecret:
+        return resolver.resolve(auth_ref)
 
     return provider
 

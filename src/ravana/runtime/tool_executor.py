@@ -24,6 +24,7 @@ from typing import Any
 
 from ravana.runtime.providers.base import Tool
 from ravana.runtime.schema_validate import validate_json
+from ravana.runtime.secrets import redact_secrets
 from ravana.runtime.toolkits.base import ToolkitError, ToolkitHandler
 from ravana.schema.util import now_iso
 
@@ -88,7 +89,7 @@ class RavanaToolExecutor:
             result = await handler.call(arguments=arguments, idempotency_key=idempotency_key)
         except Exception as exc:  # noqa: BLE001 - record the failure, then re-raise for the gateway
             if side_effecting:
-                self._record(run_id, node_id, tool, idempotency_key, status="FAILED", error=str(exc))
+                self._record(run_id, node_id, tool, idempotency_key, status="FAILED", error=redact_secrets(str(exc)))
             raise
         if side_effecting:
             self._record(run_id, node_id, tool, idempotency_key, status="SUCCEEDED", result=result)

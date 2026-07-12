@@ -404,6 +404,28 @@ def test_registry_defers_code_interpreter_and_mcp(graph):
             asyncio.run(handlers[tid].call(arguments={}, idempotency_key="k"))
 
 
+def test_toolkit_token_is_reresolved_every_dispatch(graph):
+    # §8c "at dispatch time" for toolkits too (review finding: the old
+    # provider memoized for the handler's lifetime, so a rotated auth token
+    # was never picked up). Each call re-resolves; rotation lands immediately.
+    calls: list[int] = []
+
+    class RotatingResolver:
+        def resolve(self, ref: str):
+            calls.append(1)
+            from ravana.runtime.secrets import ResolvedSecret
+
+            return ResolvedSecret(f"token-gen-{len(calls)}")
+
+    fake = FakeHttpClient()
+    handlers = build_registry(graph, RotatingResolver(), clients={"git_connector": fake})
+    asyncio.run(handlers["git_connector"].call(arguments={"method": "GET", "path": "/a"}, idempotency_key="k1"))
+    asyncio.run(handlers["git_connector"].call(arguments={"method": "GET", "path": "/b"}, idempotency_key="k2"))
+    assert len(calls) == 2  # re-resolved per dispatch, not memoized for the handler's lifetime
+    assert fake.calls[0]["headers"]["Authorization"] == "Bearer token-gen-1"
+    assert fake.calls[1]["headers"]["Authorization"] == "Bearer token-gen-2"  # rotation picked up
+
+
 def test_missing_secret_raises_clearly():
     resolver = EnvSecretResolver({})  # empty env
     with pytest.raises(SecretNotFound, match="RAVANA_SECRET_GITHUB_PAT"):
