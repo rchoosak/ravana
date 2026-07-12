@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
+from ravana.runtime.secrets import ResolvedSecret
+
 
 class Capability(str, Enum):
     """§3.4's capability flags — an adapter declares which structured-output
@@ -85,11 +87,11 @@ class ProviderRequest:
     max_tokens: int | None = None
     endpoint: str | None = None
     # The RESOLVED credential (§8c: the gateway resolves `llm.api_key_ref`
-    # through the secret resolver at dispatch; adapters never see the pointer).
-    # None = no per-agent key — the SDK falls back to its own env var.
-    # repr=False: the plaintext key must not ride the dataclass repr into
-    # debug logs or pytest assertion diffs (§8: secrets never logged).
-    api_key: str | None = field(default=None, repr=False)
+    # through the secret resolver at dispatch; adapters never see the pointer,
+    # and ResolvedSecret self-redacts in repr so the plaintext cannot ride a
+    # debug log or pytest assertion diff — §8: secrets never logged). None =
+    # no per-agent key — the SDK falls back to its own env var.
+    api_key: ResolvedSecret | None = None
 
 
 @dataclass

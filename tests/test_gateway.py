@@ -728,6 +728,56 @@ def _keyed_agent_graph(api_key_ref: str | None, fallback: dict | None = None):
     return _one_agent_graph(llm, name="keyref-test")
 
 
+def test_raw_key_in_api_key_ref_is_rejected_at_schema():
+    # §8: api_key_ref is a POINTER. A pasted raw credential must fail at
+    # compile/validate — BEFORE persist.py ever writes it into the workflow
+    # tables — and the validation error must not echo the pasted value.
+    with pytest.raises(Exception) as exc_info:
+        _keyed_agent_graph("sk-PASTED-RAW-KEY")
+    assert "sk-PASTED-RAW-KEY" not in str(exc_info.value)  # never echoed back
+    assert "secrets://" in str(exc_info.value)  # points at the fix
+
+    # Fallback entries are validated too, not just the primary.
+    with pytest.raises(Exception):
+        _keyed_agent_graph("secrets://ok", fallback={"provider": "anthropic", "model": "m2", "api_key_ref": "sk-RAW"})
+
+
+def test_raw_key_in_toolkit_auth_ref_is_rejected_at_schema():
+    # Same §8 pointer rule for toolkit auth_refs.
+    from ravana.schema.models import ToolkitConfig
+
+    with pytest.raises(Exception) as exc_info:
+        ToolkitConfig(id="t", type="api_connector", auth_ref="ghp_PASTED-RAW-TOKEN")
+    assert "ghp_PASTED-RAW-TOKEN" not in str(exc_info.value)
+
+
+def test_resolver_exception_text_never_reaches_db_or_stderr(con, capsys):
+    # §8: a misbehaving resolver may put the SECRET ITSELF in its exception
+    # text. The gateway's fixed-shape error (ref + exception type only) must
+    # keep that text out of node_execution.error and the stderr log stream.
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+
+    class LeakyResolver:
+        def resolve(self, ref: str) -> str:
+            raise RuntimeError("resolver dump: sk-THE-ACTUAL-SECRET-VALUE")
+
+    graph = _keyed_agent_graph("secrets://openai_key")  # no fallback: chain ends permanent
+    adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
+    gateway = LLMGateway(graph, {"openai": adapter}, secret_resolver=LeakyResolver())
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    run_id = asyncio.run(start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id))
+
+    run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"  # permanent chain -> failed cleanly
+    errors = [r["error"] or "" for r in con.execute("SELECT error FROM node_execution WHERE run_id = ?", (run_id,))]
+    assert all("sk-THE-ACTUAL-SECRET-VALUE" not in e for e in errors)  # never persisted
+    assert any("secrets://openai_key" in e and "RuntimeError" in e for e in errors)  # still debuggable
+    captured = capsys.readouterr()
+    assert "sk-THE-ACTUAL-SECRET-VALUE" not in captured.err  # never logged
+    assert "sk-THE-ACTUAL-SECRET-VALUE" not in captured.out
+
+
 def test_api_key_ref_is_resolved_and_lands_in_the_request():
     # §8c: the gateway resolves the pointer; the adapter's request carries the
     # REAL key, never the secrets:// ref.
@@ -740,8 +790,8 @@ def test_api_key_ref_is_resolved_and_lands_in_the_request():
         secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "sk-real-key"}),
     )
     _run(gateway, "a")
-    assert adapter.requests[0].api_key == "sk-real-key"  # resolved value
-    assert "secrets://" not in (adapter.requests[0].api_key or "")  # never the pointer
+    assert adapter.requests[0].api_key.value() == "sk-real-key"  # resolved value
+    assert "secrets://" not in adapter.requests[0].api_key.value()  # never the pointer
 
 
 def test_missing_llm_secret_fails_the_entry_permanently_and_falls_back():
@@ -811,30 +861,55 @@ def test_env_resolver_rejects_set_but_empty_secret():
 
 
 def test_resolved_api_key_never_appears_in_request_repr():
-    # §8: secrets are never logged. The dataclass repr (debug logs, pytest
-    # assertion diffs) must not carry the resolved plaintext key.
+    # §8: secrets are never logged. Neither the request's dataclass repr nor
+    # the ResolvedSecret's own repr/str (debug logs, pytest assertion diffs)
+    # may carry the plaintext key.
     from ravana.runtime.providers.base import UserMessage
+    from ravana.runtime.secrets import ResolvedSecret
 
-    request = ProviderRequest(model="m", system="s", messages=[UserMessage(text="x")], api_key="sk-super-secret")
+    secret = ResolvedSecret("sk-super-secret")
+    assert "sk-super-secret" not in repr(secret) and "sk-super-secret" not in str(secret)
+    request = ProviderRequest(model="m", system="s", messages=[UserMessage(text="x")], api_key=secret)
     assert "sk-super-secret" not in repr(request)
     assert "sk-super-secret" not in str(request)
 
 
-def test_resolved_keys_are_memoized_per_ref():
-    # The secret is read once per ref, not once per turn.
+def test_resolved_secret_value_semantics():
+    # The value object centralizes the credential rules: empty rejected at
+    # construction; equality/hash by value (cache identity across
+    # re-resolution); .value() is the only plaintext access.
+    from ravana.runtime.secrets import ResolvedSecret
+
+    with pytest.raises(ValueError, match="empty"):
+        ResolvedSecret("")
+    with pytest.raises(ValueError, match="empty"):
+        ResolvedSecret("   ")
+    a, b = ResolvedSecret("sk-same"), ResolvedSecret("sk-same")
+    assert a == b and hash(a) == hash(b)  # value identity, not object identity
+    assert a != ResolvedSecret("sk-other")
+    assert a.value() == "sk-same"
+
+
+def test_resolved_keys_are_memoized_per_dispatch_not_per_process():
+    # §8c "resolved at DISPATCH time": within one turn (repair loop => several
+    # request builds) the secret is read once, but each new dispatch
+    # re-resolves — so a rotated credential is picked up on the next turn
+    # instead of being pinned for the gateway's lifetime (review finding).
     graph = _keyed_agent_graph("secrets://openai_key")
     calls: list[str] = []
 
     class CountingResolver:
         def resolve(self, ref: str) -> str:
             calls.append(ref)
-            return "sk-once"
+            return f"sk-generation-{len(calls)}"
 
     adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
     gateway = LLMGateway(graph, {"openai": adapter}, secret_resolver=CountingResolver())
     _run(gateway, "a")
+    assert calls == ["secrets://openai_key"]  # once within the first dispatch
     _run(gateway, "a")
-    assert calls == ["secrets://openai_key"]  # resolved exactly once
+    assert calls == ["secrets://openai_key"] * 2  # re-resolved on the NEXT dispatch
+    assert adapter.requests[-1].api_key.value() == "sk-generation-2"  # rotation picked up
 
 
 def test_agent_without_api_key_ref_sends_no_key():
@@ -864,16 +939,18 @@ def test_fallback_entry_resolves_its_own_api_key_ref():
         ),
     )
     _run(gateway, "a")
-    assert primary.requests[0].api_key == "sk-a"
-    assert fallback.requests[0].api_key == "sk-b"
+    assert primary.requests[0].api_key.value() == "sk-a"
+    assert fallback.requests[0].api_key.value() == "sk-b"
 
 
 def test_anthropic_adapter_builds_client_with_resolved_key(monkeypatch):
     # The resolved key reaches AsyncAnthropic(api_key=...); distinct keys get
-    # distinct cached clients; None falls back to the SDK env default.
+    # distinct cached clients; a RE-resolved secret with the same value reuses
+    # the cache (ResolvedSecret hashes by value); None falls to the SDK env.
     import anthropic
 
     from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
+    from ravana.runtime.secrets import ResolvedSecret
 
     made: list[dict[str, Any]] = []
 
@@ -883,9 +960,9 @@ def test_anthropic_adapter_builds_client_with_resolved_key(monkeypatch):
 
     monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeClient)
     adapter = AnthropicAdapter()
-    adapter._resolve_client("sk-one")
-    adapter._resolve_client("sk-two")
-    adapter._resolve_client("sk-one")  # cached — no third construction
+    adapter._resolve_client(ResolvedSecret("sk-one"))
+    adapter._resolve_client(ResolvedSecret("sk-two"))
+    adapter._resolve_client(ResolvedSecret("sk-one"))  # NEW object, same value — cache hit
     adapter._resolve_client(None)  # env fallback: no api_key kwarg
     assert len(made) == 3
     assert made[0]["api_key"] == "sk-one" and made[1]["api_key"] == "sk-two"
@@ -1070,11 +1147,20 @@ def test_openai_adapter_caches_client_per_endpoint():
 
     orig = openai.AsyncOpenAI
     openai.AsyncOpenAI = FakeClient
+    from ravana.runtime.secrets import ResolvedSecret
+
+    def _req(endpoint: str, key: str) -> ProviderRequest:
+        # A fresh ResolvedSecret each call: the cache must hit on VALUE, not
+        # object identity, since each dispatch re-resolves the secret.
+        return ProviderRequest(
+            model="m", system="", messages=[UserMessage(text="x")], endpoint=endpoint, api_key=ResolvedSecret(key)
+        )
+
     try:
         adapter = OpenAICompatibleAdapter(name="local")  # no injected client -> lazy per-endpoint construction
-        adapter._resolve_client(ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a:11434/v1", api_key="k1"))
-        adapter._resolve_client(ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://b:11434/v1", api_key="k2"))
-        adapter._resolve_client(ProviderRequest(model="m", system="", messages=[UserMessage(text="x")], endpoint="http://a:11434/v1", api_key="k1"))
+        adapter._resolve_client(_req("http://a:11434/v1", "k1"))
+        adapter._resolve_client(_req("http://b:11434/v1", "k2"))
+        adapter._resolve_client(_req("http://a:11434/v1", "k1"))
     finally:
         openai.AsyncOpenAI = orig
 

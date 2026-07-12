@@ -29,6 +29,7 @@ from ravana.runtime.providers.base import (
     ProviderRequest,
     ProviderResponse,
 )
+from ravana.runtime.secrets import ResolvedSecret
 
 # Model families that 400 on non-default temperature/top_p/top_k (claude-api
 # reference: removed on Fable 5 / Opus 4.8 / 4.7 / Sonnet 5). Matched by prefix
@@ -51,12 +52,14 @@ class AnthropicAdapter:
 
     def __init__(self, client: Any | None = None):
         self._explicit_client = client  # an injected client (tests) is used verbatim
-        # Real clients cached per resolved api_key (None = the SDK's own
+        # Real clients cached per ResolvedSecret (None = the SDK's own
         # ANTHROPIC_API_KEY env fallback), mirroring the OpenAI adapter — two
         # agents may hold different per-agent credentials (§1.4/§8c).
-        self._clients: dict[str | None, Any] = {}
+        # ResolvedSecret hashes by value, so re-resolution of the same key
+        # reuses the cached client.
+        self._clients: dict[ResolvedSecret | None, Any] = {}
 
-    def _resolve_client(self, api_key: str | None) -> Any:
+    def _resolve_client(self, api_key: ResolvedSecret | None) -> Any:
         if self._explicit_client is not None:
             return self._explicit_client
         if api_key not in self._clients:
@@ -67,10 +70,10 @@ class AnthropicAdapter:
             # per-entry retry — up to 6 HTTP attempts per entry — and its
             # sleeps bypass the injected backoff waiter entirely.
             kwargs: dict[str, Any] = {"max_retries": 0}
-            if api_key:
+            if api_key is not None:
                 # §8c: already resolved by the gateway from llm.api_key_ref —
                 # this adapter never sees the pointer, only the credential.
-                kwargs["api_key"] = api_key
+                kwargs["api_key"] = api_key.value()
             self._clients[api_key] = anthropic.AsyncAnthropic(**kwargs)
         return self._clients[api_key]
 

@@ -64,10 +64,11 @@ class OpenAICompatibleAdapter:
             kwargs: dict[str, Any] = {"max_retries": 0}
             if request.endpoint:
                 kwargs["base_url"] = request.endpoint  # routes to Ollama/vLLM/etc.
-            if request.api_key:
+            if request.api_key is not None:
                 # §8c: already resolved by the gateway from llm.api_key_ref —
-                # this adapter never sees the pointer, only the credential.
-                kwargs["api_key"] = request.api_key
+                # this adapter never sees the pointer; ResolvedSecret
+                # guarantees non-empty and self-redacts everywhere else.
+                kwargs["api_key"] = request.api_key.value()
             elif request.endpoint:
                 # A local runtime usually requires a nonempty key but ignores
                 # its value — supply a placeholder so the SDK doesn't error.

@@ -33,7 +33,7 @@ from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgen
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
-from ravana.runtime.secrets import SecretResolver
+from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.providers.base import (
     AssistantMessage,
@@ -164,7 +164,7 @@ class LLMGateway:
         # only ever receive the resolved value. None is fine for workflows
         # whose agents declare no api_key_ref (SDK env vars serve them).
         self._secret_resolver = secret_resolver
-        self._api_keys_by_ref: dict[str, str] = {}
+        self._api_keys_by_ref: dict[str, ResolvedSecret] = {}
         # §3.4: strategy is decided once per (provider, model), not re-derived
         # every call. Capabilities are static, so this memo is the "decided at
         # registration" contract without a separate registration step.
@@ -180,12 +180,20 @@ class LLMGateway:
             raise ProviderError(f"no adapter registered for provider '{provider}'", retryable=False)
         return adapter
 
-    def _resolve_api_key(self, llm: LLMConfig) -> str | None:
+    def _resolve_api_key(self, llm: LLMConfig) -> ResolvedSecret | None:
         """§8c: turn the entry's `api_key_ref` pointer into the real key,
-        memoized per ref. A resolution failure is a config error, permanent
-        BY ENTRY (a retry can't conjure the secret) — but the next fallback
-        entry may use a different ref/provider, so it raises ProviderError
-        (chain moves on) rather than a hard error."""
+        memoized per DISPATCH (run_turn clears the memo, so a rotated secret
+        is picked up on the next turn — "resolved at dispatch time" means each
+        dispatch, not once per process). A resolution failure is a config
+        error, permanent BY ENTRY (a retry can't conjure the secret) — but the
+        next fallback entry may use a different ref/provider, so it raises
+        ProviderError (chain moves on) rather than a hard error.
+
+        Error messages are deliberately FIXED-SHAPE: they carry the ref (a
+        schema-enforced `secrets://` pointer, safe to echo) and the exception
+        TYPE — never the exception text, which a misbehaving resolver could
+        fill with the secret itself. These messages end up in
+        node_execution.error and stderr logs (§8: secrets never persisted)."""
         ref = llm.api_key_ref
         if ref is None:
             return None  # no per-agent key: the SDK's own env var serves this entry
@@ -195,16 +203,15 @@ class LLMGateway:
                     f"llm.api_key_ref '{ref}' declared but no secret resolver is wired", retryable=False
                 )
             try:
-                resolved = self._secret_resolver.resolve(ref)
+                # ResolvedSecret validates non-empty at construction and
+                # self-redacts in repr — a custom resolver returning "" must
+                # not slip past the adapters' truthiness gates and silently
+                # swap in the SDK's ambient env credential.
+                self._api_keys_by_ref[ref] = ResolvedSecret(self._secret_resolver.resolve(ref))
             except Exception as exc:  # noqa: BLE001 - resolution failure is a permanent entry failure
-                raise ProviderError(f"resolving llm.api_key_ref '{ref}' failed: {exc}", retryable=False) from exc
-            if not resolved or not resolved.strip():
-                # Defense in depth (EnvSecretResolver already rejects empty): a
-                # custom resolver returning "" must not slip past the adapters'
-                # truthiness gates and silently swap in the SDK's ambient env
-                # credential — fail the entry like a missing secret.
-                raise ProviderError(f"llm.api_key_ref '{ref}' resolved to an empty value", retryable=False)
-            self._api_keys_by_ref[ref] = resolved
+                raise ProviderError(
+                    f"resolving llm.api_key_ref '{ref}' failed ({type(exc).__name__})", retryable=False
+                ) from exc
         return self._api_keys_by_ref[ref]
 
     def _strategy_for(self, adapter: ProviderAdapter, model: str) -> _Strategy:
@@ -225,6 +232,13 @@ class LLMGateway:
         agent = self._graph.agents_by_id[agent_id]
         system = assemble_system_prompt(agent, self._graph.skills_by_id, shared_state)
         output_schema = agent.output_schema or _ANY_OBJECT_SCHEMA
+
+        # §8c "resolved at DISPATCH time": the key memo lives for ONE turn —
+        # within a turn (repair loop, tool round-trips, same-entry retries) the
+        # secret is read once, but the next dispatch re-resolves, so a rotated
+        # or expired credential is picked up between turns/HITL resumes rather
+        # than pinned for the gateway's lifetime.
+        self._api_keys_by_ref.clear()
 
         # §3.6: try the primary llm, then each fallback entry, each with its
         # own small retry budget (default 1 retry per entry — distinct from,
@@ -311,16 +325,26 @@ class LLMGateway:
             run_id=run_id, node_id=node_id, agent=agent, llm=llm, adapter=adapter, system=system, output_schema=output_schema
         )
 
-    def _request_for(self, llm: LLMConfig, *, system: str, messages: list[Message], **extras: Any) -> ProviderRequest:
+    def _request_for(
+        self,
+        llm: LLMConfig,
+        *,
+        system: str,
+        messages: list[Message],
+        tools: list[Tool] | None = None,
+        force_tool: str | None = None,
+        output_schema: dict[str, Any] | None = None,
+    ) -> ProviderRequest:
         """One place that turns an LLMConfig entry into a ProviderRequest —
         the llm-derived fields (model/sampling/endpoint/resolved key, §8c)
-        travel together; per-call shape (tools, force_tool, output_schema)
-        rides in `extras`."""
+        travel together; the per-call shape is the three explicit, type-checked
+        options: `tools`+`force_tool` (the tool loop) or `output_schema`
+        (guided one-shot)."""
         return ProviderRequest(
             model=llm.model, system=system, messages=messages,
             temperature=llm.temperature, max_tokens=llm.max_tokens,
             endpoint=llm.endpoint, api_key=self._resolve_api_key(llm),
-            **extras,
+            tools=tools or [], force_tool=force_tool, output_schema=output_schema,
         )
 
     async def _run_guided(self, *, node_id, llm, adapter, system, output_schema):
