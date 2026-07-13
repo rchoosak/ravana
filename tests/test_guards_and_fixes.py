@@ -257,8 +257,49 @@ def test_negative_node_usage_cannot_bypass_the_cost_cap(con):
     run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
     assert run["status"] == "FAILED"
     ne = con.execute("SELECT * FROM node_execution WHERE run_id = ?", (run_id,)).fetchone()
-    assert "invalid token usage" in ne["error"]
+    assert "token usage" in ne["error"]
     assert ne["input_tokens"] >= 0  # the -100 was never persisted (no poisoned total)
+
+
+def test_persistence_uses_validated_snapshot_not_reread_raw_tokens(con):
+    # TOCTOU: a hostile runtime result whose input_tokens reads 0 at the cap
+    # check and -100 at persistence must not get -100 into the DB. The engine
+    # snapshots a trusted AgentTurnResult once and persists THAT, so a later
+    # node/gate can't see a poisoned negative total and slip the cap.
+    class _TocTouTurn:
+        structured_payload: dict = {}
+        content = None
+        tool_calls: list = []
+        output_tokens = 0
+        repair_count = 0
+        tool_call_count = 0
+
+        def __init__(self):
+            self._reads = 0
+
+        @property
+        def input_tokens(self):
+            self._reads += 1
+            return 0 if self._reads == 1 else -100  # valid on the check, poisoned after
+
+    class _TocTouRuntime:
+        def __init__(self):
+            self._turn = _TocTouTurn()
+
+        async def run_turn(self, **kwargs):
+            return self._turn
+
+        async def aclose(self):
+            return None
+
+    graph = compile_workflow(_single_node_workflow())
+    graph.doc.spec.graph.guards.max_tokens_total = 10
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    run_id = asyncio.run(start_run(con, graph, _TocTouRuntime(), org_id="test", workflow_id=workflow_id))
+    total = con.execute(
+        "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS t FROM node_execution WHERE run_id = ?", (run_id,)
+    ).fetchone()["t"]
+    assert total == 0  # the validated first read (0), never the -100 re-read — no poisoned total
 
 
 def test_tool_calls_get_a_stable_idempotency_key(con):

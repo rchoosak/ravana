@@ -542,13 +542,32 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
         shared_state = _commit_state(ctx, shared_state, node_execution_id, "COMMIT", from_node=node_id, delta=on_enter_delta)
 
     try:
-        result = await ctx.runtime.run_turn(
+        raw = await ctx.runtime.run_turn(
             run_id=ctx.run_id,
             node_id=node_id,
             attempt=attempt,
             logical_visit_id=logical_visit_id,
             agent_id=agent.id,
             shared_state=shared_state,
+        )
+        # TOCTOU defense (§9 cost-cap integrity): read each field of the
+        # (possibly hostile/duck-typed) runtime result EXACTLY ONCE into a
+        # trusted, plain AgentTurnResult. The secret gate, the within-turn
+        # guards, the cost cap, and persistence ALL read this snapshot — so a
+        # result that reports one value at a check and another at use-time
+        # (probe: input_tokens reads 0 at the cap check, then -100 at the DB
+        # write) can't slip a poisoned/unchecked value past the boundary.
+        # Tokens are validated as non-negative ints here (they feed the hard
+        # cost cap); a bad value raises → caught below → the node fails closed.
+        node_usage = LLMUsage(raw.input_tokens, raw.output_tokens)
+        result = AgentTurnResult(
+            structured_payload=raw.structured_payload,
+            content=raw.content,
+            tool_calls=list(raw.tool_calls or []),
+            input_tokens=node_usage.input_tokens,
+            output_tokens=node_usage.output_tokens,
+            repair_count=raw.repair_count,
+            tool_call_count=raw.tool_call_count,
         )
         ensure_secret_free(
             {
@@ -597,21 +616,10 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
         _fail_run(ctx, node_id, f"node '{node_id}' failed: {exc}")
         return
 
-    # §9 cost-cap integrity: validate the turn's token usage the SAME way the
-    # DoD gate validates the judgement's. A node reporting a non-int/negative
-    # count would poison _total_tokens() and let the run slip its hard cap
-    # (probe: node reports -100 tokens, the cap never trips). Rebuild through
-    # LLMUsage; a bad count is a non-transient turn failure, failed CLOSED
-    # WITHOUT persisting the poisoned number (result omitted → no token write).
-    try:
-        node_usage = LLMUsage(result.input_tokens, result.output_tokens)
-    except (ValueError, TypeError):
-        _fail_run(ctx, node_id, f"node '{node_id}' reported invalid token usage", logical_visit_id=logical_visit_id)
-        return
-
     # §3.4's within-turn guards and §9's cost cap are decided before the
     # durability transaction. A rejected turn is still recorded for audit,
-    # but its delta never reaches shared state or routing.
+    # but its delta never reaches shared state or routing. All reads below are
+    # of the trusted snapshot built above, never the live runtime result.
     if result.tool_call_count > guards.max_tool_calls_per_turn:
         _fail_run(
             ctx,
@@ -630,7 +638,7 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
             logical_visit_id=logical_visit_id,
         )
         return
-    projected_tokens = _total_tokens(con, ctx.run_id) + node_usage.total
+    projected_tokens = _total_tokens(con, ctx.run_id) + result.input_tokens + result.output_tokens
     if guards.max_tokens_total is not None and projected_tokens > guards.max_tokens_total:
         _fail_run(
             ctx,
