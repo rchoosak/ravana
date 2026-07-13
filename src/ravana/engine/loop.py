@@ -22,7 +22,7 @@ import asyncio
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from ravana.compiler.graph import TERMINAL, CompiledGraph
 from ravana.engine.dod import DodResult, ProseVerdict, evaluate_dod
@@ -333,6 +333,32 @@ async def _finalize_status(ctx: _RunCtx) -> None:
     ctx.con.commit()
 
 
+# §3.1 step 7: the reserved node_execution.node_id under which a prose DoD
+# judgement's token usage is recorded, so it counts in _total_tokens / the
+# run's cost cap / §9's node_execution cost dashboards. Not a real graph node
+# (node_execution.node_id is free TEXT, no FK), so it never collides with one.
+_DOD_NODE_ID = "__dod__"
+
+
+def _record_dod_execution(ctx: _RunCtx, judgement: ProseJudgement) -> None:
+    """Record a prose judgement's LLM token usage as a node_execution row so it
+    enters the same accounting every node turn does (§9). Keyed idempotently on
+    (run_id, `__dod__`, attempt=1); the gate runs once at the terminal, so one
+    row per run. Reading `judgement.usage` here (inside the gate's try) also
+    doubles as the malformed-judgement guard — a None/garbled verdict raises and
+    fails the run closed rather than stranding it."""
+    now = now_iso()
+    ctx.con.execute(
+        """INSERT OR REPLACE INTO node_execution
+               (id, run_id, node_id, attempt, logical_visit_id, status, input_tokens, output_tokens, started_at, finished_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (
+            new_id(), ctx.run_id, _DOD_NODE_ID, 1, "", "SUCCEEDED",
+            judgement.usage.input_tokens, judgement.usage.output_tokens, now, now,
+        ),
+    )
+
+
 async def _dod_gate(ctx: _RunCtx) -> str:
     """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
     definition_of_done is met, else FAILs. Expression criteria are enforced
@@ -350,33 +376,40 @@ async def _dod_gate(ctx: _RunCtx) -> str:
     state = ctx.load_shared_state()
     result = evaluate_dod(dod, state)  # pure/sync — expressions only
     prose = result.prose_criteria
-    if prose and ctx.dod_prose_verdict is not None:
-        # The verdict runs an agent turn, and this gate executes in
-        # _finalize_status — outside _dispatch's failure boundary. A verdict that
-        # RAISES (provider down, repair budget exhausted) must not escape and
-        # strand the run at RUNNING; fail closed and record the durable cause.
-        try:
-            judgement = await ctx.dod_prose_verdict(dod.evaluated_by, prose, state)
-        except Exception as exc:  # noqa: BLE001
-            return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=str(exc), status="FAILED")
-        # §3.6 cost cap: judgement tokens count toward the run's hard ceiling. A
-        # judgement that pushes the run past max_tokens_total FAILs it rather
-        # than COMPLETEs — the same rule node dispatch enforces at commit.
-        projected = _total_tokens(ctx.con, ctx.run_id) + judgement.input_tokens + judgement.output_tokens
-        if guards.max_tokens_total is not None and projected > guards.max_tokens_total:
-            return _finish_dod(
-                ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=judgement,
-                detail=f"DoD judgement pushed the run to {projected} tokens, over max_tokens_total ({guards.max_tokens_total})",
-            )
-        result.apply_prose_verdict(judgement.verdicts)
+    if not (prose and ctx.dod_prose_verdict is not None):
         return _finish_dod(
             ctx, dod, result, outcome="met" if result.met else "criteria_unmet",
-            status="COMPLETED" if result.met else "FAILED", usage=judgement,
+            status="COMPLETED" if result.met else "FAILED",
+        )
+    # A prose judgement runs an agent turn, and this gate executes in
+    # _finalize_status — OUTSIDE _dispatch's failure boundary. The whole
+    # obtain→record→meter→apply block is wrapped: a verdict that raises, OR
+    # returns something malformed (None, a bad usage count), must fail the run
+    # CLOSED with a durable cause — never escape and strand it at RUNNING.
+    try:
+        judgement = await ctx.dod_prose_verdict(dod.evaluated_by, prose, state)
+        # Record the judgement's tokens as a node_execution row so _total_tokens
+        # (and §9's node_execution cost dashboards) count them, then meter the
+        # run's hard cap against that updated total — a judgement can't slip a
+        # run past max_tokens_total, and its spend isn't invisible to billing.
+        _record_dod_execution(ctx, judgement)
+        over_cap = guards.max_tokens_total is not None and _total_tokens(ctx.con, ctx.run_id) > guards.max_tokens_total
+        if not over_cap:
+            result.apply_prose_verdict(judgement.verdicts)
+    except Exception as exc:  # noqa: BLE001 - fail closed; persist the error CLASS, never its (possibly secret-bearing) text
+        return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
+    if over_cap:
+        return _finish_dod(
+            ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=judgement,
+            detail=f"DoD judgement's {judgement.usage.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
         )
     return _finish_dod(
         ctx, dod, result, outcome="met" if result.met else "criteria_unmet",
-        status="COMPLETED" if result.met else "FAILED",
+        status="COMPLETED" if result.met else "FAILED", usage=judgement,
     )
+
+
+DodOutcome = Literal["met", "criteria_unmet", "evaluator_error", "cost_cap_exceeded"]
 
 
 def _finish_dod(
@@ -384,7 +417,7 @@ def _finish_dod(
     dod: DefinitionOfDone,
     result: DodResult,
     *,
-    outcome: str,
+    outcome: DodOutcome,
     status: str,
     detail: str | None = None,
     usage: ProseJudgement | None = None,
@@ -395,7 +428,7 @@ def _finish_dod(
     return the run status. Centralizes the single-log-per-gate invariant."""
     state_diff: dict[str, Any] = {"outcome": outcome, **result.as_dict()}
     if usage is not None:
-        state_diff["usage"] = {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
+        state_diff["usage"] = {"input_tokens": usage.usage.input_tokens, "output_tokens": usage.usage.output_tokens}
     if detail is not None:
         # §8 backstop: the cause ends up in the persisted event; the gateway's
         # errors are fixed-shape and secret-free by construction, but redact as

@@ -12,11 +12,13 @@ import asyncio
 import json
 from typing import Any, Callable
 
+import pytest
+
 from ravana.compiler.graph import compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.engine.dod import evaluate_dod
 from ravana.engine.loop import start_run
-from ravana.runtime.base import ProseJudgement
+from ravana.runtime.base import LLMUsage, ProseJudgement
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.schema.models import DefinitionOfDone, WorkflowDoc
 
@@ -251,18 +253,23 @@ def test_engine_prose_verdict_receives_evaluated_by_and_final_state(con):
 
 def test_dod_event_records_judgement_usage(con):
     async def verdict(evaluated_by, criteria, state):
-        return ProseJudgement(verdicts=[True for _ in criteria], input_tokens=40, output_tokens=12)
+        return ProseJudgement(verdicts=[True for _ in criteria], usage=LLMUsage(input_tokens=40, output_tokens=12))
 
     run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
     usage = json.loads(_dod_event(con, run_id)["state_diff"])["usage"]
     assert usage == {"input_tokens": 40, "output_tokens": 12}
+    # And it is recorded as a node_execution row so _total_tokens counts it.
+    total = con.execute(
+        "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS t FROM node_execution WHERE run_id = ?", (run_id,)
+    ).fetchone()["t"]
+    assert total >= 52
 
 
 def test_dod_judgement_usage_is_metered_against_max_tokens_total(con):
     # A judgement whose tokens push the run over guards.max_tokens_total FAILs
     # the run (cost cap), even though every criterion was judged met.
     async def verdict(evaluated_by, criteria, state):
-        return ProseJudgement(verdicts=[True for _ in criteria], input_tokens=100, output_tokens=100)
+        return ProseJudgement(verdicts=[True for _ in criteria], usage=LLMUsage(input_tokens=100, output_tokens=100))
 
     run_id = _start_with_verdict(
         con, _dod_workflow(["a prose criterion"], guards={"max_tokens_total": 10}),
@@ -271,3 +278,34 @@ def test_dod_judgement_usage_is_metered_against_max_tokens_total(con):
     run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
     assert run["status"] == "FAILED"
     assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "cost_cap_exceeded"
+
+
+def test_malformed_judge_returning_none_fails_closed_not_stranded(con):
+    # A runtime that returns None (not a ProseJudgement) must FAIL the run with a
+    # durable cause — never throw past the gate and strand it at RUNNING.
+    async def verdict(evaluated_by, criteria, state):
+        return None
+
+    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED" and run["ended_at"] is not None
+    assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "evaluator_error"
+
+
+def test_negative_usage_verdict_fails_closed(con):
+    # A judge reporting negative tokens (to duck the cost cap) can't even
+    # construct its ProseJudgement — LLMUsage rejects it — so the run FAILs
+    # rather than metering a negative into the total.
+    async def verdict(evaluated_by, criteria, state):
+        return ProseJudgement(verdicts=[True], usage=LLMUsage(input_tokens=-100, output_tokens=0))
+
+    run_id = _start_with_verdict(
+        con, _dod_workflow(["a prose criterion"], guards={"max_tokens_total": 10}),
+        {"qa_status": "PASS"}, None, raw=verdict,
+    )
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "FAILED"
+
+
+def test_llm_usage_rejects_negative_tokens():
+    with pytest.raises(ValueError, match="non-negative"):
+        LLMUsage(input_tokens=-1, output_tokens=0)

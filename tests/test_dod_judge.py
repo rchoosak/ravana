@@ -140,7 +140,34 @@ def test_judge_prose_duplicate_index_fails_closed():
 def test_judge_prose_carries_token_usage():
     adapter = FakeAdapter(responses=[_verdict([{"index": 0, "met": True}], input_tokens=30, output_tokens=8)])
     out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
-    assert out.verdicts == [True] and out.input_tokens == 30 and out.output_tokens == 8
+    assert out.verdicts == [True] and out.usage.input_tokens == 30 and out.usage.output_tokens == 8
+
+
+def test_judge_prose_usage_accumulates_across_repairs():
+    # Tokens from an attempt that turned out invalid are NOT lost — the
+    # judgement's usage is the sum across the whole logical judgement.
+    bad = _verdict_call({"wrong": "shape"}, input_tokens=50, output_tokens=10)
+    good = _verdict([{"index": 0, "met": True}], input_tokens=53, output_tokens=17)
+    adapter = FakeAdapter(responses=[bad, good])
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert out.verdicts == [True]
+    assert out.usage.input_tokens == 103 and out.usage.output_tokens == 27
+
+
+def test_judge_prose_multiple_submit_verdict_is_fail_closed():
+    # Two submit_verdict calls in one response (first true, second false) must
+    # NOT last-write-wins or take-first — it's ambiguous, so repair, then (here)
+    # exhaust and raise. Never a silent [True].
+    two = ProviderResponse(
+        text="",
+        tool_calls=[
+            NormalizedToolCall(id="a", tool=SUBMIT_VERDICT, arguments={"verdicts": [{"index": 0, "met": True}]}),
+            NormalizedToolCall(id="b", tool=SUBMIT_VERDICT, arguments={"verdicts": [{"index": 0, "met": False}]}),
+        ],
+    )
+    adapter = FakeAdapter(responses=[two])
+    with pytest.raises(AgentOutputError):
+        asyncio.run(LLMGateway(_judge_graph(), {"anthropic": adapter}).judge_prose("pm", ["c0"], {}))
 
 
 # --- config error, repair, fallback ----------------------------------------

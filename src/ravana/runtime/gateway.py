@@ -25,12 +25,12 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ravana.compiler.graph import CompiledGraph, NodeExecutionContract
 from ravana.runtime.backoff import RetrySleep, backoff_delay
-from ravana.runtime.base import AgentOutputError, AgentTurnResult, ProseJudgement, TransientAgentError
+from ravana.runtime.base import AgentOutputError, AgentTurnResult, LLMUsage, ProseJudgement, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
@@ -161,6 +161,17 @@ class _Strategy:
     use_guided: bool
     use_native_forced_tool: bool
     # If neither of the above, the only lever left is the repair loop.
+
+
+@dataclass
+class _JudgeState:
+    """Judgement-scoped accumulator shared across a prose judgement's fallback
+    entries (§3.1 step 7): token usage that must survive a failed attempt, and
+    a single `max_output_repairs` budget for the whole judgement rather than one
+    reset per entry."""
+
+    usage: LLMUsage = field(default_factory=LLMUsage)
+    repairs_used: int = 0
 
 
 def _select_strategy(adapter: ProviderAdapter, target: ProviderTarget) -> _Strategy:
@@ -671,9 +682,12 @@ class LLMGateway:
         `verdicts` are **position-aligned** to `criteria` (verdicts[i] rules on
         criteria[i]) plus the LLM usage spent. Runs through the same §3.6
         fallback chain as node dispatch (a judgement should survive a primary
-        provider outage the same way a node does), and carries token usage back
-        so the engine can meter it against guards.max_tokens_total. This
-        method's shape IS the engine's async ProseVerdict."""
+        provider outage the same way a node does). Usage and the repair budget
+        are tracked across the WHOLE logical judgement (a shared `_JudgeState`),
+        not reset per fallback entry: usage from an attempt that later failed
+        still counts, and `max_output_repairs` is one budget for the judgement,
+        not one-per-entry. This method's shape IS the engine's async
+        ProseVerdict."""
         agent = self._graph.agents_by_id.get(agent_id)
         if agent is None:
             # A DoD naming an unknown evaluated_by agent is a config error. Raise
@@ -689,32 +703,35 @@ class LLMGateway:
             f"criterion, keyed by its index.\n\nCriteria:\n{numbered}"
         )
         chain = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
+        judge_state = _JudgeState()
 
         async def run_one(llm: LLMConfig) -> AgentTurnResult:
-            return await self._judge_completion(llm, system, user_text)
+            return await self._judge_completion(llm, system, user_text, judge_state)
 
         turn = await self._run_chain(agent_id=agent_id, chain=chain, run_one=run_one)
         return ProseJudgement(
             verdicts=_map_verdicts(turn.structured_payload, len(criteria)),
-            input_tokens=turn.input_tokens,
-            output_tokens=turn.output_tokens,
+            usage=judge_state.usage,
         )
 
-    async def _judge_completion(self, llm: LLMConfig, system: str, user_text: str) -> AgentTurnResult:
-        """A no-tools structured completion returning one _VERDICT_SCHEMA object,
-        wrapped as an AgentTurnResult so it flows through `_run_chain` (fallback
-        + retry) and carries token usage for the engine to meter. Reuses the
-        node path's strategy pick (guided vs forced-tool) and small helpers, but
-        deliberately offers NO toolkits and skips the tool loop's
-        idempotency/bookkeeping — a judgement has no side effects. Bounded by
-        guards.max_output_repairs; exhausting that raises AgentOutputError
-        (non-transient — the DoD gate turns it into a fail-closed run)."""
+    async def _judge_completion(
+        self, llm: LLMConfig, system: str, user_text: str, state: _JudgeState
+    ) -> AgentTurnResult:
+        """A no-tools structured completion returning one _VERDICT_SCHEMA object.
+        Reuses the node path's strategy pick (guided vs forced-tool) and small
+        helpers, but deliberately offers NO toolkits and skips the tool loop's
+        idempotency/bookkeeping — a judgement has no side effects. `state` is the
+        JUDGEMENT-scoped accumulator (shared across fallback entries by
+        `judge_prose`): usage is added after *every* provider call, so an
+        attempt that later fails still contributes its tokens, and the repair
+        budget is one `max_output_repairs` for the whole judgement, not one per
+        entry. Exhausting it raises AgentOutputError (non-transient — the DoD
+        gate turns it into a fail-closed run)."""
         adapter = self._adapter_for(llm.provider)
         strategy = self._strategy_for(adapter, llm)
         api_key = self._resolve_api_key(llm)
         guards = self._graph.doc.spec.graph.guards
         messages: list[Message] = [UserMessage(text=user_text)]
-        input_tokens = output_tokens = repair_count = 0
         while True:
             if strategy.use_guided:
                 request = self._request_for(
@@ -732,25 +749,31 @@ class LLMGateway:
                 )
             response = await adapter.complete(request)
             _ensure_provider_response_secret_free(response, api_key)
-            input_tokens += response.input_tokens
-            output_tokens += response.output_tokens
+            # Meter BEFORE any validation/repair decision, so tokens from an
+            # attempt that turns out invalid (or that a later call will abandon)
+            # are never lost from the judgement's total.
+            state.usage.add(response.input_tokens, response.output_tokens)
             if strategy.use_guided:
                 payload, error = _parse_json(response.text)
             else:
-                calls = [tc for tc in response.tool_calls if tc.tool == SUBMIT_VERDICT]
-                payload, error = (calls[0].arguments, None) if calls else (None, "no submit_verdict call returned")
+                # A forced judgement must return EXACTLY one submit_verdict call.
+                # Zero, several (a second call could silently override the first
+                # — fail-open), or any other tool is invalid → repair, not
+                # last-write-wins.
+                calls = response.tool_calls
+                if len(calls) == 1 and calls[0].tool == SUBMIT_VERDICT:
+                    payload, error = calls[0].arguments, None
+                else:
+                    payload, error = None, f"expected exactly one submit_verdict tool call, got {len(calls)}"
             if error is None:
                 error = _validate(payload, _VERDICT_SCHEMA)
             if error is None:
-                return AgentTurnResult(
-                    structured_payload=payload, input_tokens=input_tokens,
-                    output_tokens=output_tokens, repair_count=repair_count,
-                )
-            if repair_count >= guards.max_output_repairs:
+                return AgentTurnResult(structured_payload=payload, repair_count=state.repairs_used)
+            if state.repairs_used >= guards.max_output_repairs:
                 raise AgentOutputError(
-                    f"DoD prose judgement produced invalid output after {repair_count} repairs: {error}"
+                    f"DoD prose judgement produced invalid output after {state.repairs_used} repairs: {error}"
                 )
-            repair_count += 1
+            state.repairs_used += 1
             messages.append(
                 UserMessage(text=f"That verdict was invalid: {error}. Return valid output matching the schema.")
             )
