@@ -51,6 +51,12 @@ _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
 # needs it.
 _NODE_RETRY_BASE_SECONDS = 1.0
 _NODE_RETRY_CAP_SECONDS = 30.0
+TERMINAL_STATUSES = ("COMPLETED", "FAILED", "CANCELLED")
+_TERMINAL_STATUS_PLACEHOLDERS = ", ".join("?" for _ in TERMINAL_STATUSES)
+
+
+class TerminalPersistenceError(RuntimeError):
+    """The run outcome could not be persisted, including the status fallback."""
 
 
 @dataclass
@@ -323,13 +329,13 @@ async def _finalize_status(ctx: _RunCtx) -> None:
     # drain, a stray resume) must NOT re-run the DoD gate — re-judging would
     # double-bill, append a second DOD_EVALUATED, and could flip COMPLETED→FAILED
     # on a non-deterministic verdict. A terminal state is final.
-    if run["status"] in ("COMPLETED", "FAILED", "CANCELLED"):
+    if run["status"] in TERMINAL_STATUSES:
         return
     pending_hitl = ctx.con.execute(
         "SELECT 1 FROM hitl_request WHERE run_id = ? AND status = 'PENDING' LIMIT 1", (ctx.run_id,)
     ).fetchone()
     if pending_hitl:
-        _write_final(ctx, run, "WAITING_HUMAN", event=None)
+        _write_final(ctx, "WAITING_HUMAN", event=None)
     elif ctx.terminal_reached:
         # §3.1 step 7: reaching a terminal is necessary but not sufficient — the
         # run COMPLETEs only if its definition_of_done is met. DECIDE (pure and
@@ -338,12 +344,12 @@ async def _finalize_status(ctx: _RunCtx) -> None:
         # split is what keeps a DoD bug OR a rejected event write from stranding
         # the run at RUNNING — the failure mode every review round has probed.
         status, event = await _decide_dod(ctx)
-        _write_final(ctx, run, status, event=event)
+        _write_final(ctx, status, event=event)
     else:
         # Queue drained with nothing pending and no terminal edge ever fired —
         # shouldn't happen under §3.1's fail-fast rule; persist the status as-is
         # so a genuine gap stays visible rather than being reported either way.
-        _write_final(ctx, run, run["status"], event=None)
+        _write_final(ctx, run["status"], event=None)
 
 
 DodOutcome = Literal["met", "criteria_unmet", "evaluator_error", "cost_cap_exceeded"]
@@ -367,20 +373,37 @@ def _safe_rollback(con: sqlite3.Connection) -> None:
         pass
 
 
-def _write_final(ctx: _RunCtx, run: sqlite3.Row, status: str, *, event: _DodEvent | None) -> None:
-    """Persist a terminal outcome: the DoD event (if any) AND the run status, in
-    ONE transaction. If that write fails (e.g., a DOD_EVALUATED insert rejected
-    by a constraint/trigger), roll back and resolve the run STATUS-ONLY as
-    FAILED — WITHOUT re-invoking the event writer that just failed — so a
-    persistence failure can't strand the run at RUNNING. Never raises."""
-    ended_at = now_iso() if status in ("COMPLETED", "FAILED") else run["ended_at"]
+def _update_run_status_if_active(ctx: _RunCtx, status: str) -> bool:
+    """CAS-like status update: terminal states are final, including a CANCELLED
+    committed while an async DoD judgement was in flight."""
+    ended_at = now_iso() if status in ("COMPLETED", "FAILED") else None
+    cursor = ctx.con.execute(
+        f"""UPDATE run
+            SET status = ?, ended_at = COALESCE(?, ended_at)
+            WHERE id = ? AND status NOT IN ({_TERMINAL_STATUS_PLACEHOLDERS})""",
+        (status, ended_at, ctx.run_id, *TERMINAL_STATUSES),
+    )
+    return cursor.rowcount == 1
+
+
+def _write_final(ctx: _RunCtx, status: str, *, event: _DodEvent | None) -> None:
+    """Persist the DoD event and active-run status in one transaction.
+
+    A concurrent terminal transition wins: the conditional status update fails
+    and the staged event is rolled back. If the event write fails, retry only a
+    status-only FAILED transition. If that status write is also unavailable,
+    raise TerminalPersistenceError so the caller/recovery layer cannot mistake a
+    still-RUNNING row for successful finalization.
+    """
     try:
         if event is not None:
             _log_event(
                 ctx.con, ctx.run_id, None, "DOD_EVALUATED",
                 result=event.result, condition_evaluated=event.condition, state_diff=event.state_diff,
             )
-        ctx.con.execute("UPDATE run SET status = ?, ended_at = ? WHERE id = ?", (status, ended_at, ctx.run_id))
+        if not _update_run_status_if_active(ctx, status):
+            _safe_rollback(ctx.con)
+            return
         ctx.con.commit()
         if status == "FAILED" and event is not None:
             log_event("ERROR", f"run {ctx.run_id} DoD gate FAILED ({event.state_diff.get('outcome')})", run_id=ctx.run_id)
@@ -390,10 +413,13 @@ def _write_final(ctx: _RunCtx, run: sqlite3.Row, status: str, *, event: _DodEven
         log_event("ERROR", f"run {ctx.run_id} terminal write failed ({type(exc).__name__}); resolving status-only", run_id=ctx.run_id)
     # Terminal failure path: status-only, NOT re-calling the failed event writer.
     try:
-        ctx.con.execute("UPDATE run SET status = 'FAILED', ended_at = ? WHERE id = ?", (now_iso(), ctx.run_id))
+        if not _update_run_status_if_active(ctx, "FAILED"):
+            _safe_rollback(ctx.con)
+            return
         ctx.con.commit()
-    except Exception:  # noqa: BLE001 - nothing more we can safely do; never raise past the engine
+    except Exception as exc:  # noqa: BLE001 - surface an unwritable status to recovery
         _safe_rollback(ctx.con)
+        raise TerminalPersistenceError(f"run {ctx.run_id} terminal status could not be persisted") from exc
 
 
 def _safe_usage(reported: object) -> LLMUsage | None:
@@ -409,13 +435,9 @@ def _safe_usage(reported: object) -> LLMUsage | None:
         return None
 
 
-def _over_cap(ctx: _RunCtx, max_tokens_total: int | None, usage: LLMUsage) -> bool:
-    """Would this judgement's usage push the run's tally past its hard cost cap
-    (node tokens committed so far + this judgement's)? Shared by the success and
-    failure paths so a judgement that breaches `max_tokens_total` is labelled
-    `cost_cap_exceeded` whether or not it also produced a usable verdict — the
-    cap is a governance boundary on *spend*, and a failed judgement still spent."""
-    return max_tokens_total is not None and _total_tokens(ctx.con, ctx.run_id) + usage.total > max_tokens_total
+def _would_exceed_token_cap(ctx: _RunCtx, max_tokens_total: int | None, additional_tokens: int) -> bool:
+    """Would validated additional usage push this run past its token cap?"""
+    return max_tokens_total is not None and _total_tokens(ctx.con, ctx.run_id) + additional_tokens > max_tokens_total
 
 
 def _build_dod_event(
@@ -440,6 +462,26 @@ def _build_dod_event(
         # exception text), but redact defensively before it lands in the event.
         state_diff["detail"] = redact_secrets(detail)
     return _DodEvent(result=(status == "COMPLETED"), condition="; ".join(dod.criteria), state_diff=state_diff)
+
+
+def _minimal_dod_error_event(dod: DefinitionOfDone, exc: Exception) -> _DodEvent:
+    """Fixed-shape last resort that does not re-enter the normal event builder."""
+    try:
+        condition = "; ".join(dod.criteria)
+    except Exception:  # noqa: BLE001 - malformed in-memory config must still fail closed
+        condition = ""
+    return _DodEvent(
+        result=False,
+        condition=condition,
+        state_diff={
+            "outcome": "evaluator_error",
+            "met": False,
+            "results": [],
+            "unmet": [],
+            "unevaluated": [],
+            "detail": type(exc).__name__,
+        },
+    )
 
 
 async def _decide_dod(ctx: _RunCtx) -> tuple[str, _DodEvent | None]:
@@ -476,14 +518,14 @@ async def _decide_dod(ctx: _RunCtx) -> tuple[str, _DodEvent | None]:
                 # cost_cap_exceeded takes precedence (governance); else
                 # evaluator_error. Persist only the underlying cause's CLASS.
                 spent = _safe_usage(exc.usage)
-                if spent is not None and _over_cap(ctx, guards.max_tokens_total, spent):
+                if spent is not None and _would_exceed_token_cap(ctx, guards.max_tokens_total, spent.total):
                     return "FAILED", _build_dod_event(
                         dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=spent,
                         detail=f"DoD judgement's {spent.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
                     )
                 cause = type(exc.__cause__).__name__ if exc.__cause__ else "ProseJudgementError"
                 return "FAILED", _build_dod_event(dod, result, outcome="evaluator_error", status="FAILED", detail=cause, usage=spent)
-            if _over_cap(ctx, guards.max_tokens_total, usage):
+            if _would_exceed_token_cap(ctx, guards.max_tokens_total, usage.total):
                 return "FAILED", _build_dod_event(
                     dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=usage,
                     detail=f"DoD judgement's {usage.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
@@ -494,7 +536,7 @@ async def _decide_dod(ctx: _RunCtx) -> tuple[str, _DodEvent | None]:
         outcome: DodOutcome = "met" if result.met else "criteria_unmet"
         return status, _build_dod_event(dod, result, outcome=outcome, status=status, usage=usage_for_event)
     except Exception as exc:  # noqa: BLE001 - unforeseen: the decision must be TOTAL; fail closed with an event
-        return "FAILED", _build_dod_event(dod, DodResult(results=[]), outcome="evaluator_error", status="FAILED", detail=type(exc).__name__)
+        return "FAILED", _minimal_dod_error_event(dod, exc)
 
 
 async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
@@ -641,8 +683,7 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
             logical_visit_id=logical_visit_id,
         )
         return
-    projected_tokens = _total_tokens(con, ctx.run_id) + result.input_tokens + result.output_tokens
-    if guards.max_tokens_total is not None and projected_tokens > guards.max_tokens_total:
+    if _would_exceed_token_cap(ctx, guards.max_tokens_total, node_usage.total):
         _fail_run(
             ctx,
             node_id,

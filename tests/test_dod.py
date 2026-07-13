@@ -17,7 +17,7 @@ import pytest
 from ravana.compiler.graph import compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.engine.dod import evaluate_dod
-from ravana.engine.loop import start_run
+from ravana.engine.loop import TerminalPersistenceError, start_run
 from ravana.runtime.base import LLMUsage, ProseJudgement, ProseJudgementError
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.schema.models import DefinitionOfDone, WorkflowDoc
@@ -325,6 +325,45 @@ def test_dod_event_write_failure_does_not_strand_run(con):
     assert _dod_event(con, run_id) is None  # the event write was rejected; the run resolved anyway
 
 
+def test_terminal_status_write_failure_is_observable(con):
+    # If even the status-only fallback is unwritable, persistence cannot truthfully
+    # claim the run resolved. Surface a typed error so a supervisor can recover it.
+    con.execute(
+        "CREATE TRIGGER reject_terminal_status BEFORE UPDATE OF status ON run "
+        "WHEN OLD.status = 'RUNNING' AND NEW.status IN ('COMPLETED', 'FAILED') "
+        "BEGIN SELECT RAISE(ABORT, 'no terminal statuses'); END"
+    )
+
+    with pytest.raises(TerminalPersistenceError):
+        _run_single(con, _dod_workflow(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
+
+    run = con.execute("SELECT id, status, ended_at FROM run ORDER BY started_at DESC LIMIT 1").fetchone()
+    assert run["status"] == "RUNNING" and run["ended_at"] is None
+    assert _dod_event(con, run["id"]) is None
+
+
+def test_cancel_during_dod_judgement_is_not_overwritten(con):
+    # The judge is an await point. A CANCELLED committed while it runs is terminal
+    # and must win over the stale completion decision, including its staged event.
+    async def cancel_then_pass(evaluated_by, criteria, state):
+        run = con.execute("SELECT id FROM run WHERE status = 'RUNNING' ORDER BY started_at DESC LIMIT 1").fetchone()
+        con.execute("UPDATE run SET status = 'CANCELLED', ended_at = 'cancelled' WHERE id = ?", (run["id"],))
+        con.commit()
+        return ProseJudgement(verdicts=[True for _ in criteria], usage=LLMUsage(1, 1))
+
+    run_id = _start_with_verdict(
+        con,
+        _dod_workflow(["All acceptance criteria are met"]),
+        {"qa_status": "PASS"},
+        None,
+        raw=cancel_then_pass,
+    )
+
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "CANCELLED" and run["ended_at"] == "cancelled"
+    assert _dod_event(con, run_id) is None
+
+
 def test_unforeseen_gate_error_still_stages_event(con, monkeypatch):
     # An UNFORESEEN error inside the DoD decision (here: evaluate_dod raises)
     # must still produce a FAILED run WITH a DOD_EVALUATED — the decision is
@@ -343,6 +382,24 @@ def test_unforeseen_gate_error_still_stages_event(con, monkeypatch):
     ).fetchone()["c"]
     assert count == 1  # exactly one event, not zero (contract) and not double
     assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "evaluator_error"
+
+
+def test_event_builder_failure_uses_minimal_fail_closed_event(con, monkeypatch):
+    # The total-decision fallback must not call the same builder that just failed.
+    import ravana.engine.loop as loop_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("unexpected builder bug")
+
+    monkeypatch.setattr(loop_mod, "_build_dod_event", boom)
+    run_id = _run_single(con, _dod_workflow(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
+
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    event = _dod_event(con, run_id)
+    payload = json.loads(event["state_diff"])
+    assert run["status"] == "FAILED" and run["ended_at"] is not None
+    assert event["result"] == 0
+    assert payload["outcome"] == "evaluator_error" and payload["detail"] == "RuntimeError"
 
 
 def test_dod_finalization_is_idempotent_on_reentry(con):

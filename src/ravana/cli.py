@@ -22,7 +22,7 @@ from ravana.compiler.graph import CompiledGraph, compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.compiler.validate import validate
 from ravana.engine.dod import ProseVerdict
-from ravana.engine.loop import resume_hitl, start_run
+from ravana.engine.loop import TERMINAL_STATUSES, resume_hitl, start_run
 from ravana.runtime.base import AgentRuntime, ProseJudge
 from ravana.runtime.gateway import LLMGateway
 from ravana.runtime.mock import MockAgentRuntime
@@ -36,7 +36,6 @@ from ravana.schema.db import init_db
 from ravana.schema.loader import load_workflow_yaml
 
 RAVANA_DIR = ".ravana"
-TERMINAL_STATUSES = ("COMPLETED", "FAILED", "CANCELLED")
 
 
 def find_ravana_dir(start: Path | None = None) -> Path:
