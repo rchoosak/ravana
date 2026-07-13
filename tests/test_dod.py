@@ -470,6 +470,38 @@ def test_failure_path_revalidates_corrupted_usage(con):
     assert "usage" not in sd  # corrupted usage recorded as no usage
 
 
+def test_failed_judgement_over_cap_is_cost_cap_not_evaluator_error(con):
+    # A judgement that FAILS but whose spend breaches the hard cap is labelled
+    # cost_cap_exceeded (the governance-salient outcome), not evaluator_error —
+    # the cap applies to any usage that enters the tally, success or failure.
+    async def verdict(evaluated_by, criteria, state):
+        raise ProseJudgementError(LLMUsage(input_tokens=300, output_tokens=60))
+
+    run_id = _start_with_verdict(
+        con, _dod_workflow(["a prose criterion"], guards={"max_tokens_total": 10}),
+        {"qa_status": "PASS"}, None, raw=verdict,
+    )
+    run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    sd = json.loads(_dod_event(con, run_id)["state_diff"])
+    assert sd["outcome"] == "cost_cap_exceeded"
+    assert sd["usage"] == {"input_tokens": 300, "output_tokens": 60}
+
+
+def test_failed_judgement_under_cap_stays_evaluator_error(con):
+    # ...but a failed judgement whose spend is WITHIN the cap keeps the
+    # evaluator_error label (the cap check doesn't reclassify every failure).
+    async def verdict(evaluated_by, criteria, state):
+        raise ProseJudgementError(LLMUsage(input_tokens=2, output_tokens=1))
+
+    run_id = _start_with_verdict(
+        con, _dod_workflow(["a prose criterion"], guards={"max_tokens_total": 100}),
+        {"qa_status": "PASS"}, None, raw=verdict,
+    )
+    sd = json.loads(_dod_event(con, run_id)["state_diff"])
+    assert sd["outcome"] == "evaluator_error"
+
+
 def test_failed_judgement_usage_is_recorded_on_event(con):
     # A judgement that fails outright (ProseJudgementError) still spent tokens;
     # the engine records them on the DOD_EVALUATED event so a failed judgement's

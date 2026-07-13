@@ -369,6 +369,15 @@ def _safe_usage(reported: object) -> LLMUsage | None:
         return None
 
 
+def _over_cap(ctx: _RunCtx, max_tokens_total: int | None, usage: LLMUsage) -> bool:
+    """Would this judgement's usage push the run's tally past its hard cost cap
+    (node tokens committed so far + this judgement's)? Shared by the success and
+    failure paths so a judgement that breaches `max_tokens_total` is labelled
+    `cost_cap_exceeded` whether or not it also produced a usable verdict — the
+    cap is a governance boundary on *spend*, and a failed judgement still spent."""
+    return max_tokens_total is not None and _total_tokens(ctx.con, ctx.run_id) + usage.total > max_tokens_total
+
+
 async def _dod_gate(ctx: _RunCtx) -> str:
     """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
     definition_of_done is met, else FAILs. Expression criteria are enforced
@@ -405,10 +414,7 @@ async def _dod_gate(ctx: _RunCtx) -> str:
         usage = LLMUsage(judgement.usage.input_tokens, judgement.usage.output_tokens)
         # §3.6 cost cap: node tokens so far + this judgement's tokens. A
         # judgement that pushes the run past max_tokens_total FAILs it.
-        over_cap = (
-            guards.max_tokens_total is not None
-            and _total_tokens(ctx.con, ctx.run_id) + usage.total > guards.max_tokens_total
-        )
+        over_cap = _over_cap(ctx, guards.max_tokens_total, usage)
         if not over_cap:
             result.apply_prose_verdict(judgement.verdicts)
     except ProseJudgementError as exc:
@@ -424,6 +430,15 @@ async def _dod_gate(ctx: _RunCtx) -> str:
         # value would otherwise poison the total or break event serialization
         # (→ no DOD_EVALUATED). A bad value records no usage; the event still writes.
         spent = _safe_usage(exc.usage)
+        # A FAILED judgement still spent tokens. If that spend breaches the hard
+        # cap, the governance-salient outcome is cost_cap_exceeded — the cap
+        # applies to any usage that enters the tally, not just a successful
+        # judgement's (repair loops burn tokens exactly on this failure path).
+        if spent is not None and _over_cap(ctx, guards.max_tokens_total, spent):
+            return _finish_dod(
+                ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=spent,
+                detail=f"DoD judgement's {spent.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
+            )
         return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=cause, status="FAILED", usage=spent)
     except Exception as exc:  # noqa: BLE001 - fail closed; persist the error CLASS, never its (possibly secret-bearing) text
         return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
