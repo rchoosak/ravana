@@ -277,6 +277,23 @@ def test_log_event_is_best_effort_when_stderr_is_broken(monkeypatch):
     log_event("ERROR", "boom", run_id="r1")  # must NOT raise
 
 
+def test_log_event_fallback_redacts_message_and_keeps_correlation(monkeypatch):
+    # When an unserializable `extra` forces the fallback path, the message must
+    # STILL be redacted (a secret must never reach stderr just because an extra
+    # field couldn't serialize) and BOTH correlation keys must survive.
+    import io
+    import sys
+
+    from ravana.observability.logging import log_event
+
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", buf)
+    log_event("ERROR", "leak sk-DO-NOT-LOG-abc123def456ghi", run_id="r1", node_execution_id="n1", bad=object())
+    out = buf.getvalue()
+    assert "sk-DO-NOT-LOG" not in out and "***REDACTED***" in out  # redacted, not raw
+    assert "r1" in out and "n1" in out  # both correlation keys preserved
+
+
 def test_logging_failure_does_not_strand_the_run(con, monkeypatch):
     # A broken stderr must not strand a run: the DoD gate logs an ERROR line on
     # the FAILED path, but log_event is best-effort, so the run still commits
