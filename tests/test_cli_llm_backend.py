@@ -21,12 +21,14 @@ from ravana.cli import (
     _build_llm_gateway,
     _build_runtime,
     _make_adapter,
+    _prose_verdict_for,
     _providers_in_graph,
     _resume_with_cleanup,
     _start_with_cleanup,
 )
 from ravana.runtime.base import AgentTurnResult
 from ravana.runtime.gateway import LLMGateway
+from ravana.runtime.mock import MockAgentRuntime
 from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
 from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
 
@@ -69,6 +71,34 @@ def test_build_llm_gateway_wires_graph_toolkits(sdlc_graph, con):
 def test_build_runtime_mock_requires_fixture(sdlc_graph, con):
     with pytest.raises(click.ClickException, match="requires --mock-fixture"):
         _build_runtime(con, sdlc_graph, "mock", None)
+
+
+def test_prose_verdict_wired_only_for_llm_backend(sdlc_graph, con):
+    # §3.1 step 7: the DoD prose judge is the gateway's own judge_prose under
+    # --backend llm; the mock backend has no judge, so prose stays advisory.
+    gateway = _build_llm_gateway(con, sdlc_graph)
+    assert _prose_verdict_for(gateway) == gateway.judge_prose
+    assert _prose_verdict_for(MockAgentRuntime({})) is None
+
+
+def test_cli_start_scope_forwards_prose_verdict(monkeypatch, sdlc_graph, con):
+    # The start scope threads a real prose judge into start_run when the runtime
+    # is the LLM gateway — otherwise the terminal DoD gate would silently skip
+    # prose criteria even on a real run.
+    seen: dict[str, Any] = {}
+
+    async def fake_start(*args, **kwargs):
+        seen["dod_prose_verdict"] = kwargs.get("dod_prose_verdict")
+        return "run-1"
+
+    monkeypatch.setattr(cli_module, "start_run", fake_start)
+    gateway = _build_llm_gateway(con, sdlc_graph)
+    asyncio.run(
+        _start_with_cleanup(
+            con, sdlc_graph, gateway, org_id="test", workflow_id="workflow-1", input_payload={}
+        )
+    )
+    assert seen["dod_prose_verdict"] == gateway.judge_prose
 
 
 class _ClosableRuntime:

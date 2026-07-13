@@ -25,6 +25,7 @@ and defeat the gate.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -34,7 +35,9 @@ from ravana.schema.models import DefinitionOfDone
 # Given (evaluated_by agent id, the prose criteria, final shared_state), returns
 # a {criterion: passed} verdict for those criteria. Injected by the caller that
 # has a runtime to ask; unset here (the default) means prose isn't evaluated.
-ProseVerdict = Callable[[str, list[str], dict[str, Any]], dict[str, bool]]
+# Async because a real verdict runs an agent turn against the LLM Gateway — an
+# awaitable the (already-async) engine loop threads through to the DoD gate.
+ProseVerdict = Callable[[str, list[str], dict[str, Any]], Awaitable[dict[str, bool]]]
 
 
 @dataclass
@@ -78,7 +81,7 @@ def _evaluate_expression(criterion: str, state: dict[str, Any]) -> bool:
         return False
 
 
-def evaluate_dod(
+async def evaluate_dod(
     dod: DefinitionOfDone,
     state: dict[str, Any],
     *,
@@ -86,7 +89,11 @@ def evaluate_dod(
 ) -> DodResult:
     """Evaluate every criterion against the final `state`. `met` is True iff
     every *evaluated* criterion passed — unevaluated prose (no verdict wired)
-    is advisory and does not gate. An empty criteria list is vacuously met."""
+    is advisory and does not gate. An empty criteria list is vacuously met.
+
+    Expression criteria are evaluated deterministically and synchronously; only
+    the injected prose verdict is awaited, so a run with no prose criteria (or
+    no verdict wired) makes no provider call."""
     results: list[CriterionResult] = []
     prose_criteria: list[str] = []
     for criterion in dod.criteria:
@@ -97,7 +104,7 @@ def evaluate_dod(
             results.append(CriterionResult(criterion, "prose", None))
 
     if prose_criteria and prose_verdict is not None:
-        verdicts = prose_verdict(dod.evaluated_by, prose_criteria, state)
+        verdicts = await prose_verdict(dod.evaluated_by, prose_criteria, state)
         for result in results:
             if result.kind == "prose":
                 result.passed = bool(verdicts.get(result.criterion, False))

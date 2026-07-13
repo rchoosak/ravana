@@ -21,6 +21,7 @@ import click
 from ravana.compiler.graph import CompiledGraph, compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.compiler.validate import validate
+from ravana.engine.dod import ProseVerdict
 from ravana.engine.loop import resume_hitl, start_run
 from ravana.runtime.base import AgentRuntime
 from ravana.runtime.gateway import LLMGateway
@@ -118,6 +119,14 @@ def _build_runtime(
     return MockAgentRuntime.from_yaml(mock_fixture)
 
 
+def _prose_verdict_for(runtime: AgentRuntime) -> ProseVerdict | None:
+    """§3.1 step 7: wire the DoD gate's prose judge only for the real LLM
+    backend — the gateway's own `evaluated_by`-agent judgement. Under the mock
+    backend there is no judge, so prose criteria stay advisory (unevaluated,
+    non-gating), exactly as in Phase 0a."""
+    return runtime.judge_prose if isinstance(runtime, LLMGateway) else None
+
+
 async def _start_with_cleanup(
     con: sqlite3.Connection,
     graph: CompiledGraph,
@@ -136,6 +145,7 @@ async def _start_with_cleanup(
             workflow_id=workflow_id,
             triggered_by="cli-user",
             input_payload=input_payload,
+            dod_prose_verdict=_prose_verdict_for(runtime),
         )
     finally:
         await runtime.aclose()
@@ -150,7 +160,10 @@ async def _resume_with_cleanup(
     response: dict[str, Any],
 ) -> None:
     try:
-        await resume_hitl(con, graph, runtime, run_id, hitl_id, response)
+        await resume_hitl(
+            con, graph, runtime, run_id, hitl_id, response,
+            dod_prose_verdict=_prose_verdict_for(runtime),
+        )
     finally:
         await runtime.aclose()
 

@@ -1,30 +1,54 @@
 """Definition-of-Done evaluation (§3.1 step 7): the pure evaluator
 (engine/dod.py) and its engine gating (a terminal only COMPLETEs if the DoD is
 met, else FAILs). Expression criteria are enforced deterministically; prose
-criteria are advisory (recorded, not gating) until an evaluator agent is wired.
+criteria are advisory (recorded, not gating) until a verdict is wired. The
+evaluator and its injected prose verdict are async (a real verdict runs an
+agent turn), so the pure-evaluator tests drive it through asyncio.run and the
+verdict doubles are async callables.
 """
 
 from __future__ import annotations
 
 import asyncio
+from typing import Any, Callable
 
 from ravana.compiler.graph import compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
-from ravana.engine.dod import evaluate_dod
+from ravana.engine.dod import DodResult, evaluate_dod
 from ravana.engine.loop import start_run
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.schema.models import DefinitionOfDone, WorkflowDoc
+
+Verdict = Callable[[str, list[str], dict[str, Any]], dict[str, bool]]
 
 
 def _dod(criteria: list[str]) -> DefinitionOfDone:
     return DefinitionOfDone(evaluated_by="a", criteria=criteria)
 
 
+def _eval(dod: DefinitionOfDone, state: dict[str, Any], *, prose_verdict: Verdict | None = None) -> DodResult:
+    """Drive the async evaluator synchronously for the pure-evaluator tests,
+    wrapping any (sync) verdict double into the async ProseVerdict shape."""
+    averdict = _averdict(prose_verdict) if prose_verdict is not None else None
+    return asyncio.run(evaluate_dod(dod, state, prose_verdict=averdict))
+
+
+def _averdict(fn: Verdict):
+    """Adapt a plain verdict function to the async ProseVerdict the evaluator
+    awaits. A raising `fn` still raises when awaited (the throwing-verdict test
+    depends on that)."""
+
+    async def verdict(who: str, criteria: list[str], state: dict[str, Any]) -> dict[str, bool]:
+        return fn(who, criteria, state)
+
+    return verdict
+
+
 # --- pure evaluator --------------------------------------------------------
 def test_expression_criteria_pass_and_fail():
-    met = evaluate_dod(_dod(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
+    met = _eval(_dod(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
     assert met.met and not met.unmet
-    unmet = evaluate_dod(_dod(["state.qa_status == 'PASS'"]), {"qa_status": "FAIL"})
+    unmet = _eval(_dod(["state.qa_status == 'PASS'"]), {"qa_status": "FAIL"})
     assert not unmet.met
     assert unmet.unmet == ["state.qa_status == 'PASS'"]
 
@@ -32,13 +56,13 @@ def test_expression_criteria_pass_and_fail():
 def test_missing_state_key_expression_is_false_not_an_error():
     # StateProxy returns None for an unset key, so `None == 'PASS'` is a clean
     # False (criterion not yet met) — not a raise that would misclassify it.
-    result = evaluate_dod(_dod(["state.qa_status == 'PASS'"]), {})
+    result = _eval(_dod(["state.qa_status == 'PASS'"]), {})
     assert not result.met
     assert result.results[0].kind == "expression"
 
 
 def test_prose_criterion_is_advisory_when_no_evaluator():
-    result = evaluate_dod(_dod(["All acceptance criteria are met"]), {})
+    result = _eval(_dod(["All acceptance criteria are met"]), {})
     assert result.met  # unevaluated prose does not gate
     assert result.unevaluated == ["All acceptance criteria are met"]
     assert result.results[0].kind == "prose" and result.results[0].passed is None
@@ -46,9 +70,9 @@ def test_prose_criterion_is_advisory_when_no_evaluator():
 
 def test_prose_criterion_enforced_when_verdict_wired():
     crit = "All acceptance criteria are met"
-    passed = evaluate_dod(_dod([crit]), {}, prose_verdict=lambda who, cs, st: {crit: True})
+    passed = _eval(_dod([crit]), {}, prose_verdict=lambda who, cs, st: {crit: True})
     assert passed.met
-    failed = evaluate_dod(_dod([crit]), {}, prose_verdict=lambda who, cs, st: {crit: False})
+    failed = _eval(_dod([crit]), {}, prose_verdict=lambda who, cs, st: {crit: False})
     assert not failed.met and failed.unmet == [crit]
 
 
@@ -60,7 +84,7 @@ def test_prose_verdict_receives_only_prose_criteria_and_evaluated_by():
         seen["criteria"] = criteria
         return {c: True for c in criteria}
 
-    evaluate_dod(
+    _eval(
         DefinitionOfDone(evaluated_by="pm", criteria=["a prose line", "state.x == 1"]),
         {"x": 1},
         prose_verdict=verdict,
@@ -71,7 +95,7 @@ def test_prose_verdict_receives_only_prose_criteria_and_evaluated_by():
 
 def test_mixed_expression_and_prose_classified_correctly():
     prose = "No open defects in state.qa_report"  # references state. but isn't a valid expression
-    result = evaluate_dod(_dod(["state.qa_status == 'PASS'", prose]), {"qa_status": "PASS"})
+    result = _eval(_dod(["state.qa_status == 'PASS'", prose]), {"qa_status": "PASS"})
     kinds = {r.criterion: r.kind for r in result.results}
     assert kinds["state.qa_status == 'PASS'"] == "expression"
     assert kinds[prose] == "prose"
@@ -79,29 +103,37 @@ def test_mixed_expression_and_prose_classified_correctly():
 
 
 def test_empty_criteria_is_vacuously_met():
-    assert evaluate_dod(_dod([]), {}).met
+    assert _eval(_dod([]), {}).met
 
 
 def test_ordering_expression_on_unset_key_is_a_failing_expression_not_prose():
     # `state.count > 5` PARSES as an expression; on an unset key it errors at
     # eval (None > 5). It must be a FAILING expression (gating), NOT silently
     # downgraded to advisory prose — otherwise the gate is defeated.
-    result = evaluate_dod(_dod(["state.count > 5"]), {})
+    result = _eval(_dod(["state.count > 5"]), {})
     assert result.results[0].kind == "expression"
     assert result.results[0].passed is False
     assert not result.met and result.unmet == ["state.count > 5"]
 
 
 def test_ordering_expression_met_when_key_present():
-    result = evaluate_dod(_dod(["state.count > 5"]), {"count": 10})
+    result = _eval(_dod(["state.count > 5"]), {"count": 10})
     assert result.met and result.results[0].passed is True
 
 
 def test_membership_expression_on_unset_key_is_a_failing_expression():
     # `'x' in state.items` parses; `'x' in None` raises -> failing expression.
-    result = evaluate_dod(_dod(["'defect' in state.qa_report"]), {})
+    result = _eval(_dod(["'defect' in state.qa_report"]), {})
     assert result.results[0].kind == "expression"
     assert not result.met
+
+
+def test_prose_verdict_omission_is_fail_closed():
+    # A verdict that returns no entry for a criterion must NOT let it pass: the
+    # evaluator treats a missing key as not-met (bool(None) is False).
+    crit = "All acceptance criteria are met"
+    result = _eval(_dod([crit]), {}, prose_verdict=lambda who, cs, st: {})
+    assert not result.met and result.unmet == [crit]
 
 
 # --- engine gating ---------------------------------------------------------
@@ -172,13 +204,13 @@ def test_run_fails_when_ordering_expression_unmet_on_unset_key(con):
     assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "FAILED"
 
 
-def _start_with_verdict(con, workflow, payload, verdict):
+def _start_with_verdict(con, workflow, payload, verdict: Verdict):
     graph = compile_workflow(workflow)
     workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": payload}]})
     return asyncio.run(
         start_run(
-            con, graph, runtime, org_id="test", workflow_id=workflow_id, dod_prose_verdict=verdict
+            con, graph, runtime, org_id="test", workflow_id=workflow_id, dod_prose_verdict=_averdict(verdict)
         )
     )
 

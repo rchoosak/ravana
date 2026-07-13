@@ -51,6 +51,9 @@ from ravana.runtime.providers.base import (
 from ravana.schema.models import LLMConfig, LLMFallbackEntry
 
 SUBMIT_RESULT = "submit_result"
+# §3.1 step 7: the forced tool a non-guided provider submits its prose DoD
+# verdict through (the guided path returns the same shape as JSON text).
+SUBMIT_VERDICT = "submit_verdict"
 
 # §3.6: per-fallback-entry retry budget — deliberately small (1) and separate
 # from the engine-level guards.max_retries_per_node, so a long fallback chain
@@ -68,6 +71,40 @@ _ENTRY_RETRY_CAP_SECONDS = 10.0
 # state_delta. (A stricter default could require declared state keys; kept
 # permissive here so agents without output_schema still work.)
 _ANY_OBJECT_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
+
+# §3.1 step 7: the structured shape the evaluated_by agent returns for a prose
+# DoD judgement — one {index, met} per criterion. Indices (not the criterion
+# text) key each verdict, so a long free-text criterion never has to survive a
+# round-trip as a JSON key. `reason` is optional: it only nudges the model to
+# justify its call and is NEVER persisted — the DoD event logs the
+# workflow-authored criteria plus the booleans, no model free-text (§8).
+_VERDICT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "met": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "met"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["verdicts"],
+    "additionalProperties": False,
+}
+
+_JUDGE_INSTRUCTION = (
+    "You are now acting as the Definition-of-Done judge for a completed run. "
+    "For each prose criterion you are given, decide whether the shared state "
+    "above is sufficient evidence that it is met. Judge conservatively: if the "
+    "evidence does not clearly establish a criterion, mark it NOT met."
+)
 
 
 class ToolExecutor(Protocol):
@@ -611,6 +648,94 @@ class LLMGateway:
             # No tool calls at all — nudge toward submit_result.
             messages.append(UserMessage(text="Call submit_result now with your final output."))
             tool_call_count += 1
+
+    async def judge_prose(
+        self, agent_id: str, criteria: list[str], state: dict[str, Any]
+    ) -> dict[str, bool]:
+        """§3.1 step 7: ask the `evaluated_by` agent to rule on prose DoD
+        criteria against the final shared state. Returns {criterion: met}. Any
+        criterion the model omits from its verdict is treated as NOT met —
+        fail-closed, so an incomplete verdict can never let a run COMPLETE on a
+        criterion the judge never actually ruled on. This method's shape IS the
+        engine's async ProseVerdict, so the CLI wires it straight into the
+        `dod_prose_verdict` injection point."""
+        agent = self._graph.agents_by_id.get(agent_id)
+        if agent is None:
+            # A DoD naming an unknown evaluated_by agent is a config error. Raise
+            # (not silently pass) so the DoD gate's fail-closed boundary FAILs
+            # the run rather than completing on prose it never judged.
+            raise ValueError(f"definition_of_done.evaluated_by names unknown agent '{agent_id}'")
+        system = assemble_system_prompt(agent, self._graph.skills_by_id, state) + "\n\n" + _JUDGE_INSTRUCTION
+        numbered = "\n".join(f"{i}: {criterion}" for i, criterion in enumerate(criteria))
+        user_text = (
+            "Rule on each Definition-of-Done criterion below, using ONLY the "
+            "shared state above as evidence. Return a verdict for EVERY "
+            f"criterion, keyed by its index.\n\nCriteria:\n{numbered}"
+        )
+        payload = await self._judge_completion(agent.llm, system, user_text)
+        # The shallow schema check (schema_validate) only guarantees `verdicts`
+        # exists and the payload is an object — not that verdicts is a well-formed
+        # list of {index, met}. So map defensively and fail CLOSED: a criterion is
+        # met only when its entry carries an integer index AND met is *exactly*
+        # boolean True. A junk value (a "false" string is truthy!) or an omitted
+        # index reads as not met — an incomplete/garbled verdict can never let a
+        # run COMPLETE on an unproven criterion.
+        by_index: dict[int, bool] = {}
+        verdicts = payload.get("verdicts")
+        for item in verdicts if isinstance(verdicts, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("index"), int):
+                by_index[item["index"]] = item.get("met") is True
+        return {criterion: by_index.get(i, False) for i, criterion in enumerate(criteria)}
+
+    async def _judge_completion(self, llm: LLMConfig, system: str, user_text: str) -> dict[str, Any]:
+        """A no-tools structured completion returning one _VERDICT_SCHEMA object.
+        Reuses the node path's strategy pick (guided vs forced-tool) and its
+        small helpers, but deliberately offers NO toolkits and skips the tool
+        loop's idempotency/bookkeeping — a judgement has no side effects. Uses
+        the agent's primary llm only (no fallback chain: the gate runs once at
+        the terminal and there is no node retry around it); bounded by
+        guards.max_output_repairs, and exhausting that raises AgentOutputError,
+        which the DoD gate turns into a fail-closed run."""
+        adapter = self._adapter_for(llm.provider)
+        strategy = self._strategy_for(adapter, llm)
+        api_key = self._resolve_api_key(llm)
+        guards = self._graph.doc.spec.graph.guards
+        messages: list[Message] = [UserMessage(text=user_text)]
+        repair_count = 0
+        while True:
+            if strategy.use_guided:
+                request = self._request_for(
+                    llm, api_key=api_key, system=system, messages=messages, output_schema=_VERDICT_SCHEMA
+                )
+            else:
+                verdict_tool = Tool(
+                    name=SUBMIT_VERDICT,
+                    description="Submit your Definition-of-Done verdict, one entry per criterion.",
+                    input_schema=_VERDICT_SCHEMA,
+                )
+                request = self._request_for(
+                    llm, api_key=api_key, system=system, messages=messages,
+                    tools=[verdict_tool], force_tool=SUBMIT_VERDICT,
+                )
+            response = await adapter.complete(request)
+            _ensure_provider_response_secret_free(response, api_key)
+            if strategy.use_guided:
+                payload, error = _parse_json(response.text)
+            else:
+                calls = [tc for tc in response.tool_calls if tc.tool == SUBMIT_VERDICT]
+                payload, error = (calls[0].arguments, None) if calls else (None, "no submit_verdict call returned")
+            if error is None:
+                error = _validate(payload, _VERDICT_SCHEMA)
+            if error is None:
+                return payload
+            if repair_count >= guards.max_output_repairs:
+                raise AgentOutputError(
+                    f"DoD prose judgement produced invalid output after {repair_count} repairs: {error}"
+                )
+            repair_count += 1
+            messages.append(
+                UserMessage(text=f"That verdict was invalid: {error}. Return valid output matching the schema.")
+            )
 
 
 def _error_result(tc, message: str) -> ToolResultMessage:

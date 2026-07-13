@@ -306,10 +306,10 @@ async def _drain_queue(ctx: _RunCtx) -> None:
             break
         for node_id, _arrivals in stragglers:
             ctx.queue.append(node_id)
-    _finalize_status(ctx)
+    await _finalize_status(ctx)
 
 
-def _finalize_status(ctx: _RunCtx) -> None:
+async def _finalize_status(ctx: _RunCtx) -> None:
     if ctx.failed:
         return  # already set to FAILED at the point of failure
     run = _get_run(ctx.con, ctx.run_id)
@@ -321,7 +321,7 @@ def _finalize_status(ctx: _RunCtx) -> None:
     elif ctx.terminal_reached:
         # §3.1 step 7: reaching a terminal is necessary but not sufficient — the
         # run only COMPLETES if its definition_of_done is met, else it FAILs.
-        new_status = _dod_gate(ctx)
+        new_status = await _dod_gate(ctx)
     else:
         # The queue drained with nothing pending and no __terminal__/implicit-terminal edge
         # ever fired — shouldn't happen given §3.1's fail-fast rule, but leave status as-is
@@ -333,7 +333,7 @@ def _finalize_status(ctx: _RunCtx) -> None:
     ctx.con.commit()
 
 
-def _dod_gate(ctx: _RunCtx) -> str:
+async def _dod_gate(ctx: _RunCtx) -> str:
     """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
     definition_of_done is met, else FAILs. Expression criteria are enforced
     deterministically; prose criteria are recorded as unevaluated (advisory,
@@ -348,7 +348,7 @@ def _dod_gate(ctx: _RunCtx) -> str:
     # boundary. A raising verdict must not escape and strand the run at RUNNING;
     # fail closed (the DoD isn't demonstrably met) and record it.
     try:
-        result = evaluate_dod(dod, ctx.load_shared_state(), prose_verdict=ctx.dod_prose_verdict)
+        result = await evaluate_dod(dod, ctx.load_shared_state(), prose_verdict=ctx.dod_prose_verdict)
     except Exception as exc:  # noqa: BLE001
         _log_event(ctx.con, ctx.run_id, None, "DOD_EVALUATED", result=False, condition_evaluated="; ".join(dod.criteria))
         ctx.con.commit()
