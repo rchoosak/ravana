@@ -24,12 +24,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
-from typing import Any, Protocol
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, Protocol, TypeVar
 
 from ravana.compiler.graph import CompiledGraph, NodeExecutionContract
 from ravana.runtime.backoff import RetrySleep, backoff_delay
-from ravana.runtime.base import AgentOutputError, AgentTurnResult, TransientAgentError
+from ravana.runtime.base import (
+    AgentOutputError,
+    AgentTurnResult,
+    LLMUsage,
+    ProseJudgement,
+    ProseJudgementError,
+    TransientAgentError,
+)
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
@@ -51,6 +59,14 @@ from ravana.runtime.providers.base import (
 from ravana.schema.models import LLMConfig, LLMFallbackEntry
 
 SUBMIT_RESULT = "submit_result"
+# §3.1 step 7: the forced tool a non-guided provider submits its prose DoD
+# verdict through (the guided path returns the same shape as JSON text).
+SUBMIT_VERDICT = "submit_verdict"
+
+# The per-entry result of `_run_with_fallback` — an AgentTurnResult for node dispatch,
+# a raw verdict payload for a prose judgement. Generic so the shared chain isn't
+# tied to node-specific AgentTurnResult.
+_ChainResult = TypeVar("_ChainResult")
 
 # §3.6: per-fallback-entry retry budget — deliberately small (1) and separate
 # from the engine-level guards.max_retries_per_node, so a long fallback chain
@@ -68,6 +84,40 @@ _ENTRY_RETRY_CAP_SECONDS = 10.0
 # state_delta. (A stricter default could require declared state keys; kept
 # permissive here so agents without output_schema still work.)
 _ANY_OBJECT_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
+
+# §3.1 step 7: the structured shape the evaluated_by agent returns for a prose
+# DoD judgement — one {index, met} per criterion. Indices (not the criterion
+# text) key each verdict, so a long free-text criterion never has to survive a
+# round-trip as a JSON key. `reason` is optional: it only nudges the model to
+# justify its call and is NEVER persisted — the DoD event logs the
+# workflow-authored criteria plus the booleans, no model free-text (§8).
+_VERDICT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "met": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "met"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["verdicts"],
+    "additionalProperties": False,
+}
+
+_JUDGE_INSTRUCTION = (
+    "You are now acting as the Definition-of-Done judge for a completed run. "
+    "For each prose criterion you are given, decide whether the shared state "
+    "above is sufficient evidence that it is met. Judge conservatively: if the "
+    "evidence does not clearly establish a criterion, mark it NOT met."
+)
 
 
 class ToolExecutor(Protocol):
@@ -123,6 +173,17 @@ class _Strategy:
     use_guided: bool
     use_native_forced_tool: bool
     # If neither of the above, the only lever left is the repair loop.
+
+
+@dataclass
+class _JudgeState:
+    """Judgement-scoped accumulator shared across a prose judgement's fallback
+    entries (§3.1 step 7): token usage that must survive a failed attempt, and
+    a single `max_output_repairs` budget for the whole judgement rather than one
+    reset per entry."""
+
+    usage: LLMUsage = field(default_factory=LLMUsage)
+    repairs_used: int = 0
 
 
 def _select_strategy(adapter: ProviderAdapter, target: ProviderTarget) -> _Strategy:
@@ -284,18 +345,35 @@ class LLMGateway:
             raise ValueError(f"node '{node_id}' is not backed by agent '{agent_id}'")
         system = assemble_system_prompt(agent, self._graph.skills_by_id, shared_state)
         output_schema = contract.output_schema or _ANY_OBJECT_SCHEMA
+        chain = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
 
-        # §3.6: try the primary llm, then each fallback entry, each with its
-        # own small retry budget (default 1 retry per entry — distinct from,
-        # and smaller than, the engine-level max_retries_per_node, so a chain
-        # of N fallbacks can't multiply total attempts by N). A provider-level
-        # failure (ProviderError) is what a retry/fallback responds to; an
-        # AgentOutputError from repair-budget exhaustion is the model producing
-        # bad output, not a provider fault, so it propagates immediately —
-        # past this chain AND past the engine's transient retry (§3.6 line:
-        # "repair budget exhausted" is non-transient). Only when every entry's
-        # budget is spent does the node_execution fail.
-        chain: list[LLMConfig] = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
+        async def run_one(llm: LLMConfig) -> AgentTurnResult:
+            return await self._run_one_llm(
+                run_id=run_id, node_id=node_id, logical_visit_id=logical_visit_id,
+                contract=contract, llm=llm, system=system, output_schema=output_schema,
+            )
+
+        return await self._run_with_fallback(agent_id=agent_id, chain=chain, run_one=run_one)
+
+    async def _run_with_fallback(
+        self,
+        *,
+        agent_id: str,
+        chain: list[LLMConfig],
+        run_one: Callable[[LLMConfig], Awaitable[_ChainResult]],
+    ) -> _ChainResult:
+        """§3.6 fallback chain, shared by node dispatch and DoD prose judgement:
+        try the primary llm, then each fallback entry, each with its own small
+        retry budget (default 1 retry per entry — distinct from, and smaller
+        than, the engine-level max_retries_per_node, so a chain of N fallbacks
+        can't multiply total attempts by N). A provider-level failure
+        (ProviderError) is what a retry/fallback responds to; an AgentOutputError
+        from repair-budget exhaustion is the model producing bad output, not a
+        provider fault, so it propagates immediately — past this chain AND past
+        the engine's transient retry (§3.6: "repair budget exhausted" is
+        non-transient). Only when every entry's budget is spent does the caller
+        fail. `run_one` is what differs between callers (a node runs the tool
+        loop; a judgement runs a no-tools structured completion)."""
         last_error: Exception | None = None
         # Whether any entry's TERMINAL outcome was retryable. Per-entry, not
         # per-failure: an entry whose first failure was a 500 but whose retry
@@ -306,11 +384,7 @@ class LLMGateway:
             entry_error: ProviderError | None = None
             for try_index in range(_PER_ENTRY_RETRIES + 1):
                 try:
-                    return await self._run_one_llm(
-                        run_id=run_id, node_id=node_id, logical_visit_id=logical_visit_id,
-                        contract=contract, llm=llm,
-                        system=system, output_schema=output_schema,
-                    )
+                    return await run_one(llm)
                 except ProviderError as exc:
                     entry_error = exc
                     last_error = exc
@@ -611,6 +685,155 @@ class LLMGateway:
             # No tool calls at all — nudge toward submit_result.
             messages.append(UserMessage(text="Call submit_result now with your final output."))
             tool_call_count += 1
+
+    async def judge_prose(
+        self, agent_id: str, criteria: list[str], state: dict[str, Any]
+    ) -> ProseJudgement:
+        """§3.1 step 7: ask the `evaluated_by` agent to rule on prose DoD
+        criteria against the final shared state. Returns a ProseJudgement whose
+        `verdicts` are **position-aligned** to `criteria` (verdicts[i] rules on
+        criteria[i]) plus the LLM usage spent. Runs through the same §3.6
+        fallback chain as node dispatch (a judgement should survive a primary
+        provider outage the same way a node does). Usage and the repair budget
+        are tracked across the WHOLE logical judgement (a shared `_JudgeState`),
+        not reset per fallback entry: usage from an attempt that later failed
+        still counts, and `max_output_repairs` is one budget for the judgement,
+        not one-per-entry. This method's shape IS the engine's async
+        ProseVerdict."""
+        agent = self._graph.agents_by_id.get(agent_id)
+        if agent is None:
+            # A DoD naming an unknown evaluated_by agent is a config error. Raise
+            # (not silently pass) so the DoD gate's fail-closed boundary FAILs
+            # the run rather than completing on prose it never judged. (Also
+            # rejected at compile time — this is the runtime backstop.)
+            raise ValueError(f"definition_of_done.evaluated_by names unknown agent '{agent_id}'")
+        system = assemble_system_prompt(agent, self._graph.skills_by_id, state) + "\n\n" + _JUDGE_INSTRUCTION
+        numbered = "\n".join(f"{i}: {criterion}" for i, criterion in enumerate(criteria))
+        user_text = (
+            "Rule on each Definition-of-Done criterion below, using ONLY the "
+            "shared state above as evidence. Return a verdict for EVERY "
+            f"criterion, keyed by its index.\n\nCriteria:\n{numbered}"
+        )
+        chain = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
+        judge_state = _JudgeState()
+
+        async def run_one(llm: LLMConfig) -> dict[str, Any]:
+            return await self._judge_completion(llm, system, user_text, judge_state)
+
+        try:
+            payload = await self._run_with_fallback(agent_id=agent_id, chain=chain, run_one=run_one)
+        except Exception as exc:
+            # The whole judgement failed (repairs exhausted / all fallbacks down
+            # / a leaked-secret response). Surface the tokens already spent so the
+            # engine still accounts for them, and chain the cause for the durable
+            # outcome. (An unknown-agent ValueError is raised above, before any
+            # token is spent, so it isn't wrapped here.)
+            raise ProseJudgementError(judge_state.usage) from exc
+        return ProseJudgement(verdicts=_map_verdicts(payload, len(criteria)), usage=judge_state.usage)
+
+    async def _judge_completion(
+        self, llm: LLMConfig, system: str, user_text: str, state: _JudgeState
+    ) -> dict[str, Any]:
+        """A no-tools structured completion returning one _VERDICT_SCHEMA object
+        (the raw verdict payload). Reuses the node path's strategy pick (guided
+        vs forced-tool) and the shared parse/validate helpers (`_parse_json`,
+        `_validate`, `_request_for`), but is deliberately NOT merged with
+        `_run_guided`: this loop is guided-OR-forced-tool (a judgement never has
+        toolkits, so it can't reuse `_run_tool_loop`), threads a judgement-scoped
+        `_JudgeState` (usage sink + shared repair budget) rather than local
+        counters, counts usage *before* the secret gate (so a rejected response
+        is still billed), and requires exactly one `submit_verdict` call. A
+        shared abstraction over those ~6 axes of variation would take more
+        callbacks than the ~15 lines it saves (Speculative Generality) — the
+        genuinely reusable pieces are already extracted as module helpers.
+        `state` is the JUDGEMENT-scoped accumulator (shared across fallback
+        entries by `judge_prose`): usage is folded in after *every* provider
+        call, so an attempt that later fails still contributes its tokens, and
+        the repair budget is one `max_output_repairs` for the whole
+        judgement, not one per entry. Exhausting it raises AgentOutputError
+        (non-transient — the DoD gate turns it into a fail-closed run)."""
+        adapter = self._adapter_for(llm.provider)
+        strategy = self._strategy_for(adapter, llm)
+        api_key = self._resolve_api_key(llm)
+        guards = self._graph.doc.spec.graph.guards
+        messages: list[Message] = [UserMessage(text=user_text)]
+        while True:
+            if strategy.use_guided:
+                request = self._request_for(
+                    llm, api_key=api_key, system=system, messages=messages, output_schema=_VERDICT_SCHEMA
+                )
+            else:
+                verdict_tool = Tool(
+                    name=SUBMIT_VERDICT,
+                    description="Submit your Definition-of-Done verdict, one entry per criterion.",
+                    input_schema=_VERDICT_SCHEMA,
+                )
+                request = self._request_for(
+                    llm, api_key=api_key, system=system, messages=messages,
+                    tools=[verdict_tool], force_tool=SUBMIT_VERDICT,
+                )
+            response = await adapter.complete(request)
+            # Fold usage in FIRST — before the secret gate or any validation — so
+            # even a response that is then REJECTED (secret leak) or found invalid
+            # still counts toward the judgement's billed total.
+            state.usage = state.usage.add(response.input_tokens, response.output_tokens)
+            _ensure_provider_response_secret_free(response, api_key)
+            if strategy.use_guided:
+                payload, error = _parse_json(response.text)
+            else:
+                # A forced judgement must return EXACTLY one submit_verdict call.
+                # Zero, several (a second call could silently override the first
+                # — fail-open), or any other tool is invalid → repair, not
+                # last-write-wins.
+                calls = response.tool_calls
+                if len(calls) == 1 and calls[0].tool == SUBMIT_VERDICT:
+                    payload, error = calls[0].arguments, None
+                else:
+                    payload, error = None, f"expected exactly one submit_verdict tool call, got {len(calls)}"
+            if error is None:
+                error = _validate(payload, _VERDICT_SCHEMA)
+            if error is None:
+                return payload
+            if state.repairs_used >= guards.max_output_repairs:
+                raise AgentOutputError(
+                    f"DoD prose judgement produced invalid output after {state.repairs_used} repairs: {error}"
+                )
+            state.repairs_used += 1
+            messages.append(
+                UserMessage(text=f"That verdict was invalid: {error}. Return valid output matching the schema.")
+            )
+
+
+def _map_verdicts(payload: dict[str, Any], n: int) -> list[bool]:
+    """Turn a raw judgement payload into position-aligned booleans for `n` prose
+    criteria, FAIL-CLOSED. The shallow schema check only guarantees the
+    `verdicts` key exists — not that it's a well-formed list of {index, met} —
+    so map defensively:
+      - a criterion is met only when its entry's `met` is *exactly* True (a
+        truthy non-True value like the string "false" must not read as met);
+      - `index` must be a real int in `[0, n)` — a bool is rejected (`bool` is a
+        subclass of `int`, so `index: false` would otherwise collide with
+        criterion 0), and an out-of-range index is dropped;
+      - a duplicate ruling on the same index is unreliable, so that criterion
+        fails closed;
+      - any criterion with no usable entry is not met.
+    """
+    met_by_index: dict[int, bool] = {}
+    duplicates: set[int] = set()
+    verdicts = payload.get("verdicts")
+    for item in verdicts if isinstance(verdicts, list) else []:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        if type(index) is not int or not (0 <= index < n):  # `type() is` rejects bool indices
+            continue
+        if index in met_by_index:
+            duplicates.add(index)
+            continue
+        met_by_index[index] = item.get("met") is True
+    for index in duplicates:
+        met_by_index[index] = False  # ambiguous double-ruling → fail closed
+    return [met_by_index.get(i, False) for i in range(n)]
 
 
 def _error_result(tc, message: str) -> ToolResultMessage:

@@ -21,8 +21,9 @@ import click
 from ravana.compiler.graph import CompiledGraph, compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.compiler.validate import validate
-from ravana.engine.loop import resume_hitl, start_run
-from ravana.runtime.base import AgentRuntime
+from ravana.engine.dod import ProseVerdict
+from ravana.engine.loop import TERMINAL_STATUSES, resume_hitl, start_run
+from ravana.runtime.base import AgentRuntime, ProseJudge
 from ravana.runtime.gateway import LLMGateway
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
@@ -35,7 +36,6 @@ from ravana.schema.db import init_db
 from ravana.schema.loader import load_workflow_yaml
 
 RAVANA_DIR = ".ravana"
-TERMINAL_STATUSES = ("COMPLETED", "FAILED", "CANCELLED")
 
 
 def find_ravana_dir(start: Path | None = None) -> Path:
@@ -118,6 +118,15 @@ def _build_runtime(
     return MockAgentRuntime.from_yaml(mock_fixture)
 
 
+def _prose_verdict_for(runtime: AgentRuntime) -> ProseVerdict | None:
+    """§3.1 step 7: wire the DoD gate's prose judge for any runtime that can
+    judge prose (the `ProseJudge` capability). Detected structurally, not by
+    concrete class, so a future runtime that gains `judge_prose` is picked up
+    here with no CLI change. A runtime without the capability (the mock backend)
+    leaves prose criteria advisory (unevaluated, non-gating), as in Phase 0a."""
+    return runtime.judge_prose if isinstance(runtime, ProseJudge) else None
+
+
 async def _start_with_cleanup(
     con: sqlite3.Connection,
     graph: CompiledGraph,
@@ -136,6 +145,7 @@ async def _start_with_cleanup(
             workflow_id=workflow_id,
             triggered_by="cli-user",
             input_payload=input_payload,
+            dod_prose_verdict=_prose_verdict_for(runtime),
         )
     finally:
         await runtime.aclose()
@@ -150,7 +160,10 @@ async def _resume_with_cleanup(
     response: dict[str, Any],
 ) -> None:
     try:
-        await resume_hitl(con, graph, runtime, run_id, hitl_id, response)
+        await resume_hitl(
+            con, graph, runtime, run_id, hitl_id, response,
+            dod_prose_verdict=_prose_verdict_for(runtime),
+        )
     finally:
         await runtime.aclose()
 

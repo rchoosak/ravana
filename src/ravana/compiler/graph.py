@@ -155,6 +155,14 @@ def compile_workflow(doc: WorkflowDoc) -> CompiledGraph:
             if sk not in skills_by_id:
                 raise CompileError(f"agent '{agent.id}' references unknown skill '{sk}'")
 
+    # §3.1 step 7: the DoD's prose judge must name a real agent. Catch it here,
+    # not at the terminal — otherwise a typo'd evaluated_by runs the whole
+    # workflow before failing at the gate (and never fails at all under a
+    # backend with no prose judge, where prose is advisory).
+    dod = spec.definition_of_done
+    if dod is not None and dod.evaluated_by not in agents_by_id:
+        raise CompileError(f"definition_of_done.evaluated_by references unknown agent '{dod.evaluated_by}'")
+
     return CompiledGraph(
         doc=doc,
         nodes_by_id=nodes_by_id,

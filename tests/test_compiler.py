@@ -105,6 +105,16 @@ def test_node_cannot_grant_tool_outside_agent_allow_list():
         compile_workflow(WorkflowDoc.model_validate(raw))
 
 
+def test_unknown_dod_evaluated_by_is_rejected_at_compile(sdlc_graph):
+    # §3.1 step 7: a DoD naming a non-existent evaluated_by agent must fail at
+    # compile, not silently run the whole workflow and only surface at the gate
+    # (or never, under a backend with no prose judge).
+    raw = _load_raw()
+    raw["spec"]["definition_of_done"] = {"evaluated_by": "ghost", "criteria": ["all done"]}
+    with pytest.raises(CompileError, match="definition_of_done.evaluated_by references unknown agent 'ghost'"):
+        compile_workflow(WorkflowDoc.model_validate(raw))
+
+
 def test_init_db_adds_execution_contract_columns_to_existing_sqlite(tmp_path):
     db_path = tmp_path / "legacy.db"
     legacy = sqlite3.connect(db_path)

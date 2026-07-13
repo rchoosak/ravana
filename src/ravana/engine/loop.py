@@ -22,19 +22,25 @@ import asyncio
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from ravana.compiler.graph import TERMINAL, CompiledGraph
-from ravana.engine.dod import ProseVerdict, evaluate_dod
+from ravana.engine.dod import DodResult, ProseVerdict, evaluate_dod
 from ravana.engine.expr import apply_on_enter, eval_condition
 from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
 from ravana.observability.logging import log_event
 from ravana.runtime.backoff import RetrySleep, backoff_delay
-from ravana.runtime.base import AgentRuntime, AgentTurnResult, TransientAgentError
+from ravana.runtime.base import (
+    AgentRuntime,
+    AgentTurnResult,
+    LLMUsage,
+    ProseJudgementError,
+    TransientAgentError,
+)
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.secrets import ensure_secret_free, redact_secrets
-from ravana.schema.models import HITLConfig
+from ravana.schema.models import DefinitionOfDone, HITLConfig
 from ravana.schema.util import dumps, loads, new_id, now_iso
 
 _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
@@ -45,6 +51,12 @@ _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
 # needs it.
 _NODE_RETRY_BASE_SECONDS = 1.0
 _NODE_RETRY_CAP_SECONDS = 30.0
+TERMINAL_STATUSES = ("COMPLETED", "FAILED", "CANCELLED")
+_TERMINAL_STATUS_PLACEHOLDERS = ", ".join("?" for _ in TERMINAL_STATUSES)
+
+
+class TerminalPersistenceError(RuntimeError):
+    """The run outcome could not be persisted, including the status fallback."""
 
 
 @dataclass
@@ -306,63 +318,225 @@ async def _drain_queue(ctx: _RunCtx) -> None:
             break
         for node_id, _arrivals in stragglers:
             ctx.queue.append(node_id)
-    _finalize_status(ctx)
+    await _finalize_status(ctx)
 
 
-def _finalize_status(ctx: _RunCtx) -> None:
+async def _finalize_status(ctx: _RunCtx) -> None:
     if ctx.failed:
         return  # already set to FAILED at the point of failure
     run = _get_run(ctx.con, ctx.run_id)
+    # Idempotent finalization: once a run is terminal, a re-entry (a second
+    # drain, a stray resume) must NOT re-run the DoD gate — re-judging would
+    # double-bill, append a second DOD_EVALUATED, and could flip COMPLETED→FAILED
+    # on a non-deterministic verdict. A terminal state is final.
+    if run["status"] in TERMINAL_STATUSES:
+        return
     pending_hitl = ctx.con.execute(
         "SELECT 1 FROM hitl_request WHERE run_id = ? AND status = 'PENDING' LIMIT 1", (ctx.run_id,)
     ).fetchone()
     if pending_hitl:
-        new_status = "WAITING_HUMAN"
+        _write_final(ctx, "WAITING_HUMAN", event=None)
     elif ctx.terminal_reached:
         # §3.1 step 7: reaching a terminal is necessary but not sufficient — the
-        # run only COMPLETES if its definition_of_done is met, else it FAILs.
-        new_status = _dod_gate(ctx)
+        # run COMPLETEs only if its definition_of_done is met. DECIDE (pure and
+        # total — never writes, never raises) then WRITE (one transaction:
+        # event + status, with a status-only fallback if the write fails). This
+        # split is what keeps a DoD bug OR a rejected event write from stranding
+        # the run at RUNNING — the failure mode every review round has probed.
+        status, event = await _decide_dod(ctx)
+        _write_final(ctx, status, event=event)
     else:
-        # The queue drained with nothing pending and no __terminal__/implicit-terminal edge
-        # ever fired — shouldn't happen given §3.1's fail-fast rule, but leave status as-is
-        # rather than guess, so a genuine gap here is visible (stuck RUNNING) instead of
-        # silently reported as either outcome.
-        new_status = run["status"]
-    ended_at = now_iso() if new_status in ("COMPLETED", "FAILED") else run["ended_at"]
-    ctx.con.execute("UPDATE run SET status = ?, ended_at = ? WHERE id = ?", (new_status, ended_at, ctx.run_id))
-    ctx.con.commit()
+        # Queue drained with nothing pending and no terminal edge ever fired —
+        # shouldn't happen under §3.1's fail-fast rule; persist the status as-is
+        # so a genuine gap stays visible rather than being reported either way.
+        _write_final(ctx, run["status"], event=None)
 
 
-def _dod_gate(ctx: _RunCtx) -> str:
-    """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
-    definition_of_done is met, else FAILs. Expression criteria are enforced
-    deterministically; prose criteria are recorded as unevaluated (advisory,
-    not gating) until an evaluator agent is wired. Records the outcome as a
-    DOD_EVALUATED event either way, so a completion always carries the DoD
-    evidence and a failure carries the unmet criteria."""
+DodOutcome = Literal["met", "criteria_unmet", "evaluator_error", "cost_cap_exceeded"]
+
+
+@dataclass
+class _DodEvent:
+    """The DOD_EVALUATED row a DoD decision wants persisted — computed by
+    `_decide_dod` (pure), written by `_write_final` (the single persistence
+    point). Kept separate so the decision never touches the database."""
+
+    result: bool  # the GATE outcome (did the run COMPLETE), for the event's `result` column
+    condition: str  # "; ".join(dod.criteria)
+    state_diff: dict[str, Any]
+
+
+def _safe_rollback(con: sqlite3.Connection) -> None:
+    try:
+        con.rollback()
+    except Exception:  # noqa: BLE001 - a failed rollback must not mask the original error
+        pass
+
+
+def _update_run_status_if_active(ctx: _RunCtx, status: str) -> bool:
+    """CAS-like status update: terminal states are final, including a CANCELLED
+    committed while an async DoD judgement was in flight."""
+    ended_at = now_iso() if status in ("COMPLETED", "FAILED") else None
+    cursor = ctx.con.execute(
+        f"""UPDATE run
+            SET status = ?, ended_at = COALESCE(?, ended_at)
+            WHERE id = ? AND status NOT IN ({_TERMINAL_STATUS_PLACEHOLDERS})""",
+        (status, ended_at, ctx.run_id, *TERMINAL_STATUSES),
+    )
+    return cursor.rowcount == 1
+
+
+def _write_final(ctx: _RunCtx, status: str, *, event: _DodEvent | None) -> None:
+    """Persist the DoD event and active-run status in one transaction.
+
+    A concurrent terminal transition wins: the conditional status update fails
+    and the staged event is rolled back. If the event write fails, retry only a
+    status-only FAILED transition. If that status write is also unavailable,
+    raise TerminalPersistenceError so the caller/recovery layer cannot mistake a
+    still-RUNNING row for successful finalization.
+    """
+    try:
+        if event is not None:
+            _log_event(
+                ctx.con, ctx.run_id, None, "DOD_EVALUATED",
+                result=event.result, condition_evaluated=event.condition, state_diff=event.state_diff,
+            )
+        if not _update_run_status_if_active(ctx, status):
+            _safe_rollback(ctx.con)
+            return
+        ctx.con.commit()
+        if status == "FAILED" and event is not None:
+            log_event("ERROR", f"run {ctx.run_id} DoD gate FAILED ({event.state_diff.get('outcome')})", run_id=ctx.run_id)
+        return
+    except Exception as exc:  # noqa: BLE001 - a persistence failure must not strand the run
+        _safe_rollback(ctx.con)
+        log_event("ERROR", f"run {ctx.run_id} terminal write failed ({type(exc).__name__}); resolving status-only", run_id=ctx.run_id)
+    # Terminal failure path: status-only, NOT re-calling the failed event writer.
+    try:
+        if not _update_run_status_if_active(ctx, "FAILED"):
+            _safe_rollback(ctx.con)
+            return
+        ctx.con.commit()
+    except Exception as exc:  # noqa: BLE001 - surface an unwritable status to recovery
+        _safe_rollback(ctx.con)
+        raise TerminalPersistenceError(f"run {ctx.run_id} terminal status could not be persisted") from exc
+
+
+def _safe_usage(reported: object) -> LLMUsage | None:
+    """Rebuild a reported usage THROUGH LLMUsage so its fields are re-validated
+    before they reach persistence. `isinstance` alone is not enough: a frozen
+    LLMUsage can still be corrupted (a NaN or a non-serializable object forced in
+    via `object.__setattr__`) — reconstructing re-runs the non-negative-int
+    check and rejects it. Any unusable value → None (recorded as no usage);
+    never raises, so the fail-closed recording path can't itself throw."""
+    try:
+        return LLMUsage(reported.input_tokens, reported.output_tokens)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - a corrupted/duck-typed usage records as no usage
+        return None
+
+
+def _would_exceed_token_cap(ctx: _RunCtx, max_tokens_total: int | None, additional_tokens: int) -> bool:
+    """Would validated additional usage push this run past its token cap?"""
+    return max_tokens_total is not None and _total_tokens(ctx.con, ctx.run_id) + additional_tokens > max_tokens_total
+
+
+def _build_dod_event(
+    dod: DefinitionOfDone,
+    result: DodResult,
+    *,
+    outcome: DodOutcome,
+    status: str,
+    detail: str | None = None,
+    usage: LLMUsage | None = None,
+) -> _DodEvent:
+    """Build (do NOT write) the DOD_EVALUATED payload: the outcome, the
+    per-criterion result, any judgement usage, and a redacted failure cause.
+    The event's `result` is the GATE outcome (did the run COMPLETE), not
+    result.met — an evaluator_error or cost_cap FAILs even when the criteria it
+    managed to evaluate were vacuously met."""
+    state_diff: dict[str, Any] = {"outcome": outcome, **result.as_dict()}
+    if usage is not None:
+        state_diff["usage"] = {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
+    if detail is not None:
+        # §8 backstop: the cause is a fixed-shape error CLASS name (never the
+        # exception text), but redact defensively before it lands in the event.
+        state_diff["detail"] = redact_secrets(detail)
+    return _DodEvent(result=(status == "COMPLETED"), condition="; ".join(dod.criteria), state_diff=state_diff)
+
+
+def _minimal_dod_error_event(dod: DefinitionOfDone, exc: Exception) -> _DodEvent:
+    """Fixed-shape last resort that does not re-enter the normal event builder."""
+    try:
+        condition = "; ".join(dod.criteria)
+    except Exception:  # noqa: BLE001 - malformed in-memory config must still fail closed
+        condition = ""
+    return _DodEvent(
+        result=False,
+        condition=condition,
+        state_diff={
+            "outcome": "evaluator_error",
+            "met": False,
+            "results": [],
+            "unmet": [],
+            "unevaluated": [],
+            "detail": type(exc).__name__,
+        },
+    )
+
+
+async def _decide_dod(ctx: _RunCtx) -> tuple[str, _DodEvent | None]:
+    """§3.1 step 7, PURE + TOTAL: compute the run status and the DOD_EVALUATED
+    payload to persist (or None when there's no DoD). Performs NO writes —
+    persistence is `_write_final`'s job — and NEVER raises: any unforeseen error
+    becomes a fail-closed evaluator_error decision. Separating decide from
+    persist is what lets a rejected event write be handled by `_write_final`
+    without re-running the decision or re-invoking the failed writer.
+
+    Expression criteria are enforced deterministically; a prose judgement runs
+    the injected `dod_prose_verdict`, its usage revalidated through LLMUsage and
+    metered against guards.max_tokens_total. A failed judgement whose spend
+    breaches the cap is `cost_cap_exceeded` (governance precedence) else
+    `evaluator_error`; when no verdict is wired, prose stays advisory."""
     dod = ctx.graph.doc.spec.definition_of_done
     if dod is None:
-        return "COMPLETED"
-    # The DoD evaluation can run an INJECTED prose verdict (an agent turn), and
-    # this gate executes in _finalize_status — outside _dispatch's failure
-    # boundary. A raising verdict must not escape and strand the run at RUNNING;
-    # fail closed (the DoD isn't demonstrably met) and record it.
+        return "COMPLETED", None
+    guards = ctx.graph.doc.spec.graph.guards
     try:
-        result = evaluate_dod(dod, ctx.load_shared_state(), prose_verdict=ctx.dod_prose_verdict)
-    except Exception as exc:  # noqa: BLE001
-        _log_event(ctx.con, ctx.run_id, None, "DOD_EVALUATED", result=False, condition_evaluated="; ".join(dod.criteria))
-        ctx.con.commit()
-        log_event("ERROR", f"run {ctx.run_id} DoD evaluation raised, failing the run: {exc}", run_id=ctx.run_id)
-        return "FAILED"
-    _log_event(
-        ctx.con, ctx.run_id, None, "DOD_EVALUATED",
-        result=result.met, condition_evaluated="; ".join(dod.criteria), state_diff=result.as_dict(),
-    )
-    ctx.con.commit()
-    if result.met:
-        return "COMPLETED"
-    log_event("ERROR", f"run {ctx.run_id} reached a terminal but its definition_of_done is not met: {result.unmet}", run_id=ctx.run_id)
-    return "FAILED"
+        state = ctx.load_shared_state()
+        result = evaluate_dod(dod, state)  # pure/sync — expressions only
+        prose = result.prose_criteria
+        usage_for_event: LLMUsage | None = None
+        if prose and ctx.dod_prose_verdict is not None:
+            try:
+                judgement = await ctx.dod_prose_verdict(dod.evaluated_by, prose, state)
+                # Engine-boundary revalidation: rebuild usage THROUGH LLMUsage so
+                # a corrupted/duck-typed count is rejected here too (raises →
+                # caught by the outer handler → fail closed).
+                usage = LLMUsage(judgement.usage.input_tokens, judgement.usage.output_tokens)
+            except ProseJudgementError as exc:
+                # Failed after spending tokens. If that spend breaches the cap,
+                # cost_cap_exceeded takes precedence (governance); else
+                # evaluator_error. Persist only the underlying cause's CLASS.
+                spent = _safe_usage(exc.usage)
+                if spent is not None and _would_exceed_token_cap(ctx, guards.max_tokens_total, spent.total):
+                    return "FAILED", _build_dod_event(
+                        dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=spent,
+                        detail=f"DoD judgement's {spent.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
+                    )
+                cause = type(exc.__cause__).__name__ if exc.__cause__ else "ProseJudgementError"
+                return "FAILED", _build_dod_event(dod, result, outcome="evaluator_error", status="FAILED", detail=cause, usage=spent)
+            if _would_exceed_token_cap(ctx, guards.max_tokens_total, usage.total):
+                return "FAILED", _build_dod_event(
+                    dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=usage,
+                    detail=f"DoD judgement's {usage.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
+                )
+            result.apply_prose_verdict(judgement.verdicts)
+            usage_for_event = usage
+        status = "COMPLETED" if result.met else "FAILED"
+        outcome: DodOutcome = "met" if result.met else "criteria_unmet"
+        return status, _build_dod_event(dod, result, outcome=outcome, status=status, usage=usage_for_event)
+    except Exception as exc:  # noqa: BLE001 - unforeseen: the decision must be TOTAL; fail closed with an event
+        return "FAILED", _minimal_dod_error_event(dod, exc)
 
 
 async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
@@ -413,13 +587,32 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
         shared_state = _commit_state(ctx, shared_state, node_execution_id, "COMMIT", from_node=node_id, delta=on_enter_delta)
 
     try:
-        result = await ctx.runtime.run_turn(
+        raw = await ctx.runtime.run_turn(
             run_id=ctx.run_id,
             node_id=node_id,
             attempt=attempt,
             logical_visit_id=logical_visit_id,
             agent_id=agent.id,
             shared_state=shared_state,
+        )
+        # TOCTOU defense (§9 cost-cap integrity): read each field of the
+        # (possibly hostile/duck-typed) runtime result EXACTLY ONCE into a
+        # trusted, plain AgentTurnResult. The secret gate, the within-turn
+        # guards, the cost cap, and persistence ALL read this snapshot — so a
+        # result that reports one value at a check and another at use-time
+        # (probe: input_tokens reads 0 at the cap check, then -100 at the DB
+        # write) can't slip a poisoned/unchecked value past the boundary.
+        # Tokens are validated as non-negative ints here (they feed the hard
+        # cost cap); a bad value raises → caught below → the node fails closed.
+        node_usage = LLMUsage(raw.input_tokens, raw.output_tokens)
+        result = AgentTurnResult(
+            structured_payload=raw.structured_payload,
+            content=raw.content,
+            tool_calls=list(raw.tool_calls or []),
+            input_tokens=node_usage.input_tokens,
+            output_tokens=node_usage.output_tokens,
+            repair_count=raw.repair_count,
+            tool_call_count=raw.tool_call_count,
         )
         ensure_secret_free(
             {
@@ -470,7 +663,8 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
 
     # §3.4's within-turn guards and §9's cost cap are decided before the
     # durability transaction. A rejected turn is still recorded for audit,
-    # but its delta never reaches shared state or routing.
+    # but its delta never reaches shared state or routing. All reads below are
+    # of the trusted snapshot built above, never the live runtime result.
     if result.tool_call_count > guards.max_tool_calls_per_turn:
         _fail_run(
             ctx,
@@ -489,8 +683,7 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
             logical_visit_id=logical_visit_id,
         )
         return
-    projected_tokens = _total_tokens(con, ctx.run_id) + result.input_tokens + result.output_tokens
-    if guards.max_tokens_total is not None and projected_tokens > guards.max_tokens_total:
+    if _would_exceed_token_cap(ctx, guards.max_tokens_total, node_usage.total):
         _fail_run(
             ctx,
             node_id,
