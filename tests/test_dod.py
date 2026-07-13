@@ -449,6 +449,27 @@ def test_mutated_error_usage_fails_closed_not_stranded(con):
     assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "evaluator_error"
 
 
+def test_failure_path_revalidates_corrupted_usage(con):
+    # A ProseJudgementError carrying an LLMUsage whose frozen field was corrupted
+    # (past the guard, via object.__setattr__) to a non-serializable value must
+    # be re-validated: the engine rebuilds it through LLMUsage, records NO usage,
+    # and still writes the DOD_EVALUATED event + FAILs closed — rather than
+    # throwing on serialization and leaving no event.
+    async def verdict(evaluated_by, criteria, state):
+        u = LLMUsage(5, 5)
+        object.__setattr__(u, "input_tokens", object())  # corrupt past frozen + validation
+        raise ProseJudgementError(u)
+
+    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED" and run["ended_at"] is not None
+    event = _dod_event(con, run_id)
+    assert event is not None  # the event WAS written (corrupt usage didn't break serialization)
+    sd = json.loads(event["state_diff"])
+    assert sd["outcome"] == "evaluator_error"
+    assert "usage" not in sd  # corrupted usage recorded as no usage
+
+
 def test_failed_judgement_usage_is_recorded_on_event(con):
     # A judgement that fails outright (ProseJudgementError) still spent tokens;
     # the engine records them on the DOD_EVALUATED event so a failed judgement's

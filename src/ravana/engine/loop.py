@@ -356,6 +356,19 @@ async def _finalize_status(ctx: _RunCtx) -> None:
 DodOutcome = Literal["met", "criteria_unmet", "evaluator_error", "cost_cap_exceeded"]
 
 
+def _safe_usage(reported: object) -> LLMUsage | None:
+    """Rebuild a reported usage THROUGH LLMUsage so its fields are re-validated
+    before they reach persistence. `isinstance` alone is not enough: a frozen
+    LLMUsage can still be corrupted (a NaN or a non-serializable object forced in
+    via `object.__setattr__`) — reconstructing re-runs the non-negative-int
+    check and rejects it. Any unusable value → None (recorded as no usage);
+    never raises, so the fail-closed recording path can't itself throw."""
+    try:
+        return LLMUsage(reported.input_tokens, reported.output_tokens)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - a corrupted/duck-typed usage records as no usage
+        return None
+
+
 async def _dod_gate(ctx: _RunCtx) -> str:
     """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
     definition_of_done is met, else FAILs. Expression criteria are enforced
@@ -406,7 +419,11 @@ async def _dod_gate(ctx: _RunCtx) -> str:
         # not AttributeError past this handler (which runs outside the broad
         # boundary) and strand the run — an unusable usage is simply not recorded.
         cause = type(exc.__cause__).__name__ if exc.__cause__ else "ProseJudgementError"
-        spent = exc.usage if isinstance(exc.usage, LLMUsage) else None
+        # Rebuild through LLMUsage (like the success path), NOT just isinstance:
+        # a frozen usage whose field was corrupted to a NaN / non-serializable
+        # value would otherwise poison the total or break event serialization
+        # (→ no DOD_EVALUATED). A bad value records no usage; the event still writes.
+        spent = _safe_usage(exc.usage)
         return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=cause, status="FAILED", usage=spent)
     except Exception as exc:  # noqa: BLE001 - fail closed; persist the error CLASS, never its (possibly secret-bearing) text
         return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
