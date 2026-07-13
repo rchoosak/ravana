@@ -10,12 +10,14 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
-@dataclass
+@dataclass(frozen=True)
 class LLMUsage:
-    """Token usage accumulated over one or more provider calls. Non-negative by
-    construction — a negative count (a buggy or hostile runtime reporting
-    `input_tokens=-100` to duck a cost cap) is rejected here, at the value
-    object, rather than silently subtracted from a run's metered total. `add`
+    """Token usage accumulated over one or more provider calls. Non-negative
+    **and immutable** by construction: a negative count (a buggy or hostile
+    runtime reporting `input_tokens=-100` to duck a cost cap) is rejected at
+    construction, and `frozen=True` blocks a post-hoc `usage.input_tokens = -100`
+    that would otherwise slip past that check straight into the metered total.
+    `add` returns a *new* LLMUsage (the frozen instance can't self-mutate), which
     is the accumulation point across retries/fallbacks so usage from an attempt
     that later failed is never lost."""
 
@@ -30,11 +32,9 @@ class LLMUsage:
     def total(self) -> int:
         return self.input_tokens + self.output_tokens
 
-    def add(self, input_tokens: int, output_tokens: int) -> None:
-        if input_tokens < 0 or output_tokens < 0:
-            raise ValueError(f"token usage must be non-negative, got {input_tokens}/{output_tokens}")
-        self.input_tokens += input_tokens
-        self.output_tokens += output_tokens
+    def add(self, input_tokens: int, output_tokens: int) -> LLMUsage:
+        """A new LLMUsage with these (non-negative) tokens folded in."""
+        return LLMUsage(self.input_tokens + input_tokens, self.output_tokens + output_tokens)
 
 
 @dataclass
@@ -50,6 +50,18 @@ class ProseJudgement:
 
     verdicts: list[bool] = field(default_factory=list)
     usage: LLMUsage = field(default_factory=LLMUsage)
+
+
+class ProseJudgementError(Exception):
+    """Raised by a prose judge when the whole judgement fails (repairs
+    exhausted, every fallback down, a leaked-secret response). Carries the
+    token `usage` spent up to the failure so the engine still accounts for it
+    (a failed judgement's tokens were still billed), and chains the underlying
+    cause via `__cause__` for the durable outcome's classification."""
+
+    def __init__(self, usage: "LLMUsage") -> None:
+        super().__init__("prose judgement failed")
+        self.usage = usage
 
 
 @runtime_checkable

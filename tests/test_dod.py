@@ -258,11 +258,6 @@ def test_dod_event_records_judgement_usage(con):
     run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
     usage = json.loads(_dod_event(con, run_id)["state_diff"])["usage"]
     assert usage == {"input_tokens": 40, "output_tokens": 12}
-    # And it is recorded as a node_execution row so _total_tokens counts it.
-    total = con.execute(
-        "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS t FROM node_execution WHERE run_id = ?", (run_id,)
-    ).fetchone()["t"]
-    assert total >= 52
 
 
 def test_dod_judgement_usage_is_metered_against_max_tokens_total(con):
@@ -309,3 +304,29 @@ def test_negative_usage_verdict_fails_closed(con):
 def test_llm_usage_rejects_negative_tokens():
     with pytest.raises(ValueError, match="non-negative"):
         LLMUsage(input_tokens=-1, output_tokens=0)
+
+
+def test_llm_usage_is_immutable():
+    # A post-construction `usage.input_tokens = -100` (a cost-cap bypass) must
+    # fail — the non-negative invariant is held by frozen-ness, not just at
+    # construction.
+    usage = LLMUsage(input_tokens=5, output_tokens=5)
+    with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+        usage.input_tokens = -100  # type: ignore[misc]
+
+
+def test_failed_judgement_usage_is_recorded_on_event(con):
+    # A judgement that fails outright (ProseJudgementError) still spent tokens;
+    # the engine records them on the DOD_EVALUATED event so a failed judgement's
+    # cost isn't invisible to accounting, and fails the run closed.
+    from ravana.runtime.base import ProseJudgementError
+
+    async def verdict(evaluated_by, criteria, state):
+        raise ProseJudgementError(LLMUsage(input_tokens=300, output_tokens=60))
+
+    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
+    run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    event = json.loads(_dod_event(con, run_id)["state_diff"])
+    assert event["outcome"] == "evaluator_error"
+    assert event["usage"] == {"input_tokens": 300, "output_tokens": 60}

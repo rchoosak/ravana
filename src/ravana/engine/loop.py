@@ -31,7 +31,13 @@ from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
 from ravana.observability.logging import log_event
 from ravana.runtime.backoff import RetrySleep, backoff_delay
-from ravana.runtime.base import AgentRuntime, AgentTurnResult, ProseJudgement, TransientAgentError
+from ravana.runtime.base import (
+    AgentRuntime,
+    AgentTurnResult,
+    LLMUsage,
+    ProseJudgementError,
+    TransientAgentError,
+)
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.secrets import ensure_secret_free, redact_secrets
 from ravana.schema.models import DefinitionOfDone, HITLConfig
@@ -333,42 +339,19 @@ async def _finalize_status(ctx: _RunCtx) -> None:
     ctx.con.commit()
 
 
-# §3.1 step 7: the reserved node_execution.node_id under which a prose DoD
-# judgement's token usage is recorded, so it counts in _total_tokens / the
-# run's cost cap / §9's node_execution cost dashboards. Not a real graph node
-# (node_execution.node_id is free TEXT, no FK), so it never collides with one.
-_DOD_NODE_ID = "__dod__"
-
-
-def _record_dod_execution(ctx: _RunCtx, judgement: ProseJudgement) -> None:
-    """Record a prose judgement's LLM token usage as a node_execution row so it
-    enters the same accounting every node turn does (§9). Keyed idempotently on
-    (run_id, `__dod__`, attempt=1); the gate runs once at the terminal, so one
-    row per run. Reading `judgement.usage` here (inside the gate's try) also
-    doubles as the malformed-judgement guard — a None/garbled verdict raises and
-    fails the run closed rather than stranding it."""
-    now = now_iso()
-    ctx.con.execute(
-        """INSERT OR REPLACE INTO node_execution
-               (id, run_id, node_id, attempt, logical_visit_id, status, input_tokens, output_tokens, started_at, finished_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (
-            new_id(), ctx.run_id, _DOD_NODE_ID, 1, "", "SUCCEEDED",
-            judgement.usage.input_tokens, judgement.usage.output_tokens, now, now,
-        ),
-    )
+DodOutcome = Literal["met", "criteria_unmet", "evaluator_error", "cost_cap_exceeded"]
 
 
 async def _dod_gate(ctx: _RunCtx) -> str:
     """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
     definition_of_done is met, else FAILs. Expression criteria are enforced
     deterministically (pure, sync); prose criteria are judged by the injected
-    `dod_prose_verdict` — its LLM usage is metered against
-    guards.max_tokens_total before the run may COMPLETE, so a judgement can't
-    slip the run past its hard cost cap. Records a DOD_EVALUATED event on every
-    path with a durable `outcome` so a later reader can tell a criterion that
-    was unmet from an evaluator that failed (provider down / repair exhausted).
-    When no verdict is wired, prose criteria stay advisory (not gating)."""
+    `dod_prose_verdict`. The judgement's LLM usage is metered against
+    guards.max_tokens_total (node tokens + this judgement's) before the run may
+    COMPLETE, so a judgement can't slip the run past its hard cost cap. Records a
+    DOD_EVALUATED event on every path with a durable `outcome` so a later reader
+    can tell an unmet criterion from an evaluator that failed (provider down /
+    repair exhausted). When no verdict is wired, prose stays advisory."""
     dod = ctx.graph.doc.spec.definition_of_done
     if dod is None:
         return "COMPLETED"
@@ -383,33 +366,36 @@ async def _dod_gate(ctx: _RunCtx) -> str:
         )
     # A prose judgement runs an agent turn, and this gate executes in
     # _finalize_status — OUTSIDE _dispatch's failure boundary. The whole
-    # obtain→record→meter→apply block is wrapped: a verdict that raises, OR
-    # returns something malformed (None, a bad usage count), must fail the run
-    # CLOSED with a durable cause — never escape and strand it at RUNNING.
+    # obtain→meter→apply block is wrapped: a verdict that raises, OR returns
+    # something malformed (None, a bad shape), must fail the run CLOSED with a
+    # durable cause — never escape and strand it at RUNNING.
     try:
         judgement = await ctx.dod_prose_verdict(dod.evaluated_by, prose, state)
-        # Record the judgement's tokens as a node_execution row so _total_tokens
-        # (and §9's node_execution cost dashboards) count them, then meter the
-        # run's hard cap against that updated total — a judgement can't slip a
-        # run past max_tokens_total, and its spend isn't invisible to billing.
-        _record_dod_execution(ctx, judgement)
-        over_cap = guards.max_tokens_total is not None and _total_tokens(ctx.con, ctx.run_id) > guards.max_tokens_total
+        # §3.6 cost cap: node tokens so far + this judgement's tokens. A
+        # judgement that pushes the run past max_tokens_total FAILs it.
+        over_cap = (
+            guards.max_tokens_total is not None
+            and _total_tokens(ctx.con, ctx.run_id) + judgement.usage.total > guards.max_tokens_total
+        )
         if not over_cap:
             result.apply_prose_verdict(judgement.verdicts)
+    except ProseJudgementError as exc:
+        # The judgement failed AFTER spending tokens — record what it billed
+        # (so the failure path isn't invisible to accounting) and fail closed,
+        # persisting only the underlying cause's CLASS.
+        cause = type(exc.__cause__).__name__ if exc.__cause__ else "ProseJudgementError"
+        return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=cause, status="FAILED", usage=exc.usage)
     except Exception as exc:  # noqa: BLE001 - fail closed; persist the error CLASS, never its (possibly secret-bearing) text
         return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
     if over_cap:
         return _finish_dod(
-            ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=judgement,
+            ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=judgement.usage,
             detail=f"DoD judgement's {judgement.usage.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
         )
     return _finish_dod(
         ctx, dod, result, outcome="met" if result.met else "criteria_unmet",
-        status="COMPLETED" if result.met else "FAILED", usage=judgement,
+        status="COMPLETED" if result.met else "FAILED", usage=judgement.usage,
     )
-
-
-DodOutcome = Literal["met", "criteria_unmet", "evaluator_error", "cost_cap_exceeded"]
 
 
 def _finish_dod(
@@ -420,19 +406,21 @@ def _finish_dod(
     outcome: DodOutcome,
     status: str,
     detail: str | None = None,
-    usage: ProseJudgement | None = None,
+    usage: LLMUsage | None = None,
 ) -> str:
-    """Record one DOD_EVALUATED event carrying the outcome (met / criteria_unmet
+    """Stage one DOD_EVALUATED event carrying the outcome (met / criteria_unmet
     / evaluator_error / cost_cap_exceeded), the per-criterion result, any
     judgement token usage, and — for a failure cause — a redacted detail, then
-    return the run status. Centralizes the single-log-per-gate invariant."""
+    return the run status. Deliberately does NOT commit: `_finalize_status`
+    UPDATEs the run status and commits ONCE, so the terminal DoD event and the
+    run's terminal status land atomically (a crash between them can't leave a
+    RUNNING run carrying a terminal DoD event)."""
     state_diff: dict[str, Any] = {"outcome": outcome, **result.as_dict()}
     if usage is not None:
-        state_diff["usage"] = {"input_tokens": usage.usage.input_tokens, "output_tokens": usage.usage.output_tokens}
+        state_diff["usage"] = {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
     if detail is not None:
-        # §8 backstop: the cause ends up in the persisted event; the gateway's
-        # errors are fixed-shape and secret-free by construction, but redact as
-        # defense in depth before it lands in the log.
+        # §8 backstop: the cause is a fixed-shape error CLASS name (never the
+        # exception text), but redact defensively before it lands in the event.
         state_diff["detail"] = redact_secrets(detail)
     _log_event(
         # `result` is the GATE outcome (did the run COMPLETE), not result.met —
@@ -441,7 +429,6 @@ def _finish_dod(
         ctx.con, ctx.run_id, None, "DOD_EVALUATED",
         result=(status == "COMPLETED"), condition_evaluated="; ".join(dod.criteria), state_diff=state_diff,
     )
-    ctx.con.commit()
     if status == "FAILED":
         log_event(
             "ERROR",

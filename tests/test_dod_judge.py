@@ -18,7 +18,7 @@ import pytest
 from ravana.compiler.graph import compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.engine.loop import start_run
-from ravana.runtime.base import AgentOutputError
+from ravana.runtime.base import AgentOutputError, ProseJudgementError
 from ravana.runtime.gateway import SUBMIT_VERDICT, LLMGateway
 from ravana.runtime.providers.base import (
     Capability,
@@ -166,8 +166,9 @@ def test_judge_prose_multiple_submit_verdict_is_fail_closed():
         ],
     )
     adapter = FakeAdapter(responses=[two])
-    with pytest.raises(AgentOutputError):
+    with pytest.raises(ProseJudgementError) as ei:
         asyncio.run(LLMGateway(_judge_graph(), {"anthropic": adapter}).judge_prose("pm", ["c0"], {}))
+    assert isinstance(ei.value.__cause__, AgentOutputError)
 
 
 # --- config error, repair, fallback ----------------------------------------
@@ -188,14 +189,25 @@ def test_judge_prose_repairs_then_succeeds():
 
 def test_judge_prose_exhausts_repairs_then_raises():
     adapter = FakeAdapter(responses=[_verdict_call({"wrong": "shape"})])
-    with pytest.raises(AgentOutputError):
+    with pytest.raises(ProseJudgementError) as ei:
         asyncio.run(LLMGateway(_judge_graph(), {"anthropic": adapter}).judge_prose("pm", ["c0"], {}))
+    assert isinstance(ei.value.__cause__, AgentOutputError)  # underlying cause preserved
     assert len(adapter.requests) == 3  # initial + max_output_repairs (2)
+
+
+def test_judge_prose_failed_judgement_still_carries_usage():
+    # A judgement that fails outright (repairs exhausted) still reports the
+    # tokens it spent, so the engine can account for a failed judgement's cost.
+    adapter = FakeAdapter(responses=[_verdict_call({"wrong": "shape"}, input_tokens=100, output_tokens=20)])
+    with pytest.raises(ProseJudgementError) as ei:
+        asyncio.run(LLMGateway(_judge_graph(), {"anthropic": adapter}).judge_prose("pm", ["c0"], {}))
+    # 3 attempts (initial + 2 repairs), each 100/20 -> 300/60.
+    assert ei.value.usage.input_tokens == 300 and ei.value.usage.output_tokens == 60
 
 
 def test_judge_prose_missing_tool_call_is_repaired_not_crashed():
     adapter = FakeAdapter(responses=[ProviderResponse(text="I refuse to use the tool", tool_calls=[])])
-    with pytest.raises(AgentOutputError):
+    with pytest.raises(ProseJudgementError):
         asyncio.run(LLMGateway(_judge_graph(), {"anthropic": adapter}).judge_prose("pm", ["c0"], {}))
 
 

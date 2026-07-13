@@ -26,11 +26,18 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from ravana.compiler.graph import CompiledGraph, NodeExecutionContract
 from ravana.runtime.backoff import RetrySleep, backoff_delay
-from ravana.runtime.base import AgentOutputError, AgentTurnResult, LLMUsage, ProseJudgement, TransientAgentError
+from ravana.runtime.base import (
+    AgentOutputError,
+    AgentTurnResult,
+    LLMUsage,
+    ProseJudgement,
+    ProseJudgementError,
+    TransientAgentError,
+)
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.prompt import assemble_system_prompt
 from ravana.runtime.schema_validate import validate_json
@@ -55,6 +62,11 @@ SUBMIT_RESULT = "submit_result"
 # §3.1 step 7: the forced tool a non-guided provider submits its prose DoD
 # verdict through (the guided path returns the same shape as JSON text).
 SUBMIT_VERDICT = "submit_verdict"
+
+# The per-entry result of `_run_chain` — an AgentTurnResult for node dispatch,
+# a raw verdict payload for a prose judgement. Generic so the shared chain isn't
+# tied to node-specific AgentTurnResult.
+_ChainResult = TypeVar("_ChainResult")
 
 # §3.6: per-fallback-entry retry budget — deliberately small (1) and separate
 # from the engine-level guards.max_retries_per_node, so a long fallback chain
@@ -348,8 +360,8 @@ class LLMGateway:
         *,
         agent_id: str,
         chain: list[LLMConfig],
-        run_one: Callable[[LLMConfig], Awaitable[AgentTurnResult]],
-    ) -> AgentTurnResult:
+        run_one: Callable[[LLMConfig], Awaitable[_ChainResult]],
+    ) -> _ChainResult:
         """§3.6 fallback chain, shared by node dispatch and DoD prose judgement:
         try the primary llm, then each fallback entry, each with its own small
         retry budget (default 1 retry per entry — distinct from, and smaller
@@ -705,28 +717,33 @@ class LLMGateway:
         chain = [agent.llm, *(_fallback_to_llm(f) for f in agent.llm.fallback)]
         judge_state = _JudgeState()
 
-        async def run_one(llm: LLMConfig) -> AgentTurnResult:
+        async def run_one(llm: LLMConfig) -> dict[str, Any]:
             return await self._judge_completion(llm, system, user_text, judge_state)
 
-        turn = await self._run_chain(agent_id=agent_id, chain=chain, run_one=run_one)
-        return ProseJudgement(
-            verdicts=_map_verdicts(turn.structured_payload, len(criteria)),
-            usage=judge_state.usage,
-        )
+        try:
+            payload = await self._run_chain(agent_id=agent_id, chain=chain, run_one=run_one)
+        except Exception as exc:
+            # The whole judgement failed (repairs exhausted / all fallbacks down
+            # / a leaked-secret response). Surface the tokens already spent so the
+            # engine still accounts for them, and chain the cause for the durable
+            # outcome. (An unknown-agent ValueError is raised above, before any
+            # token is spent, so it isn't wrapped here.)
+            raise ProseJudgementError(judge_state.usage) from exc
+        return ProseJudgement(verdicts=_map_verdicts(payload, len(criteria)), usage=judge_state.usage)
 
     async def _judge_completion(
         self, llm: LLMConfig, system: str, user_text: str, state: _JudgeState
-    ) -> AgentTurnResult:
-        """A no-tools structured completion returning one _VERDICT_SCHEMA object.
-        Reuses the node path's strategy pick (guided vs forced-tool) and small
-        helpers, but deliberately offers NO toolkits and skips the tool loop's
-        idempotency/bookkeeping — a judgement has no side effects. `state` is the
-        JUDGEMENT-scoped accumulator (shared across fallback entries by
-        `judge_prose`): usage is added after *every* provider call, so an
-        attempt that later fails still contributes its tokens, and the repair
-        budget is one `max_output_repairs` for the whole judgement, not one per
-        entry. Exhausting it raises AgentOutputError (non-transient — the DoD
-        gate turns it into a fail-closed run)."""
+    ) -> dict[str, Any]:
+        """A no-tools structured completion returning one _VERDICT_SCHEMA object
+        (the raw verdict payload). Reuses the node path's strategy pick (guided
+        vs forced-tool) and small helpers, but deliberately offers NO toolkits
+        and skips the tool loop's idempotency/bookkeeping — a judgement has no
+        side effects. `state` is the JUDGEMENT-scoped accumulator (shared across
+        fallback entries by `judge_prose`): usage is folded in after *every*
+        provider call, so an attempt that later fails still contributes its
+        tokens, and the repair budget is one `max_output_repairs` for the whole
+        judgement, not one per entry. Exhausting it raises AgentOutputError
+        (non-transient — the DoD gate turns it into a fail-closed run)."""
         adapter = self._adapter_for(llm.provider)
         strategy = self._strategy_for(adapter, llm)
         api_key = self._resolve_api_key(llm)
@@ -748,11 +765,11 @@ class LLMGateway:
                     tools=[verdict_tool], force_tool=SUBMIT_VERDICT,
                 )
             response = await adapter.complete(request)
+            # Fold usage in FIRST — before the secret gate or any validation — so
+            # even a response that is then REJECTED (secret leak) or found invalid
+            # still counts toward the judgement's billed total.
+            state.usage = state.usage.add(response.input_tokens, response.output_tokens)
             _ensure_provider_response_secret_free(response, api_key)
-            # Meter BEFORE any validation/repair decision, so tokens from an
-            # attempt that turns out invalid (or that a later call will abandon)
-            # are never lost from the judgement's total.
-            state.usage.add(response.input_tokens, response.output_tokens)
             if strategy.use_guided:
                 payload, error = _parse_json(response.text)
             else:
@@ -768,7 +785,7 @@ class LLMGateway:
             if error is None:
                 error = _validate(payload, _VERDICT_SCHEMA)
             if error is None:
-                return AgentTurnResult(structured_payload=payload, repair_count=state.repairs_used)
+                return payload
             if state.repairs_used >= guards.max_output_repairs:
                 raise AgentOutputError(
                     f"DoD prose judgement produced invalid output after {state.repairs_used} repairs: {error}"
