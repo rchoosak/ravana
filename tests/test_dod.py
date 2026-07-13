@@ -260,6 +260,43 @@ def test_dod_event_records_judgement_usage(con):
     assert usage == {"input_tokens": 40, "output_tokens": 12}
 
 
+def test_dod_finalization_is_idempotent_on_reentry(con):
+    # A re-entry after a run is already terminal must NOT re-judge, must not
+    # append a second DOD_EVALUATED, and must not flip the terminal status.
+    from ravana.engine.loop import _RunCtx, _finalize_status
+
+    calls = {"n": 0}
+
+    async def verdict(evaluated_by, criteria, state):
+        calls["n"] += 1
+        # Flip the verdict on the 2nd call, so a non-idempotent re-judge would
+        # visibly change COMPLETED -> FAILED.
+        return ProseJudgement(verdicts=[calls["n"] == 1 for _ in criteria])
+
+    graph = compile_workflow(_dod_workflow(["a prose criterion"]))
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    runtime = MockAgentRuntime({"only": [{"structured_payload": {"qa_status": "PASS"}}]})
+    run_id = asyncio.run(
+        start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id, dod_prose_verdict=verdict)
+    )
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "COMPLETED"
+    assert calls["n"] == 1
+
+    # Re-enter finalization on the already-terminal run.
+    ctx = _RunCtx(
+        con=con, graph=graph, run_id=run_id, org_id="test", workflow_id=workflow_id,
+        runtime=runtime, terminal_reached=True, dod_prose_verdict=verdict,
+    )
+    asyncio.run(_finalize_status(ctx))
+
+    assert calls["n"] == 1  # judge NOT called again
+    n_events = con.execute(
+        "SELECT COUNT(*) AS c FROM state_transition_log WHERE run_id = ? AND event_type = 'DOD_EVALUATED'", (run_id,)
+    ).fetchone()["c"]
+    assert n_events == 1  # no second event
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "COMPLETED"  # not flipped
+
+
 def test_dod_judgement_usage_is_metered_against_max_tokens_total(con):
     # A judgement whose tokens push the run over guards.max_tokens_total FAILs
     # the run (cost cap), even though every criterion was judged met.

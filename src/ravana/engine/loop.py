@@ -319,6 +319,13 @@ async def _finalize_status(ctx: _RunCtx) -> None:
     if ctx.failed:
         return  # already set to FAILED at the point of failure
     run = _get_run(ctx.con, ctx.run_id)
+    # Idempotent finalization: once a run has reached a terminal status, a
+    # re-entry (a second drain, a stray resume) must NOT re-run the DoD gate.
+    # Re-judging would call the evaluator again (double cost), append a second
+    # DOD_EVALUATED event, and could flip a COMPLETED run to FAILED on a
+    # non-deterministic verdict. A terminal state is final.
+    if run["status"] in ("COMPLETED", "FAILED", "CANCELLED"):
+        return
     pending_hitl = ctx.con.execute(
         "SELECT 1 FROM hitl_request WHERE run_id = ? AND status = 'PENDING' LIMIT 1", (ctx.run_id,)
     ).fetchone()
