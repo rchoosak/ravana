@@ -301,9 +301,20 @@ def test_negative_usage_verdict_fails_closed(con):
     assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "FAILED"
 
 
-def test_llm_usage_rejects_negative_tokens():
-    with pytest.raises(ValueError, match="non-negative"):
-        LLMUsage(input_tokens=-1, output_tokens=0)
+@pytest.mark.parametrize("bad", [-1, True, False, 1.5, float("nan"), float("inf")])
+def test_llm_usage_rejects_non_int_or_negative(bad):
+    # A token count is a non-negative *int*: bool (an int subclass), float, and
+    # NaN/inf must all be rejected — NaN especially, since `NaN > cap` is False
+    # and would make the cost cap un-triggerable.
+    with pytest.raises(ValueError, match="non-negative int"):
+        LLMUsage(input_tokens=bad, output_tokens=0)
+
+
+def test_llm_usage_add_rejects_negative_delta_not_netted():
+    # A -100 delta must raise, not be absorbed against a larger positive total
+    # (100 + -100 = 0 would otherwise pass a result-only check).
+    with pytest.raises(ValueError, match="non-negative int"):
+        LLMUsage(100, 20).add(-100, -20)
 
 
 def test_llm_usage_is_immutable():
@@ -313,6 +324,26 @@ def test_llm_usage_is_immutable():
     usage = LLMUsage(input_tokens=5, output_tokens=5)
     with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
         usage.input_tokens = -100  # type: ignore[misc]
+
+
+def test_corrupted_judgement_usage_fails_closed_not_over_cap(con):
+    # A runtime handing back a duck-typed usage with a NaN count must NOT let the
+    # run COMPLETE by making `NaN > cap` False — the engine rebuilds usage through
+    # LLMUsage, which rejects it, and the run FAILs closed.
+    import types
+
+    async def verdict(evaluated_by, criteria, state):
+        judgement = ProseJudgement(verdicts=[True])
+        judgement.usage = types.SimpleNamespace(input_tokens=float("nan"), output_tokens=0, total=float("nan"))
+        return judgement
+
+    run_id = _start_with_verdict(
+        con, _dod_workflow(["a prose criterion"], guards={"max_tokens_total": 10}),
+        {"qa_status": "PASS"}, None, raw=verdict,
+    )
+    run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "evaluator_error"
 
 
 def test_failed_judgement_usage_is_recorded_on_event(con):

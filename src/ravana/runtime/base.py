@@ -10,31 +10,48 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
+def _as_token_count(value: int) -> int:
+    """A token count is a non-negative **int** — nothing else. A bare `< 0`
+    check is not enough: `bool` is an int subclass (so `True`/`False` would pass
+    and mean 1/0), and `float`/`NaN` slip past every comparison (`NaN < 0`,
+    `NaN >= 0`, and `NaN > cap` are all False — a NaN usage would make the cost
+    cap un-triggerable and land NaN in the persisted event). Require an exact
+    int that is `>= 0`."""
+    if type(value) is not int or value < 0:
+        raise ValueError(f"token usage must be a non-negative int, got {value!r} ({type(value).__name__})")
+    return value
+
+
 @dataclass(frozen=True)
 class LLMUsage:
-    """Token usage accumulated over one or more provider calls. Non-negative
-    **and immutable** by construction: a negative count (a buggy or hostile
-    runtime reporting `input_tokens=-100` to duck a cost cap) is rejected at
-    construction, and `frozen=True` blocks a post-hoc `usage.input_tokens = -100`
-    that would otherwise slip past that check straight into the metered total.
-    `add` returns a *new* LLMUsage (the frozen instance can't self-mutate), which
-    is the accumulation point across retries/fallbacks so usage from an attempt
-    that later failed is never lost."""
+    """Token usage accumulated over one or more provider calls. Each field is a
+    non-negative **int** (see `_as_token_count`) and the instance is **immutable**
+    (`frozen=True`) — so neither a hostile value at construction (`bool`, `float`,
+    `NaN`, negative) nor a post-hoc `usage.input_tokens = -100` can slip a bad
+    count into the metered total. `add` validates each incoming *delta* (not just
+    the running sum, so a `-100` can't be absorbed by a larger positive) and
+    returns a *new* LLMUsage — the accumulation point across retries/fallbacks,
+    so usage from an attempt that later failed is never lost."""
 
     input_tokens: int = 0
     output_tokens: int = 0
 
     def __post_init__(self) -> None:
-        if self.input_tokens < 0 or self.output_tokens < 0:
-            raise ValueError(f"token usage must be non-negative, got {self.input_tokens}/{self.output_tokens}")
+        _as_token_count(self.input_tokens)
+        _as_token_count(self.output_tokens)
 
     @property
     def total(self) -> int:
         return self.input_tokens + self.output_tokens
 
     def add(self, input_tokens: int, output_tokens: int) -> LLMUsage:
-        """A new LLMUsage with these (non-negative) tokens folded in."""
-        return LLMUsage(self.input_tokens + input_tokens, self.output_tokens + output_tokens)
+        """A new LLMUsage with these tokens folded in. Each delta must itself be
+        a non-negative int — a negative delta is rejected here, not silently
+        netted against the running total."""
+        return LLMUsage(
+            self.input_tokens + _as_token_count(input_tokens),
+            self.output_tokens + _as_token_count(output_tokens),
+        )
 
 
 @dataclass

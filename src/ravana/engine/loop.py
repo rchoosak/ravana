@@ -371,11 +371,16 @@ async def _dod_gate(ctx: _RunCtx) -> str:
     # durable cause — never escape and strand it at RUNNING.
     try:
         judgement = await ctx.dod_prose_verdict(dod.evaluated_by, prose, state)
+        # Engine-boundary revalidation: rebuild the usage THROUGH LLMUsage so a
+        # judgement carrying a corrupted/duck-typed usage (float/NaN/negative/
+        # bool) is rejected here too — the metered total is never trusted raw
+        # from the runtime. A bad value raises → caught below → fail closed.
+        usage = LLMUsage(judgement.usage.input_tokens, judgement.usage.output_tokens)
         # §3.6 cost cap: node tokens so far + this judgement's tokens. A
         # judgement that pushes the run past max_tokens_total FAILs it.
         over_cap = (
             guards.max_tokens_total is not None
-            and _total_tokens(ctx.con, ctx.run_id) + judgement.usage.total > guards.max_tokens_total
+            and _total_tokens(ctx.con, ctx.run_id) + usage.total > guards.max_tokens_total
         )
         if not over_cap:
             result.apply_prose_verdict(judgement.verdicts)
@@ -389,12 +394,12 @@ async def _dod_gate(ctx: _RunCtx) -> str:
         return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
     if over_cap:
         return _finish_dod(
-            ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=judgement.usage,
-            detail=f"DoD judgement's {judgement.usage.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
+            ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=usage,
+            detail=f"DoD judgement's {usage.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
         )
     return _finish_dod(
         ctx, dod, result, outcome="met" if result.met else "criteria_unmet",
-        status="COMPLETED" if result.met else "FAILED", usage=judgement.usage,
+        status="COMPLETED" if result.met else "FAILED", usage=usage,
     )
 
 
