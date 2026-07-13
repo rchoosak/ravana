@@ -341,7 +341,16 @@ async def _finalize_status(ctx: _RunCtx) -> None:
             new_status = await _dod_gate(ctx)
         except Exception as exc:  # noqa: BLE001 - last-resort: a terminal must resolve, never hang
             log_event("ERROR", f"run {ctx.run_id} DoD gate raised unexpectedly ({type(exc).__name__}); failing closed", run_id=ctx.run_id)
-            new_status = "FAILED"
+            # Still STAGE a DOD_EVALUATED so the "event either way" / atomic
+            # event+status contract holds on this path too (an unforeseen raise
+            # escapes _dod_gate before any _finish_dod ran — a single INSERT is
+            # atomic, so it never staged a partial one). Commit is _finalize_status's.
+            dod = ctx.graph.doc.spec.definition_of_done
+            new_status = (
+                _finish_dod(ctx, dod, DodResult(results=[]), outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
+                if dod is not None
+                else "FAILED"
+            )
     else:
         # The queue drained with nothing pending and no __terminal__/implicit-terminal edge
         # ever fired — shouldn't happen given §3.1's fail-fast rule, but leave status as-is

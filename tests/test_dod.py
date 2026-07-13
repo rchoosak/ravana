@@ -308,6 +308,26 @@ def test_logging_failure_does_not_strand_the_run(con, monkeypatch):
     assert run["status"] == "FAILED" and run["ended_at"] is not None
 
 
+def test_unforeseen_gate_error_still_stages_event(con, monkeypatch):
+    # The outer net catches an UNFORESEEN _dod_gate raise and FAILs the run —
+    # but it must still stage a DOD_EVALUATED, so the "event either way" / atomic
+    # event+status contract holds even on this last-resort path.
+    import ravana.engine.loop as loop_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("unexpected gate bug")
+
+    monkeypatch.setattr(loop_mod, "evaluate_dod", boom)
+    run_id = _run_single(con, _dod_workflow(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED" and run["ended_at"] is not None
+    count = con.execute(
+        "SELECT COUNT(*) AS c FROM state_transition_log WHERE run_id = ? AND event_type = 'DOD_EVALUATED'", (run_id,)
+    ).fetchone()["c"]
+    assert count == 1  # exactly one event, not zero (contract) and not double
+    assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "evaluator_error"
+
+
 def test_dod_finalization_is_idempotent_on_reentry(con):
     # A re-entry after a run is already terminal must NOT re-judge, must not
     # append a second DOD_EVALUATED, and must not flip the terminal status.
