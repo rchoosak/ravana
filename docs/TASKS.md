@@ -122,6 +122,9 @@ Goal: swap the mock backend for real providers and real tool execution, on a gra
 - [ ] Verify structured-output strategy selection (§3.4) actually resolves to the expected mechanism per provider (guided decoding for the local model, native tool-calling for Anthropic)
 - [ ] Idempotency integration test: force a retry against a fake connector and confirm the *second* call is recognized as a duplicate, not just that the key looks stable in isolation
 
+### Toolchain / quality gates
+- [x] **mypy in the toolchain, green** (`[tool.mypy]` in `pyproject.toml`, `mypy` + `types-PyYAML` in the dev group). Run it as `uv run mypy` (NOT `uvx mypy`) so the project's own deps — pydantic, httpx, anthropic, openai, click, all shipping `py.typed` — are importable and typed; the "9/13 mypy errors" every review round cited were purely `uvx`'s isolated env not seeing those deps, not code defects (net type bugs fixed: zero). `check_untyped_defs = true` so the engine/gateway's `async def` bodies are actually checked (a green run without it would be hollow); `simpleeval` (no stubs) is the one per-module `ignore_missing_imports`. Type-checks `src/` only — test files' fakes/monkeypatch patterns aren't worth the noise. `ruff` + `pytest` remain the other two gates; wiring all three into CI lands with Phase 1's docker-compose CI.
+
 ---
 
 ## Cloud Product Requirements (Phases 1-3)
