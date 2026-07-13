@@ -319,50 +319,81 @@ async def _finalize_status(ctx: _RunCtx) -> None:
     if ctx.failed:
         return  # already set to FAILED at the point of failure
     run = _get_run(ctx.con, ctx.run_id)
-    # Idempotent finalization: once a run has reached a terminal status, a
-    # re-entry (a second drain, a stray resume) must NOT re-run the DoD gate.
-    # Re-judging would call the evaluator again (double cost), append a second
-    # DOD_EVALUATED event, and could flip a COMPLETED run to FAILED on a
-    # non-deterministic verdict. A terminal state is final.
+    # Idempotent finalization: once a run is terminal, a re-entry (a second
+    # drain, a stray resume) must NOT re-run the DoD gate — re-judging would
+    # double-bill, append a second DOD_EVALUATED, and could flip COMPLETED→FAILED
+    # on a non-deterministic verdict. A terminal state is final.
     if run["status"] in ("COMPLETED", "FAILED", "CANCELLED"):
         return
     pending_hitl = ctx.con.execute(
         "SELECT 1 FROM hitl_request WHERE run_id = ? AND status = 'PENDING' LIMIT 1", (ctx.run_id,)
     ).fetchone()
     if pending_hitl:
-        new_status = "WAITING_HUMAN"
+        _write_final(ctx, run, "WAITING_HUMAN", event=None)
     elif ctx.terminal_reached:
         # §3.1 step 7: reaching a terminal is necessary but not sufficient — the
-        # run only COMPLETES if its definition_of_done is met, else it FAILs.
-        # The gate fails closed on every KNOWN path; this outer net guarantees a
-        # terminal status even on an UNFORESEEN raise, so a run can never strand
-        # at RUNNING (the failure mode every DoD review round has probed for).
-        try:
-            new_status = await _dod_gate(ctx)
-        except Exception as exc:  # noqa: BLE001 - last-resort: a terminal must resolve, never hang
-            log_event("ERROR", f"run {ctx.run_id} DoD gate raised unexpectedly ({type(exc).__name__}); failing closed", run_id=ctx.run_id)
-            # Still STAGE a DOD_EVALUATED so the "event either way" / atomic
-            # event+status contract holds on this path too (an unforeseen raise
-            # escapes _dod_gate before any _finish_dod ran — a single INSERT is
-            # atomic, so it never staged a partial one). Commit is _finalize_status's.
-            dod = ctx.graph.doc.spec.definition_of_done
-            new_status = (
-                _finish_dod(ctx, dod, DodResult(results=[]), outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
-                if dod is not None
-                else "FAILED"
-            )
+        # run COMPLETEs only if its definition_of_done is met. DECIDE (pure and
+        # total — never writes, never raises) then WRITE (one transaction:
+        # event + status, with a status-only fallback if the write fails). This
+        # split is what keeps a DoD bug OR a rejected event write from stranding
+        # the run at RUNNING — the failure mode every review round has probed.
+        status, event = await _decide_dod(ctx)
+        _write_final(ctx, run, status, event=event)
     else:
-        # The queue drained with nothing pending and no __terminal__/implicit-terminal edge
-        # ever fired — shouldn't happen given §3.1's fail-fast rule, but leave status as-is
-        # rather than guess, so a genuine gap here is visible (stuck RUNNING) instead of
-        # silently reported as either outcome.
-        new_status = run["status"]
-    ended_at = now_iso() if new_status in ("COMPLETED", "FAILED") else run["ended_at"]
-    ctx.con.execute("UPDATE run SET status = ?, ended_at = ? WHERE id = ?", (new_status, ended_at, ctx.run_id))
-    ctx.con.commit()
+        # Queue drained with nothing pending and no terminal edge ever fired —
+        # shouldn't happen under §3.1's fail-fast rule; persist the status as-is
+        # so a genuine gap stays visible rather than being reported either way.
+        _write_final(ctx, run, run["status"], event=None)
 
 
 DodOutcome = Literal["met", "criteria_unmet", "evaluator_error", "cost_cap_exceeded"]
+
+
+@dataclass
+class _DodEvent:
+    """The DOD_EVALUATED row a DoD decision wants persisted — computed by
+    `_decide_dod` (pure), written by `_write_final` (the single persistence
+    point). Kept separate so the decision never touches the database."""
+
+    result: bool  # the GATE outcome (did the run COMPLETE), for the event's `result` column
+    condition: str  # "; ".join(dod.criteria)
+    state_diff: dict[str, Any]
+
+
+def _safe_rollback(con: sqlite3.Connection) -> None:
+    try:
+        con.rollback()
+    except Exception:  # noqa: BLE001 - a failed rollback must not mask the original error
+        pass
+
+
+def _write_final(ctx: _RunCtx, run: sqlite3.Row, status: str, *, event: _DodEvent | None) -> None:
+    """Persist a terminal outcome: the DoD event (if any) AND the run status, in
+    ONE transaction. If that write fails (e.g., a DOD_EVALUATED insert rejected
+    by a constraint/trigger), roll back and resolve the run STATUS-ONLY as
+    FAILED — WITHOUT re-invoking the event writer that just failed — so a
+    persistence failure can't strand the run at RUNNING. Never raises."""
+    ended_at = now_iso() if status in ("COMPLETED", "FAILED") else run["ended_at"]
+    try:
+        if event is not None:
+            _log_event(
+                ctx.con, ctx.run_id, None, "DOD_EVALUATED",
+                result=event.result, condition_evaluated=event.condition, state_diff=event.state_diff,
+            )
+        ctx.con.execute("UPDATE run SET status = ?, ended_at = ? WHERE id = ?", (status, ended_at, ctx.run_id))
+        ctx.con.commit()
+        if status == "FAILED" and event is not None:
+            log_event("ERROR", f"run {ctx.run_id} DoD gate FAILED ({event.state_diff.get('outcome')})", run_id=ctx.run_id)
+        return
+    except Exception as exc:  # noqa: BLE001 - a persistence failure must not strand the run
+        _safe_rollback(ctx.con)
+        log_event("ERROR", f"run {ctx.run_id} terminal write failed ({type(exc).__name__}); resolving status-only", run_id=ctx.run_id)
+    # Terminal failure path: status-only, NOT re-calling the failed event writer.
+    try:
+        ctx.con.execute("UPDATE run SET status = 'FAILED', ended_at = ? WHERE id = ?", (now_iso(), ctx.run_id))
+        ctx.con.commit()
+    except Exception:  # noqa: BLE001 - nothing more we can safely do; never raise past the engine
+        _safe_rollback(ctx.con)
 
 
 def _safe_usage(reported: object) -> LLMUsage | None:
@@ -387,83 +418,7 @@ def _over_cap(ctx: _RunCtx, max_tokens_total: int | None, usage: LLMUsage) -> bo
     return max_tokens_total is not None and _total_tokens(ctx.con, ctx.run_id) + usage.total > max_tokens_total
 
 
-async def _dod_gate(ctx: _RunCtx) -> str:
-    """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
-    definition_of_done is met, else FAILs. Expression criteria are enforced
-    deterministically (pure, sync); prose criteria are judged by the injected
-    `dod_prose_verdict`. The judgement's LLM usage is metered against
-    guards.max_tokens_total (node tokens + this judgement's) before the run may
-    COMPLETE, so a judgement can't slip the run past its hard cost cap. Records a
-    DOD_EVALUATED event on every path with a durable `outcome` so a later reader
-    can tell an unmet criterion from an evaluator that failed (provider down /
-    repair exhausted). When no verdict is wired, prose stays advisory."""
-    dod = ctx.graph.doc.spec.definition_of_done
-    if dod is None:
-        return "COMPLETED"
-    guards = ctx.graph.doc.spec.graph.guards
-    state = ctx.load_shared_state()
-    result = evaluate_dod(dod, state)  # pure/sync — expressions only
-    prose = result.prose_criteria
-    if not (prose and ctx.dod_prose_verdict is not None):
-        return _finish_dod(
-            ctx, dod, result, outcome="met" if result.met else "criteria_unmet",
-            status="COMPLETED" if result.met else "FAILED",
-        )
-    # A prose judgement runs an agent turn, and this gate executes in
-    # _finalize_status — OUTSIDE _dispatch's failure boundary. The whole
-    # obtain→meter→apply block is wrapped: a verdict that raises, OR returns
-    # something malformed (None, a bad shape), must fail the run CLOSED with a
-    # durable cause — never escape and strand it at RUNNING.
-    try:
-        judgement = await ctx.dod_prose_verdict(dod.evaluated_by, prose, state)
-        # Engine-boundary revalidation: rebuild the usage THROUGH LLMUsage so a
-        # judgement carrying a corrupted/duck-typed usage (float/NaN/negative/
-        # bool) is rejected here too — the metered total is never trusted raw
-        # from the runtime. A bad value raises → caught below → fail closed.
-        usage = LLMUsage(judgement.usage.input_tokens, judgement.usage.output_tokens)
-        # §3.6 cost cap: node tokens so far + this judgement's tokens. A
-        # judgement that pushes the run past max_tokens_total FAILs it.
-        over_cap = _over_cap(ctx, guards.max_tokens_total, usage)
-        if not over_cap:
-            result.apply_prose_verdict(judgement.verdicts)
-    except ProseJudgementError as exc:
-        # The judgement failed AFTER spending tokens — record what it billed
-        # (so the failure path isn't invisible to accounting) and fail closed,
-        # persisting only the underlying cause's CLASS. Guard the usage: the
-        # constructor enforces LLMUsage, but a post-construction mutation must
-        # not AttributeError past this handler (which runs outside the broad
-        # boundary) and strand the run — an unusable usage is simply not recorded.
-        cause = type(exc.__cause__).__name__ if exc.__cause__ else "ProseJudgementError"
-        # Rebuild through LLMUsage (like the success path), NOT just isinstance:
-        # a frozen usage whose field was corrupted to a NaN / non-serializable
-        # value would otherwise poison the total or break event serialization
-        # (→ no DOD_EVALUATED). A bad value records no usage; the event still writes.
-        spent = _safe_usage(exc.usage)
-        # A FAILED judgement still spent tokens. If that spend breaches the hard
-        # cap, the governance-salient outcome is cost_cap_exceeded — the cap
-        # applies to any usage that enters the tally, not just a successful
-        # judgement's (repair loops burn tokens exactly on this failure path).
-        if spent is not None and _over_cap(ctx, guards.max_tokens_total, spent):
-            return _finish_dod(
-                ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=spent,
-                detail=f"DoD judgement's {spent.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
-            )
-        return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=cause, status="FAILED", usage=spent)
-    except Exception as exc:  # noqa: BLE001 - fail closed; persist the error CLASS, never its (possibly secret-bearing) text
-        return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
-    if over_cap:
-        return _finish_dod(
-            ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=usage,
-            detail=f"DoD judgement's {usage.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
-        )
-    return _finish_dod(
-        ctx, dod, result, outcome="met" if result.met else "criteria_unmet",
-        status="COMPLETED" if result.met else "FAILED", usage=usage,
-    )
-
-
-def _finish_dod(
-    ctx: _RunCtx,
+def _build_dod_event(
     dod: DefinitionOfDone,
     result: DodResult,
     *,
@@ -471,14 +426,12 @@ def _finish_dod(
     status: str,
     detail: str | None = None,
     usage: LLMUsage | None = None,
-) -> str:
-    """Stage one DOD_EVALUATED event carrying the outcome (met / criteria_unmet
-    / evaluator_error / cost_cap_exceeded), the per-criterion result, any
-    judgement token usage, and — for a failure cause — a redacted detail, then
-    return the run status. Deliberately does NOT commit: `_finalize_status`
-    UPDATEs the run status and commits ONCE, so the terminal DoD event and the
-    run's terminal status land atomically (a crash between them can't leave a
-    RUNNING run carrying a terminal DoD event)."""
+) -> _DodEvent:
+    """Build (do NOT write) the DOD_EVALUATED payload: the outcome, the
+    per-criterion result, any judgement usage, and a redacted failure cause.
+    The event's `result` is the GATE outcome (did the run COMPLETE), not
+    result.met — an evaluator_error or cost_cap FAILs even when the criteria it
+    managed to evaluate were vacuously met."""
     state_diff: dict[str, Any] = {"outcome": outcome, **result.as_dict()}
     if usage is not None:
         state_diff["usage"] = {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
@@ -486,21 +439,62 @@ def _finish_dod(
         # §8 backstop: the cause is a fixed-shape error CLASS name (never the
         # exception text), but redact defensively before it lands in the event.
         state_diff["detail"] = redact_secrets(detail)
-    _log_event(
-        # `result` is the GATE outcome (did the run COMPLETE), not result.met —
-        # an evaluator_error or cost_cap FAILs the run even though the criteria
-        # it managed to evaluate were vacuously met.
-        ctx.con, ctx.run_id, None, "DOD_EVALUATED",
-        result=(status == "COMPLETED"), condition_evaluated="; ".join(dod.criteria), state_diff=state_diff,
-    )
-    if status == "FAILED":
-        log_event(
-            "ERROR",
-            f"run {ctx.run_id} DoD gate FAILED ({outcome}): unmet={result.unmet}"
-            + (f"; {redact_secrets(detail)}" if detail else ""),
-            run_id=ctx.run_id,
-        )
-    return status
+    return _DodEvent(result=(status == "COMPLETED"), condition="; ".join(dod.criteria), state_diff=state_diff)
+
+
+async def _decide_dod(ctx: _RunCtx) -> tuple[str, _DodEvent | None]:
+    """§3.1 step 7, PURE + TOTAL: compute the run status and the DOD_EVALUATED
+    payload to persist (or None when there's no DoD). Performs NO writes —
+    persistence is `_write_final`'s job — and NEVER raises: any unforeseen error
+    becomes a fail-closed evaluator_error decision. Separating decide from
+    persist is what lets a rejected event write be handled by `_write_final`
+    without re-running the decision or re-invoking the failed writer.
+
+    Expression criteria are enforced deterministically; a prose judgement runs
+    the injected `dod_prose_verdict`, its usage revalidated through LLMUsage and
+    metered against guards.max_tokens_total. A failed judgement whose spend
+    breaches the cap is `cost_cap_exceeded` (governance precedence) else
+    `evaluator_error`; when no verdict is wired, prose stays advisory."""
+    dod = ctx.graph.doc.spec.definition_of_done
+    if dod is None:
+        return "COMPLETED", None
+    guards = ctx.graph.doc.spec.graph.guards
+    try:
+        state = ctx.load_shared_state()
+        result = evaluate_dod(dod, state)  # pure/sync — expressions only
+        prose = result.prose_criteria
+        usage_for_event: LLMUsage | None = None
+        if prose and ctx.dod_prose_verdict is not None:
+            try:
+                judgement = await ctx.dod_prose_verdict(dod.evaluated_by, prose, state)
+                # Engine-boundary revalidation: rebuild usage THROUGH LLMUsage so
+                # a corrupted/duck-typed count is rejected here too (raises →
+                # caught by the outer handler → fail closed).
+                usage = LLMUsage(judgement.usage.input_tokens, judgement.usage.output_tokens)
+            except ProseJudgementError as exc:
+                # Failed after spending tokens. If that spend breaches the cap,
+                # cost_cap_exceeded takes precedence (governance); else
+                # evaluator_error. Persist only the underlying cause's CLASS.
+                spent = _safe_usage(exc.usage)
+                if spent is not None and _over_cap(ctx, guards.max_tokens_total, spent):
+                    return "FAILED", _build_dod_event(
+                        dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=spent,
+                        detail=f"DoD judgement's {spent.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
+                    )
+                cause = type(exc.__cause__).__name__ if exc.__cause__ else "ProseJudgementError"
+                return "FAILED", _build_dod_event(dod, result, outcome="evaluator_error", status="FAILED", detail=cause, usage=spent)
+            if _over_cap(ctx, guards.max_tokens_total, usage):
+                return "FAILED", _build_dod_event(
+                    dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=usage,
+                    detail=f"DoD judgement's {usage.total} tokens push the run over max_tokens_total ({guards.max_tokens_total})",
+                )
+            result.apply_prose_verdict(judgement.verdicts)
+            usage_for_event = usage
+        status = "COMPLETED" if result.met else "FAILED"
+        outcome: DodOutcome = "met" if result.met else "criteria_unmet"
+        return status, _build_dod_event(dod, result, outcome=outcome, status=status, usage=usage_for_event)
+    except Exception as exc:  # noqa: BLE001 - unforeseen: the decision must be TOTAL; fail closed with an event
+        return "FAILED", _build_dod_event(dod, DodResult(results=[]), outcome="evaluator_error", status="FAILED", detail=type(exc).__name__)
 
 
 async def _dispatch(ctx: _RunCtx, node_id: str) -> None:

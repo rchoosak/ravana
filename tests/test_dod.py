@@ -308,10 +308,27 @@ def test_logging_failure_does_not_strand_the_run(con, monkeypatch):
     assert run["status"] == "FAILED" and run["ended_at"] is not None
 
 
+def test_dod_event_write_failure_does_not_strand_run(con):
+    # If persisting the DOD_EVALUATED itself fails (here: a trigger rejects the
+    # insert), the run must STILL resolve — status-only FAILED with ended_at set
+    # — not strand at RUNNING with start_run raising. This is why the DoD
+    # decision is pure and separate from the (single, fallback-guarded) write.
+    con.execute(
+        "CREATE TRIGGER reject_dod BEFORE INSERT ON state_transition_log "
+        "WHEN NEW.event_type = 'DOD_EVALUATED' "
+        "BEGIN SELECT RAISE(ABORT, 'no dod events'); END"
+    )
+    run_id = _run_single(con, _dod_workflow(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"  # resolved status-only, not stranded at RUNNING
+    assert run["ended_at"] is not None
+    assert _dod_event(con, run_id) is None  # the event write was rejected; the run resolved anyway
+
+
 def test_unforeseen_gate_error_still_stages_event(con, monkeypatch):
-    # The outer net catches an UNFORESEEN _dod_gate raise and FAILs the run —
-    # but it must still stage a DOD_EVALUATED, so the "event either way" / atomic
-    # event+status contract holds even on this last-resort path.
+    # An UNFORESEEN error inside the DoD decision (here: evaluate_dod raises)
+    # must still produce a FAILED run WITH a DOD_EVALUATED — the decision is
+    # total (fails closed to evaluator_error) and _write_final persists it.
     import ravana.engine.loop as loop_mod
 
     def boom(*a, **k):
