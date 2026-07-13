@@ -244,6 +244,23 @@ def test_max_tokens_total_guard_fails_the_run(con):
     assert ne["output_tokens"] == 80
 
 
+def test_negative_node_usage_cannot_bypass_the_cost_cap(con):
+    # A node reporting a negative token count would poison _total_tokens() and
+    # push `projected` below the cap — the run must FAIL on the invalid usage,
+    # not COMPLETE, and the poisoned number must not be persisted.
+    graph = compile_workflow(_single_node_workflow())
+    graph.doc.spec.graph.guards.max_tokens_total = 10
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    runtime = MockAgentRuntime({"only": [{"structured_payload": {}, "input_tokens": -100, "output_tokens": 0}]})
+
+    run_id = asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
+    run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    ne = con.execute("SELECT * FROM node_execution WHERE run_id = ?", (run_id,)).fetchone()
+    assert "invalid token usage" in ne["error"]
+    assert ne["input_tokens"] >= 0  # the -100 was never persisted (no poisoned total)
+
+
 def test_tool_calls_get_a_stable_idempotency_key(con):
     """§3.6: the key is computed once, at persistence time, and attached to
     message.tool_calls — this is the fix for the finding that

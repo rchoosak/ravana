@@ -565,6 +565,18 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
         _fail_run(ctx, node_id, f"node '{node_id}' failed: {exc}")
         return
 
+    # §9 cost-cap integrity: validate the turn's token usage the SAME way the
+    # DoD gate validates the judgement's. A node reporting a non-int/negative
+    # count would poison _total_tokens() and let the run slip its hard cap
+    # (probe: node reports -100 tokens, the cap never trips). Rebuild through
+    # LLMUsage; a bad count is a non-transient turn failure, failed CLOSED
+    # WITHOUT persisting the poisoned number (result omitted → no token write).
+    try:
+        node_usage = LLMUsage(result.input_tokens, result.output_tokens)
+    except (ValueError, TypeError):
+        _fail_run(ctx, node_id, f"node '{node_id}' reported invalid token usage", logical_visit_id=logical_visit_id)
+        return
+
     # §3.4's within-turn guards and §9's cost cap are decided before the
     # durability transaction. A rejected turn is still recorded for audit,
     # but its delta never reaches shared state or routing.
@@ -586,7 +598,7 @@ async def _dispatch(ctx: _RunCtx, node_id: str) -> None:
             logical_visit_id=logical_visit_id,
         )
         return
-    projected_tokens = _total_tokens(con, ctx.run_id) + result.input_tokens + result.output_tokens
+    projected_tokens = _total_tokens(con, ctx.run_id) + node_usage.total
     if guards.max_tokens_total is not None and projected_tokens > guards.max_tokens_total:
         _fail_run(
             ctx,
