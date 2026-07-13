@@ -122,6 +122,9 @@ Goal: swap the mock backend for real providers and real tool execution, on a gra
 - [ ] Verify structured-output strategy selection (§3.4) actually resolves to the expected mechanism per provider (guided decoding for the local model, native tool-calling for Anthropic)
 - [ ] Idempotency integration test: force a retry against a fake connector and confirm the *second* call is recognized as a duplicate, not just that the key looks stable in isolation
 
+### Toolchain / quality gates
+- [x] **mypy in the toolchain, green** (`[tool.mypy]` in `pyproject.toml`, `mypy` + `types-PyYAML` in the dev group). Run it as `uv run mypy` (NOT `uvx mypy`) so the project's own deps — pydantic, httpx, anthropic, openai, click, all shipping `py.typed` — are importable and typed; most of the errors earlier review rounds cited were `uvx`'s isolated env not seeing those deps rather than code defects. This does **not** mean the source was already type-clean: the genuine source typing defects mypy would have caught (e.g. `api_connector`'s `base_url` handled as `Any | None` before it was narrowed to a validated `str`) were fixed in the earlier runtime-hardening PR — this toolchain branch adds only config/deps/lockfile and changes no production code. `check_untyped_defs = true` so the engine/gateway's `async def` bodies are actually checked (a green run without it would be hollow); `simpleeval` (no stubs) is the one per-module `ignore_missing_imports`. Type-checks `src/` only — test files' fakes/monkeypatch patterns aren't worth the noise. `ruff` and `pytest` are the other two gates and are now all locked in the dev group (so `uv run ruff` / `uv run mypy` / `uv run pytest` are reproducible on a clean runner); none are yet enforced in CI — that wiring lands with Phase 1's docker-compose CI.
+
 ---
 
 ## Cloud Product Requirements (Phases 1-3)
