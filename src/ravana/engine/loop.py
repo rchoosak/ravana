@@ -327,7 +327,14 @@ async def _finalize_status(ctx: _RunCtx) -> None:
     elif ctx.terminal_reached:
         # §3.1 step 7: reaching a terminal is necessary but not sufficient — the
         # run only COMPLETES if its definition_of_done is met, else it FAILs.
-        new_status = await _dod_gate(ctx)
+        # The gate fails closed on every KNOWN path; this outer net guarantees a
+        # terminal status even on an UNFORESEEN raise, so a run can never strand
+        # at RUNNING (the failure mode every DoD review round has probed for).
+        try:
+            new_status = await _dod_gate(ctx)
+        except Exception as exc:  # noqa: BLE001 - last-resort: a terminal must resolve, never hang
+            log_event("ERROR", f"run {ctx.run_id} DoD gate raised unexpectedly ({type(exc).__name__}); failing closed", run_id=ctx.run_id)
+            new_status = "FAILED"
     else:
         # The queue drained with nothing pending and no __terminal__/implicit-terminal edge
         # ever fired — shouldn't happen given §3.1's fail-fast rule, but leave status as-is
@@ -387,9 +394,13 @@ async def _dod_gate(ctx: _RunCtx) -> str:
     except ProseJudgementError as exc:
         # The judgement failed AFTER spending tokens — record what it billed
         # (so the failure path isn't invisible to accounting) and fail closed,
-        # persisting only the underlying cause's CLASS.
+        # persisting only the underlying cause's CLASS. Guard the usage: the
+        # constructor enforces LLMUsage, but a post-construction mutation must
+        # not AttributeError past this handler (which runs outside the broad
+        # boundary) and strand the run — an unusable usage is simply not recorded.
         cause = type(exc.__cause__).__name__ if exc.__cause__ else "ProseJudgementError"
-        return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=cause, status="FAILED", usage=exc.usage)
+        spent = exc.usage if isinstance(exc.usage, LLMUsage) else None
+        return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=cause, status="FAILED", usage=spent)
     except Exception as exc:  # noqa: BLE001 - fail closed; persist the error CLASS, never its (possibly secret-bearing) text
         return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=type(exc).__name__, status="FAILED")
     if over_cap:

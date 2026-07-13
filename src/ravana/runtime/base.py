@@ -76,8 +76,14 @@ class ProseJudgementError(Exception):
     (a failed judgement's tokens were still billed), and chains the underlying
     cause via `__cause__` for the durable outcome's classification."""
 
-    def __init__(self, usage: "LLMUsage") -> None:
+    def __init__(self, usage: LLMUsage) -> None:
         super().__init__("prose judgement failed")
+        # Enforce the contract at the source: the engine meters/records this
+        # usage on the failure path, so a non-LLMUsage payload (a runtime raising
+        # `ProseJudgementError("oops")`) must fail HERE — not later, as an
+        # AttributeError deep in the gate that strands the run at RUNNING.
+        if not isinstance(usage, LLMUsage):
+            raise TypeError(f"ProseJudgementError.usage must be an LLMUsage, got {type(usage).__name__}")
         self.usage = usage
 
 

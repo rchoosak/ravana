@@ -18,7 +18,7 @@ from ravana.compiler.graph import compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.engine.dod import evaluate_dod
 from ravana.engine.loop import start_run
-from ravana.runtime.base import LLMUsage, ProseJudgement
+from ravana.runtime.base import LLMUsage, ProseJudgement, ProseJudgementError
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.schema.models import DefinitionOfDone, WorkflowDoc
 
@@ -346,12 +346,45 @@ def test_corrupted_judgement_usage_fails_closed_not_over_cap(con):
     assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "evaluator_error"
 
 
+def test_prose_judgement_error_rejects_non_usage():
+    # The failure carrier must not trust a raw payload — a runtime raising
+    # `ProseJudgementError("oops")` fails at construction, not later as an
+    # AttributeError in the gate.
+    with pytest.raises(TypeError, match="must be an LLMUsage"):
+        ProseJudgementError("not-usage")  # type: ignore[arg-type]
+
+
+def test_runtime_raising_malformed_error_fails_closed(con):
+    # A verdict that raises ProseJudgementError with a bad payload → the
+    # construction raises TypeError, which the gate treats as an evaluator error
+    # and FAILs the run closed (ended_at set, DOD event present) — not stranded.
+    async def verdict(evaluated_by, criteria, state):
+        raise ProseJudgementError("not-usage")  # type: ignore[arg-type]
+
+    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED" and run["ended_at"] is not None
+    assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "evaluator_error"
+
+
+def test_mutated_error_usage_fails_closed_not_stranded(con):
+    # Belt-and-suspenders for a post-construction mutation of exc.usage: the
+    # engine's isinstance guard must keep the run from stranding at RUNNING.
+    async def verdict(evaluated_by, criteria, state):
+        err = ProseJudgementError(LLMUsage(5, 5))
+        err.usage = "not-usage"  # type: ignore[assignment]  # mutate past the constructor
+        raise err
+
+    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED" and run["ended_at"] is not None
+    assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "evaluator_error"
+
+
 def test_failed_judgement_usage_is_recorded_on_event(con):
     # A judgement that fails outright (ProseJudgementError) still spent tokens;
     # the engine records them on the DOD_EVALUATED event so a failed judgement's
     # cost isn't invisible to accounting, and fails the run closed.
-    from ravana.runtime.base import ProseJudgementError
-
     async def verdict(evaluated_by, criteria, state):
         raise ProseJudgementError(LLMUsage(input_tokens=300, output_tokens=60))
 
