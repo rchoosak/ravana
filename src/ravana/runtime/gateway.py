@@ -63,7 +63,7 @@ SUBMIT_RESULT = "submit_result"
 # verdict through (the guided path returns the same shape as JSON text).
 SUBMIT_VERDICT = "submit_verdict"
 
-# The per-entry result of `_run_chain` — an AgentTurnResult for node dispatch,
+# The per-entry result of `_run_with_fallback` — an AgentTurnResult for node dispatch,
 # a raw verdict payload for a prose judgement. Generic so the shared chain isn't
 # tied to node-specific AgentTurnResult.
 _ChainResult = TypeVar("_ChainResult")
@@ -353,9 +353,9 @@ class LLMGateway:
                 contract=contract, llm=llm, system=system, output_schema=output_schema,
             )
 
-        return await self._run_chain(agent_id=agent_id, chain=chain, run_one=run_one)
+        return await self._run_with_fallback(agent_id=agent_id, chain=chain, run_one=run_one)
 
-    async def _run_chain(
+    async def _run_with_fallback(
         self,
         *,
         agent_id: str,
@@ -721,7 +721,7 @@ class LLMGateway:
             return await self._judge_completion(llm, system, user_text, judge_state)
 
         try:
-            payload = await self._run_chain(agent_id=agent_id, chain=chain, run_one=run_one)
+            payload = await self._run_with_fallback(agent_id=agent_id, chain=chain, run_one=run_one)
         except Exception as exc:
             # The whole judgement failed (repairs exhausted / all fallbacks down
             # / a leaked-secret response). Surface the tokens already spent so the
@@ -736,12 +736,20 @@ class LLMGateway:
     ) -> dict[str, Any]:
         """A no-tools structured completion returning one _VERDICT_SCHEMA object
         (the raw verdict payload). Reuses the node path's strategy pick (guided
-        vs forced-tool) and small helpers, but deliberately offers NO toolkits
-        and skips the tool loop's idempotency/bookkeeping — a judgement has no
-        side effects. `state` is the JUDGEMENT-scoped accumulator (shared across
-        fallback entries by `judge_prose`): usage is folded in after *every*
-        provider call, so an attempt that later fails still contributes its
-        tokens, and the repair budget is one `max_output_repairs` for the whole
+        vs forced-tool) and the shared parse/validate helpers (`_parse_json`,
+        `_validate`, `_request_for`), but is deliberately NOT merged with
+        `_run_guided`: this loop is guided-OR-forced-tool (a judgement never has
+        toolkits, so it can't reuse `_run_tool_loop`), threads a judgement-scoped
+        `_JudgeState` (usage sink + shared repair budget) rather than local
+        counters, counts usage *before* the secret gate (so a rejected response
+        is still billed), and requires exactly one `submit_verdict` call. A
+        shared abstraction over those ~6 axes of variation would take more
+        callbacks than the ~15 lines it saves (Speculative Generality) — the
+        genuinely reusable pieces are already extracted as module helpers.
+        `state` is the JUDGEMENT-scoped accumulator (shared across fallback
+        entries by `judge_prose`): usage is folded in after *every* provider
+        call, so an attempt that later fails still contributes its tokens, and
+        the repair budget is one `max_output_repairs` for the whole
         judgement, not one per entry. Exhausting it raises AgentOutputError
         (non-transient — the DoD gate turns it into a fail-closed run)."""
         adapter = self._adapter_for(llm.provider)
