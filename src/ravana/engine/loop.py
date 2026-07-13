@@ -25,16 +25,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ravana.compiler.graph import TERMINAL, CompiledGraph
-from ravana.engine.dod import ProseVerdict, evaluate_dod
+from ravana.engine.dod import DodResult, ProseVerdict, evaluate_dod
 from ravana.engine.expr import apply_on_enter, eval_condition
 from ravana.engine.state_merge import merge_delta
 from ravana.observability.audit import write_audit
 from ravana.observability.logging import log_event
 from ravana.runtime.backoff import RetrySleep, backoff_delay
-from ravana.runtime.base import AgentRuntime, AgentTurnResult, TransientAgentError
+from ravana.runtime.base import AgentRuntime, AgentTurnResult, ProseJudgement, TransientAgentError
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.secrets import ensure_secret_free, redact_secrets
-from ravana.schema.models import HITLConfig
+from ravana.schema.models import DefinitionOfDone, HITLConfig
 from ravana.schema.util import dumps, loads, new_id, now_iso
 
 _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
@@ -336,33 +336,87 @@ async def _finalize_status(ctx: _RunCtx) -> None:
 async def _dod_gate(ctx: _RunCtx) -> str:
     """§3.1 step 7: a run that reached a terminal COMPLETEs only if its
     definition_of_done is met, else FAILs. Expression criteria are enforced
-    deterministically; prose criteria are recorded as unevaluated (advisory,
-    not gating) until an evaluator agent is wired. Records the outcome as a
-    DOD_EVALUATED event either way, so a completion always carries the DoD
-    evidence and a failure carries the unmet criteria."""
+    deterministically (pure, sync); prose criteria are judged by the injected
+    `dod_prose_verdict` — its LLM usage is metered against
+    guards.max_tokens_total before the run may COMPLETE, so a judgement can't
+    slip the run past its hard cost cap. Records a DOD_EVALUATED event on every
+    path with a durable `outcome` so a later reader can tell a criterion that
+    was unmet from an evaluator that failed (provider down / repair exhausted).
+    When no verdict is wired, prose criteria stay advisory (not gating)."""
     dod = ctx.graph.doc.spec.definition_of_done
     if dod is None:
         return "COMPLETED"
-    # The DoD evaluation can run an INJECTED prose verdict (an agent turn), and
-    # this gate executes in _finalize_status — outside _dispatch's failure
-    # boundary. A raising verdict must not escape and strand the run at RUNNING;
-    # fail closed (the DoD isn't demonstrably met) and record it.
-    try:
-        result = await evaluate_dod(dod, ctx.load_shared_state(), prose_verdict=ctx.dod_prose_verdict)
-    except Exception as exc:  # noqa: BLE001
-        _log_event(ctx.con, ctx.run_id, None, "DOD_EVALUATED", result=False, condition_evaluated="; ".join(dod.criteria))
-        ctx.con.commit()
-        log_event("ERROR", f"run {ctx.run_id} DoD evaluation raised, failing the run: {exc}", run_id=ctx.run_id)
-        return "FAILED"
+    guards = ctx.graph.doc.spec.graph.guards
+    state = ctx.load_shared_state()
+    result = evaluate_dod(dod, state)  # pure/sync — expressions only
+    prose = result.prose_criteria
+    if prose and ctx.dod_prose_verdict is not None:
+        # The verdict runs an agent turn, and this gate executes in
+        # _finalize_status — outside _dispatch's failure boundary. A verdict that
+        # RAISES (provider down, repair budget exhausted) must not escape and
+        # strand the run at RUNNING; fail closed and record the durable cause.
+        try:
+            judgement = await ctx.dod_prose_verdict(dod.evaluated_by, prose, state)
+        except Exception as exc:  # noqa: BLE001
+            return _finish_dod(ctx, dod, result, outcome="evaluator_error", detail=str(exc), status="FAILED")
+        # §3.6 cost cap: judgement tokens count toward the run's hard ceiling. A
+        # judgement that pushes the run past max_tokens_total FAILs it rather
+        # than COMPLETEs — the same rule node dispatch enforces at commit.
+        projected = _total_tokens(ctx.con, ctx.run_id) + judgement.input_tokens + judgement.output_tokens
+        if guards.max_tokens_total is not None and projected > guards.max_tokens_total:
+            return _finish_dod(
+                ctx, dod, result, outcome="cost_cap_exceeded", status="FAILED", usage=judgement,
+                detail=f"DoD judgement pushed the run to {projected} tokens, over max_tokens_total ({guards.max_tokens_total})",
+            )
+        result.apply_prose_verdict(judgement.verdicts)
+        return _finish_dod(
+            ctx, dod, result, outcome="met" if result.met else "criteria_unmet",
+            status="COMPLETED" if result.met else "FAILED", usage=judgement,
+        )
+    return _finish_dod(
+        ctx, dod, result, outcome="met" if result.met else "criteria_unmet",
+        status="COMPLETED" if result.met else "FAILED",
+    )
+
+
+def _finish_dod(
+    ctx: _RunCtx,
+    dod: DefinitionOfDone,
+    result: DodResult,
+    *,
+    outcome: str,
+    status: str,
+    detail: str | None = None,
+    usage: ProseJudgement | None = None,
+) -> str:
+    """Record one DOD_EVALUATED event carrying the outcome (met / criteria_unmet
+    / evaluator_error / cost_cap_exceeded), the per-criterion result, any
+    judgement token usage, and — for a failure cause — a redacted detail, then
+    return the run status. Centralizes the single-log-per-gate invariant."""
+    state_diff: dict[str, Any] = {"outcome": outcome, **result.as_dict()}
+    if usage is not None:
+        state_diff["usage"] = {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
+    if detail is not None:
+        # §8 backstop: the cause ends up in the persisted event; the gateway's
+        # errors are fixed-shape and secret-free by construction, but redact as
+        # defense in depth before it lands in the log.
+        state_diff["detail"] = redact_secrets(detail)
     _log_event(
+        # `result` is the GATE outcome (did the run COMPLETE), not result.met —
+        # an evaluator_error or cost_cap FAILs the run even though the criteria
+        # it managed to evaluate were vacuously met.
         ctx.con, ctx.run_id, None, "DOD_EVALUATED",
-        result=result.met, condition_evaluated="; ".join(dod.criteria), state_diff=result.as_dict(),
+        result=(status == "COMPLETED"), condition_evaluated="; ".join(dod.criteria), state_diff=state_diff,
     )
     ctx.con.commit()
-    if result.met:
-        return "COMPLETED"
-    log_event("ERROR", f"run {ctx.run_id} reached a terminal but its definition_of_done is not met: {result.unmet}", run_id=ctx.run_id)
-    return "FAILED"
+    if status == "FAILED":
+        log_event(
+            "ERROR",
+            f"run {ctx.run_id} DoD gate FAILED ({outcome}): unmet={result.unmet}"
+            + (f"; {redact_secrets(detail)}" if detail else ""),
+            run_id=ctx.run_id,
+        )
+    return status
 
 
 async def _dispatch(ctx: _RunCtx, node_id: str) -> None:

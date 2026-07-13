@@ -23,7 +23,7 @@ from ravana.compiler.persist import get_or_create_workflow
 from ravana.compiler.validate import validate
 from ravana.engine.dod import ProseVerdict
 from ravana.engine.loop import resume_hitl, start_run
-from ravana.runtime.base import AgentRuntime
+from ravana.runtime.base import AgentRuntime, ProseJudge
 from ravana.runtime.gateway import LLMGateway
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
@@ -120,11 +120,12 @@ def _build_runtime(
 
 
 def _prose_verdict_for(runtime: AgentRuntime) -> ProseVerdict | None:
-    """§3.1 step 7: wire the DoD gate's prose judge only for the real LLM
-    backend — the gateway's own `evaluated_by`-agent judgement. Under the mock
-    backend there is no judge, so prose criteria stay advisory (unevaluated,
-    non-gating), exactly as in Phase 0a."""
-    return runtime.judge_prose if isinstance(runtime, LLMGateway) else None
+    """§3.1 step 7: wire the DoD gate's prose judge for any runtime that can
+    judge prose (the `ProseJudge` capability). Detected structurally, not by
+    concrete class, so a future runtime that gains `judge_prose` is picked up
+    here with no CLI change. A runtime without the capability (the mock backend)
+    leaves prose criteria advisory (unevaluated, non-gating), as in Phase 0a."""
+    return runtime.judge_prose if isinstance(runtime, ProseJudge) else None
 
 
 async def _start_with_cleanup(

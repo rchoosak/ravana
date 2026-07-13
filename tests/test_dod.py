@@ -1,101 +1,108 @@
 """Definition-of-Done evaluation (§3.1 step 7): the pure evaluator
-(engine/dod.py) and its engine gating (a terminal only COMPLETEs if the DoD is
-met, else FAILs). Expression criteria are enforced deterministically; prose
-criteria are advisory (recorded, not gating) until a verdict is wired. The
-evaluator and its injected prose verdict are async (a real verdict runs an
-agent turn), so the pure-evaluator tests drive it through asyncio.run and the
-verdict doubles are async callables.
+(engine/dod.py, now synchronous) and its engine gating (a terminal only
+COMPLETEs if the DoD is met, else FAILs). Expression criteria are enforced
+deterministically; prose criteria are resolved at the engine boundary by an
+injected async verdict returning a *position-aligned* ProseJudgement, whose
+token usage the gate meters against guards.max_tokens_total.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Callable
 
 from ravana.compiler.graph import compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
-from ravana.engine.dod import DodResult, evaluate_dod
+from ravana.engine.dod import evaluate_dod
 from ravana.engine.loop import start_run
+from ravana.runtime.base import ProseJudgement
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.schema.models import DefinitionOfDone, WorkflowDoc
 
-Verdict = Callable[[str, list[str], dict[str, Any]], dict[str, bool]]
+# A test double maps (evaluated_by, prose_criteria, state) -> position-aligned bools.
+VerdictFn = Callable[[str, list[str], dict[str, Any]], list[bool]]
 
 
 def _dod(criteria: list[str]) -> DefinitionOfDone:
     return DefinitionOfDone(evaluated_by="a", criteria=criteria)
 
 
-def _eval(dod: DefinitionOfDone, state: dict[str, Any], *, prose_verdict: Verdict | None = None) -> DodResult:
-    """Drive the async evaluator synchronously for the pure-evaluator tests,
-    wrapping any (sync) verdict double into the async ProseVerdict shape."""
-    averdict = _averdict(prose_verdict) if prose_verdict is not None else None
-    return asyncio.run(evaluate_dod(dod, state, prose_verdict=averdict))
+def _averdict(fn: VerdictFn):
+    """Adapt a plain (sync) verdict function into the async ProseVerdict the
+    engine awaits — returning a ProseJudgement. A raising `fn` still raises when
+    awaited (the throwing-verdict test depends on that)."""
 
-
-def _averdict(fn: Verdict):
-    """Adapt a plain verdict function to the async ProseVerdict the evaluator
-    awaits. A raising `fn` still raises when awaited (the throwing-verdict test
-    depends on that)."""
-
-    async def verdict(who: str, criteria: list[str], state: dict[str, Any]) -> dict[str, bool]:
-        return fn(who, criteria, state)
+    async def verdict(who: str, criteria: list[str], state: dict[str, Any]) -> ProseJudgement:
+        return ProseJudgement(verdicts=fn(who, criteria, state))
 
     return verdict
 
 
-# --- pure evaluator --------------------------------------------------------
+# --- pure evaluator (sync) -------------------------------------------------
 def test_expression_criteria_pass_and_fail():
-    met = _eval(_dod(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
+    met = evaluate_dod(_dod(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
     assert met.met and not met.unmet
-    unmet = _eval(_dod(["state.qa_status == 'PASS'"]), {"qa_status": "FAIL"})
+    unmet = evaluate_dod(_dod(["state.qa_status == 'PASS'"]), {"qa_status": "FAIL"})
     assert not unmet.met
     assert unmet.unmet == ["state.qa_status == 'PASS'"]
 
 
 def test_missing_state_key_expression_is_false_not_an_error():
-    # StateProxy returns None for an unset key, so `None == 'PASS'` is a clean
-    # False (criterion not yet met) — not a raise that would misclassify it.
-    result = _eval(_dod(["state.qa_status == 'PASS'"]), {})
+    result = evaluate_dod(_dod(["state.qa_status == 'PASS'"]), {})
     assert not result.met
     assert result.results[0].kind == "expression"
 
 
-def test_prose_criterion_is_advisory_when_no_evaluator():
-    result = _eval(_dod(["All acceptance criteria are met"]), {})
+def test_prose_criterion_is_advisory_when_no_verdict_applied():
+    result = evaluate_dod(_dod(["All acceptance criteria are met"]), {})
     assert result.met  # unevaluated prose does not gate
     assert result.unevaluated == ["All acceptance criteria are met"]
     assert result.results[0].kind == "prose" and result.results[0].passed is None
 
 
-def test_prose_criterion_enforced_when_verdict_wired():
+def test_prose_criteria_property_excludes_expressions():
+    result = evaluate_dod(_dod(["a prose line", "state.x == 1"]), {"x": 1})
+    assert result.prose_criteria == ["a prose line"]  # only what a verdict is asked to judge
+
+
+def test_apply_prose_verdict_gates_fail_closed():
     crit = "All acceptance criteria are met"
-    passed = _eval(_dod([crit]), {}, prose_verdict=lambda who, cs, st: {crit: True})
+    passed = evaluate_dod(_dod([crit]), {})
+    passed.apply_prose_verdict([True])
     assert passed.met
-    failed = _eval(_dod([crit]), {}, prose_verdict=lambda who, cs, st: {crit: False})
+    failed = evaluate_dod(_dod([crit]), {})
+    failed.apply_prose_verdict([False])
     assert not failed.met and failed.unmet == [crit]
 
 
-def test_prose_verdict_receives_only_prose_criteria_and_evaluated_by():
-    seen: dict = {}
+def test_apply_prose_verdict_short_list_is_fail_closed():
+    # A verdict missing an entry for a criterion leaves it not met (never passes).
+    result = evaluate_dod(_dod(["prose zero", "prose one"]), {})
+    result.apply_prose_verdict([True])  # nothing for the second
+    assert not result.met and result.unmet == ["prose one"]
 
-    def verdict(who, criteria, state):
-        seen["who"] = who
-        seen["criteria"] = criteria
-        return {c: True for c in criteria}
 
-    _eval(
-        DefinitionOfDone(evaluated_by="pm", criteria=["a prose line", "state.x == 1"]),
-        {"x": 1},
-        prose_verdict=verdict,
-    )
-    assert seen["who"] == "pm"
-    assert seen["criteria"] == ["a prose line"]  # the expression criterion is NOT sent to the agent
+def test_apply_prose_verdict_only_exact_true_passes():
+    # apply is `is True` — a truthy non-True entry does not pass.
+    result = evaluate_dod(_dod(["a prose criterion"]), {})
+    result.apply_prose_verdict([1])  # type: ignore[list-item]  # deliberately not a bool
+    assert not result.met
+
+
+def test_apply_prose_verdict_preserves_position_for_duplicate_text():
+    # Two criteria with identical text keep independent rulings — nothing is
+    # keyed by (collidable) criterion text.
+    crit = "same text"
+    result = evaluate_dod(_dod([crit, crit]), {})
+    result.apply_prose_verdict([True, False])
+    assert not result.met  # the second one is not met -> gate fails
+    assert result.unmet == [crit]
 
 
 def test_mixed_expression_and_prose_classified_correctly():
     prose = "No open defects in state.qa_report"  # references state. but isn't a valid expression
-    result = _eval(_dod(["state.qa_status == 'PASS'", prose]), {"qa_status": "PASS"})
+    result = evaluate_dod(_dod(["state.qa_status == 'PASS'", prose]), {"qa_status": "PASS"})
     kinds = {r.criterion: r.kind for r in result.results}
     assert kinds["state.qa_status == 'PASS'"] == "expression"
     assert kinds[prose] == "prose"
@@ -103,45 +110,36 @@ def test_mixed_expression_and_prose_classified_correctly():
 
 
 def test_empty_criteria_is_vacuously_met():
-    assert _eval(_dod([]), {}).met
+    assert evaluate_dod(_dod([]), {}).met
 
 
 def test_ordering_expression_on_unset_key_is_a_failing_expression_not_prose():
-    # `state.count > 5` PARSES as an expression; on an unset key it errors at
-    # eval (None > 5). It must be a FAILING expression (gating), NOT silently
-    # downgraded to advisory prose — otherwise the gate is defeated.
-    result = _eval(_dod(["state.count > 5"]), {})
+    result = evaluate_dod(_dod(["state.count > 5"]), {})
     assert result.results[0].kind == "expression"
     assert result.results[0].passed is False
     assert not result.met and result.unmet == ["state.count > 5"]
 
 
 def test_ordering_expression_met_when_key_present():
-    result = _eval(_dod(["state.count > 5"]), {"count": 10})
+    result = evaluate_dod(_dod(["state.count > 5"]), {"count": 10})
     assert result.met and result.results[0].passed is True
 
 
 def test_membership_expression_on_unset_key_is_a_failing_expression():
-    # `'x' in state.items` parses; `'x' in None` raises -> failing expression.
-    result = _eval(_dod(["'defect' in state.qa_report"]), {})
+    result = evaluate_dod(_dod(["'defect' in state.qa_report"]), {})
     assert result.results[0].kind == "expression"
     assert not result.met
 
 
-def test_prose_verdict_omission_is_fail_closed():
-    # A verdict that returns no entry for a criterion must NOT let it pass: the
-    # evaluator treats a missing key as not-met (bool(None) is False).
-    crit = "All acceptance criteria are met"
-    result = _eval(_dod([crit]), {}, prose_verdict=lambda who, cs, st: {})
-    assert not result.met and result.unmet == [crit]
-
-
 # --- engine gating ---------------------------------------------------------
-def _dod_workflow(criteria: list[str], with_dod: bool = True) -> WorkflowDoc:
+def _dod_workflow(criteria: list[str], with_dod: bool = True, guards: dict | None = None) -> WorkflowDoc:
+    graph: dict[str, Any] = {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []}
+    if guards is not None:
+        graph["guards"] = guards
     spec: dict = {
         "state": {"schema": {"qa_status": {"type": "string"}}, "initial": {}},
         "agents": [{"id": "a", "name": "A", "llm": {"provider": "anthropic", "model": "m"}, "system_prompt": "p"}],
-        "graph": {"entry": "only", "nodes": [{"id": "only", "agent": "a"}], "edges": []},
+        "graph": graph,
     }
     if with_dod:
         spec["definition_of_done"] = {"evaluated_by": "a", "criteria": criteria}
@@ -154,8 +152,7 @@ def _run_single(con, workflow, payload):
     graph = compile_workflow(workflow)
     workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": payload}]})
-    run_id = asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
-    return run_id
+    return asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
 
 
 def _dod_event(con, run_id):
@@ -168,17 +165,19 @@ def _dod_event(con, run_id):
 def test_run_fails_at_terminal_when_dod_expression_unmet(con):
     run_id = _run_single(con, _dod_workflow(["state.qa_status == 'PASS'"]), {"qa_status": "FAIL"})
     run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
-    assert run["status"] == "FAILED"  # reached terminal but DoD not met
+    assert run["status"] == "FAILED"
     event = _dod_event(con, run_id)
     assert event["result"] == 0
     assert "state.qa_status == 'PASS'" in event["state_diff"]  # unmet criterion recorded
+    assert json.loads(event["state_diff"])["outcome"] == "criteria_unmet"
 
 
 def test_run_completes_when_dod_expression_met(con):
     run_id = _run_single(con, _dod_workflow(["state.qa_status == 'PASS'"]), {"qa_status": "PASS"})
     run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
     assert run["status"] == "COMPLETED"
-    assert _dod_event(con, run_id)["result"] == 1
+    event = _dod_event(con, run_id)
+    assert event["result"] == 1 and json.loads(event["state_diff"])["outcome"] == "met"
 
 
 def test_prose_criterion_does_not_block_completion_but_is_recorded(con):
@@ -186,68 +185,89 @@ def test_prose_criterion_does_not_block_completion_but_is_recorded(con):
         con, _dod_workflow(["state.qa_status == 'PASS'", "All acceptance criteria are met"]), {"qa_status": "PASS"}
     )
     run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
-    assert run["status"] == "COMPLETED"  # expression met; unevaluated prose is advisory
-    assert "All acceptance criteria are met" in _dod_event(con, run_id)["state_diff"]  # recorded as unevaluated
+    assert run["status"] == "COMPLETED"  # expression met; unevaluated prose is advisory (mock has no judge)
+    assert "All acceptance criteria are met" in _dod_event(con, run_id)["state_diff"]
 
 
 def test_run_with_no_dod_completes_without_a_dod_event(con):
     run_id = _run_single(con, _dod_workflow([], with_dod=False), {"qa_status": "whatever"})
     run = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
     assert run["status"] == "COMPLETED"
-    assert _dod_event(con, run_id) is None  # gate no-ops when there's no definition_of_done
+    assert _dod_event(con, run_id) is None
 
 
 def test_run_fails_when_ordering_expression_unmet_on_unset_key(con):
-    # End-to-end version of the classification fix: an erroring expression must
-    # gate the run (FAILED), not pass through as advisory prose (COMPLETED).
     run_id = _run_single(con, _dod_workflow(["state.count > 5"]), {"qa_status": "PASS"})
     assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "FAILED"
 
 
-def _start_with_verdict(con, workflow, payload, verdict: Verdict):
+def _start_with_verdict(con, workflow, payload, verdict, *, raw=None):
     graph = compile_workflow(workflow)
     workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": payload}]})
     return asyncio.run(
         start_run(
-            con, graph, runtime, org_id="test", workflow_id=workflow_id, dod_prose_verdict=_averdict(verdict)
+            con, graph, runtime, org_id="test", workflow_id=workflow_id,
+            dod_prose_verdict=raw if raw is not None else _averdict(verdict),
         )
     )
 
 
 def test_engine_enforces_prose_when_a_verdict_is_injected(con):
-    # P2: with a prose_verdict wired at the engine boundary (start_run), a prose
-    # criterion gates the run end-to-end — not only in the pure evaluator.
     crit = "All acceptance criteria are met"
-    failed = _start_with_verdict(con, _dod_workflow([crit]), {"qa_status": "PASS"}, lambda who, cs, st: {c: False for c in cs})
+    failed = _start_with_verdict(con, _dod_workflow([crit]), {"qa_status": "PASS"}, lambda who, cs, st: [False for _ in cs])
     assert con.execute("SELECT status FROM run WHERE id = ?", (failed,)).fetchone()["status"] == "FAILED"
 
-    passed = _start_with_verdict(con, _dod_workflow([crit]), {"qa_status": "PASS"}, lambda who, cs, st: {c: True for c in cs})
+    passed = _start_with_verdict(con, _dod_workflow([crit]), {"qa_status": "PASS"}, lambda who, cs, st: [True for _ in cs])
     assert con.execute("SELECT status FROM run WHERE id = ?", (passed,)).fetchone()["status"] == "COMPLETED"
 
 
 def test_throwing_prose_verdict_fails_the_run_not_strands_it(con):
-    # P2: the DoD gate runs outside _dispatch's failure boundary. A verdict that
-    # raises at Terminate must NOT escape start_run and leave the run stuck at
-    # RUNNING — it must fail closed (FAILED, ended_at set), per §3.1 step 7.
-    def boom(evaluated_by, criteria, state):
+    async def boom(evaluated_by, criteria, state):
         raise RuntimeError("evaluator exploded")
 
-    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, boom)
+    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=boom)
     run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
     assert run["status"] == "FAILED"  # not stranded at RUNNING
     assert run["ended_at"] is not None
-    assert _dod_event(con, run_id)["result"] == 0  # recorded as a failed DoD
+    event = _dod_event(con, run_id)
+    assert event["result"] == 0
+    # Durable cause: an evaluator failure is distinguishable from an unmet criterion.
+    assert json.loads(event["state_diff"])["outcome"] == "evaluator_error"
 
 
 def test_engine_prose_verdict_receives_evaluated_by_and_final_state(con):
     seen: dict = {}
 
-    def verdict(evaluated_by, criteria, state):
+    async def verdict(evaluated_by, criteria, state):
         seen["evaluated_by"] = evaluated_by
         seen["state"] = dict(state)
-        return {c: True for c in criteria}
+        return ProseJudgement(verdicts=[True for _ in criteria])
 
-    _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, verdict)
-    assert seen["evaluated_by"] == "a"  # the DoD's evaluated_by agent id
-    assert seen["state"]["qa_status"] == "PASS"  # final shared_state, post-commit
+    _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
+    assert seen["evaluated_by"] == "a"
+    assert seen["state"]["qa_status"] == "PASS"
+
+
+def test_dod_event_records_judgement_usage(con):
+    async def verdict(evaluated_by, criteria, state):
+        return ProseJudgement(verdicts=[True for _ in criteria], input_tokens=40, output_tokens=12)
+
+    run_id = _start_with_verdict(con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, None, raw=verdict)
+    usage = json.loads(_dod_event(con, run_id)["state_diff"])["usage"]
+    assert usage == {"input_tokens": 40, "output_tokens": 12}
+
+
+def test_dod_judgement_usage_is_metered_against_max_tokens_total(con):
+    # A judgement whose tokens push the run over guards.max_tokens_total FAILs
+    # the run (cost cap), even though every criterion was judged met.
+    async def verdict(evaluated_by, criteria, state):
+        return ProseJudgement(verdicts=[True for _ in criteria], input_tokens=100, output_tokens=100)
+
+    run_id = _start_with_verdict(
+        con, _dod_workflow(["a prose criterion"], guards={"max_tokens_total": 10}),
+        {"qa_status": "PASS"}, None, raw=verdict,
+    )
+    run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED"
+    assert json.loads(_dod_event(con, run_id)["state_diff"])["outcome"] == "cost_cap_exceeded"

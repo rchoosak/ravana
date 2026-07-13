@@ -7,7 +7,34 @@ doesn't change when the backend does.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
+
+
+@dataclass
+class ProseJudgement:
+    """A runtime's ruling on a run's *prose* Definition-of-Done criteria (§3.1
+    step 7). `verdicts` is **position-aligned** to the prose criteria the judge
+    was handed — `verdicts[i]` is the ruling on `prose_criteria[i]` — so no
+    criterion identity is ever carried by (collidable) text. A short/empty list
+    fails closed: any criterion without an explicit `True` is treated as not
+    met. `input_tokens`/`output_tokens` are the LLM usage the judgement spent,
+    which the engine meters against `guards.max_tokens_total` before it lets a
+    run COMPLETE."""
+
+    verdicts: list[bool] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@runtime_checkable
+class ProseJudge(Protocol):
+    """A runtime that can judge prose DoD criteria. Detected structurally (not
+    by concrete class) so any future runtime gaining this capability is wired
+    at the DoD gate without a CLI change (§3.1 step 7)."""
+
+    async def judge_prose(
+        self, agent_id: str, criteria: list[str], state: dict[str, Any]
+    ) -> ProseJudgement: ...
 
 
 @dataclass

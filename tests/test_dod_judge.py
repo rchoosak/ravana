@@ -1,9 +1,11 @@
 """§3.1 step 7: the LLM Gateway's agent-backed prose Definition-of-Done judge
 (`LLMGateway.judge_prose`) and its end-to-end gating. Covers the forced-tool
-and guided judgement paths, index→criterion mapping, fail-closed omission, the
-unknown-`evaluated_by` config error, the repair loop / its exhaustion, and the
-whole path (engine gate → async evaluate_dod → judge_prose → verdict → COMPLETE
-or FAIL). No network: scripted FakeAdapters only, reusing test_gateway's fakes.
+and guided paths, POSITION-ALIGNED verdict mapping and its fail-closed
+defenses (omission, non-`true` `met`, garbage `verdicts`, bool/out-of-range/
+duplicate index), token usage, the §3.6 fallback chain, the unknown-
+`evaluated_by` config error, the repair loop / its exhaustion, and the whole
+gate (engine → evaluate_dod → judge_prose → COMPLETE or FAIL). No network:
+scripted FakeAdapters only, reusing test_gateway's fakes.
 """
 
 from __future__ import annotations
@@ -24,19 +26,23 @@ from ravana.runtime.providers.base import (
     ProviderResponse,
 )
 from ravana.schema.models import WorkflowDoc
+from tests.conftest import RecordingSleep
 from tests.test_gateway import FakeAdapter, _guided_text, _submit
 
 
-def _judge_graph(*, provider: str = "anthropic", model: str = "m", criteria: list[str] | None = None):
+def _judge_graph(*, provider: str = "anthropic", model: str = "m", criteria: list[str] | None = None, fallback=None):
     """A one-agent workflow whose evaluated_by agent is `pm`. When `criteria` is
-    given, it also carries a prose DoD (for the end-to-end gate tests)."""
+    given it also carries a prose DoD (for the end-to-end gate tests)."""
+    llm: dict[str, Any] = {"provider": provider, "model": model}
+    if fallback is not None:
+        llm["fallback"] = fallback
     spec: dict[str, Any] = {
         "state": {"schema": {"done": {"type": "boolean"}}, "initial": {}},
         "agents": [
             {
                 "id": "pm",
                 "name": "PM",
-                "llm": {"provider": provider, "model": model},
+                "llm": llm,
                 "system_prompt": "you are the pm",
                 "output_schema": {"type": "object", "additionalProperties": True},
             }
@@ -52,28 +58,31 @@ def _judge_graph(*, provider: str = "anthropic", model: str = "m", criteria: lis
     )
 
 
-def _verdict(items: Any) -> ProviderResponse:
-    """A forced-tool judgement response: a submit_verdict tool call carrying
-    `items` as its `verdicts`."""
-    return _verdict_call({"verdicts": items})
+def _verdict_call(args: dict[str, Any], **usage: int) -> ProviderResponse:
+    """A submit_verdict tool call with arbitrary arguments (and optional token
+    usage) — for the malformed / missing-key / usage cases."""
+    return ProviderResponse(
+        text="", tool_calls=[NormalizedToolCall(id="v", tool=SUBMIT_VERDICT, arguments=args)], **usage
+    )
 
 
-def _verdict_call(args: dict[str, Any]) -> ProviderResponse:
-    """A submit_verdict tool call with arbitrary arguments (for the malformed /
-    missing-key cases the repair loop must catch)."""
-    return ProviderResponse(text="", tool_calls=[NormalizedToolCall(id="v", tool=SUBMIT_VERDICT, arguments=args)])
+def _verdict(items: Any, **usage: int) -> ProviderResponse:
+    return _verdict_call({"verdicts": items}, **usage)
 
 
-# --- judge_prose in isolation ----------------------------------------------
+def _judge(gateway: LLMGateway, criteria: list[str], state: dict[str, Any] | None = None):
+    return asyncio.run(gateway.judge_prose("pm", criteria, state or {}))
+
+
+# --- verdict mapping (position-aligned, fail-closed) -----------------------
 def test_judge_prose_forced_tool_maps_verdicts_by_index():
-    graph = _judge_graph()
     adapter = FakeAdapter(
         caps={Capability.NATIVE_STRUCTURED_OUTPUT},
         responses=[_verdict([{"index": 0, "met": True}, {"index": 1, "met": False}])],
     )
-    gateway = LLMGateway(graph, {"anthropic": adapter})
-    out = asyncio.run(gateway.judge_prose("pm", ["c-zero", "c-one"], {"x": 1}))
-    assert out == {"c-zero": True, "c-one": False}
+    gateway = LLMGateway(_judge_graph(), {"anthropic": adapter})
+    out = _judge(gateway, ["c-zero", "c-one"], {"x": 1})
+    assert out.verdicts == [True, False]  # position-aligned to the criteria
     # A judgement offers ONLY the submit_verdict tool (no toolkits) and forces it.
     req = adapter.requests[0]
     assert req.force_tool == SUBMIT_VERDICT
@@ -81,91 +90,97 @@ def test_judge_prose_forced_tool_maps_verdicts_by_index():
 
 
 def test_judge_prose_guided_path_parses_json_text():
-    graph = _judge_graph(provider="local", model="local-model")
-    adapter = FakeAdapter(
-        caps={Capability.GUIDED_DECODING},
-        responses=[_guided_text({"verdicts": [{"index": 0, "met": True}]})],
-    )
-    gateway = LLMGateway(graph, {"local": adapter})
-    out = asyncio.run(gateway.judge_prose("pm", ["only"], {}))
-    assert out == {"only": True}
-    # Guided path constrains the whole response — no forced tool, no tools offered.
-    assert adapter.requests[0].force_tool is None
-    assert adapter.requests[0].output_schema is not None
+    adapter = FakeAdapter(caps={Capability.GUIDED_DECODING}, responses=[_guided_text({"verdicts": [{"index": 0, "met": True}]})])
+    gateway = LLMGateway(_judge_graph(provider="local", model="local-model"), {"local": adapter})
+    out = _judge(gateway, ["only"])
+    assert out.verdicts == [True]
+    assert adapter.requests[0].force_tool is None and adapter.requests[0].output_schema is not None
 
 
 def test_judge_prose_omitted_criterion_is_fail_closed():
-    # The model rules on index 0 but never mentions index 1 — that criterion is
-    # treated as NOT met, so an incomplete verdict can't sneak a run to COMPLETE.
-    graph = _judge_graph()
     adapter = FakeAdapter(responses=[_verdict([{"index": 0, "met": True}])])
-    gateway = LLMGateway(graph, {"anthropic": adapter})
-    out = asyncio.run(gateway.judge_prose("pm", ["c0", "c1"], {}))
-    assert out == {"c0": True, "c1": False}
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0", "c1"])
+    assert out.verdicts == [True, False]  # c1 omitted -> not met
 
 
 def test_judge_prose_non_true_met_is_fail_closed():
-    # Only an explicit boolean True passes. A truthy-but-not-True `met` (a
-    # "true" STRING, or 1) must read as NOT met — otherwise Python truthiness
-    # would fail open on garbled output.
-    graph = _judge_graph()
-    adapter = FakeAdapter(
-        responses=[_verdict([{"index": 0, "met": True}, {"index": 1, "met": "true"}, {"index": 2, "met": 1}])]
-    )
-    gateway = LLMGateway(graph, {"anthropic": adapter})
-    out = asyncio.run(gateway.judge_prose("pm", ["c0", "c1", "c2"], {}))
-    assert out == {"c0": True, "c1": False, "c2": False}
+    # Only an explicit boolean True passes — a "true" STRING or 1 must not.
+    adapter = FakeAdapter(responses=[_verdict([{"index": 0, "met": True}, {"index": 1, "met": "true"}, {"index": 2, "met": 1}])])
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0", "c1", "c2"])
+    assert out.verdicts == [True, False, False]
 
 
 def test_judge_prose_garbage_verdicts_value_fails_closed():
-    # The shallow schema check only guarantees the 'verdicts' key exists, not
-    # that it's a well-formed list. A non-list value must fail closed (every
-    # criterion not met), never crash.
-    graph = _judge_graph()
     adapter = FakeAdapter(responses=[_verdict("not-a-list")])
-    gateway = LLMGateway(graph, {"anthropic": adapter})
-    out = asyncio.run(gateway.judge_prose("pm", ["c0"], {}))
-    assert out == {"c0": False}
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert out.verdicts == [False]
 
 
+def test_judge_prose_bool_index_is_rejected_not_read_as_zero():
+    # bool is a subclass of int; index=false must NOT be read as criterion 0.
+    adapter = FakeAdapter(responses=[_verdict([{"index": False, "met": True}])])
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert out.verdicts == [False]  # the false-indexed ruling does not land on c0
+
+
+def test_judge_prose_out_of_range_index_is_dropped():
+    adapter = FakeAdapter(responses=[_verdict([{"index": 5, "met": True}])])
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert out.verdicts == [False]
+
+
+def test_judge_prose_duplicate_index_fails_closed():
+    # Two rulings on the same index are unreliable; that criterion fails closed
+    # even if one of them said met.
+    adapter = FakeAdapter(responses=[_verdict([{"index": 0, "met": True}, {"index": 0, "met": False}])])
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert out.verdicts == [False]
+
+
+def test_judge_prose_carries_token_usage():
+    adapter = FakeAdapter(responses=[_verdict([{"index": 0, "met": True}], input_tokens=30, output_tokens=8)])
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert out.verdicts == [True] and out.input_tokens == 30 and out.output_tokens == 8
+
+
+# --- config error, repair, fallback ----------------------------------------
 def test_judge_prose_unknown_evaluated_by_raises():
-    graph = _judge_graph()
-    gateway = LLMGateway(graph, {"anthropic": FakeAdapter(responses=[])})
+    gateway = LLMGateway(_judge_graph(), {"anthropic": FakeAdapter(responses=[])})
     with pytest.raises(ValueError, match="unknown agent"):
         asyncio.run(gateway.judge_prose("nobody", ["c0"], {}))
 
 
 def test_judge_prose_repairs_then_succeeds():
-    graph = _judge_graph()
     bad = _verdict_call({"wrong": "shape"})  # missing the required 'verdicts' key — repairable
     good = _verdict([{"index": 0, "met": True}])
     adapter = FakeAdapter(responses=[bad, good])
-    gateway = LLMGateway(graph, {"anthropic": adapter})
-    out = asyncio.run(gateway.judge_prose("pm", ["c0"], {}))
-    assert out == {"c0": True}
+    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert out.verdicts == [True]
     assert len(adapter.requests) == 2  # one repair round-trip
 
 
 def test_judge_prose_exhausts_repairs_then_raises():
-    # An adapter that never returns a valid verdict must not loop forever: after
-    # guards.max_output_repairs it raises AgentOutputError (non-transient — the
-    # DoD gate turns it into a fail-closed run).
-    graph = _judge_graph()
     adapter = FakeAdapter(responses=[_verdict_call({"wrong": "shape"})])
-    gateway = LLMGateway(graph, {"anthropic": adapter})
     with pytest.raises(AgentOutputError):
-        asyncio.run(gateway.judge_prose("pm", ["c0"], {}))
+        asyncio.run(LLMGateway(_judge_graph(), {"anthropic": adapter}).judge_prose("pm", ["c0"], {}))
     assert len(adapter.requests) == 3  # initial + max_output_repairs (2)
 
 
 def test_judge_prose_missing_tool_call_is_repaired_not_crashed():
-    # A non-compliant provider that ignores the forced tool returns no
-    # submit_verdict — treated as an invalid output (repairable), then exhausted.
-    graph = _judge_graph()
     adapter = FakeAdapter(responses=[ProviderResponse(text="I refuse to use the tool", tool_calls=[])])
-    gateway = LLMGateway(graph, {"anthropic": adapter})
     with pytest.raises(AgentOutputError):
-        asyncio.run(gateway.judge_prose("pm", ["c0"], {}))
+        asyncio.run(LLMGateway(_judge_graph(), {"anthropic": adapter}).judge_prose("pm", ["c0"], {}))
+
+
+def test_judge_prose_uses_fallback_chain_on_transient_primary():
+    # §3.6: a judgement survives a primary-provider outage the same way a node
+    # does — the transient primary yields to a working fallback entry.
+    graph = _judge_graph(fallback=[{"provider": "openai", "model": "gpt"}])
+    primary = FakeAdapter(name="anthropic", fail=True, fail_retryable=True)
+    fb = FakeAdapter(name="openai", responses=[_verdict([{"index": 0, "met": True}])])
+    gateway = LLMGateway(graph, {"anthropic": primary, "openai": fb}, retry_sleep=RecordingSleep())
+    out = _judge(gateway, ["c0"])
+    assert out.verdicts == [True]  # fallback served the judgement
 
 
 # --- end-to-end gate through the gateway -----------------------------------
