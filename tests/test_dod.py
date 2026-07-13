@@ -260,6 +260,37 @@ def test_dod_event_records_judgement_usage(con):
     assert usage == {"input_tokens": 40, "output_tokens": 12}
 
 
+class _BrokenStderr:
+    def write(self, *a, **k):
+        raise ValueError("stderr is closed")
+
+    def flush(self, *a, **k):
+        pass
+
+
+def test_log_event_is_best_effort_when_stderr_is_broken(monkeypatch):
+    import sys
+
+    from ravana.observability.logging import log_event
+
+    monkeypatch.setattr(sys, "stderr", _BrokenStderr())
+    log_event("ERROR", "boom", run_id="r1")  # must NOT raise
+
+
+def test_logging_failure_does_not_strand_the_run(con, monkeypatch):
+    # A broken stderr must not strand a run: the DoD gate logs an ERROR line on
+    # the FAILED path, but log_event is best-effort, so the run still commits
+    # FAILED with ended_at set rather than escaping past the commit as RUNNING.
+    import sys
+
+    monkeypatch.setattr(sys, "stderr", _BrokenStderr())
+    run_id = _start_with_verdict(
+        con, _dod_workflow(["a prose criterion"]), {"qa_status": "PASS"}, lambda who, cs, st: [False for _ in cs]
+    )
+    run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "FAILED" and run["ended_at"] is not None
+
+
 def test_dod_finalization_is_idempotent_on_reentry(con):
     # A re-entry after a run is already terminal must NOT re-judge, must not
     # append a second DOD_EVALUATED, and must not flip the terminal status.

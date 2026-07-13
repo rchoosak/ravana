@@ -29,4 +29,16 @@ def log_event(level: str, message: str, *, run_id: str | None = None, node_execu
     # known secret pattern." Applied to the WHOLE record — message and every
     # string `**extra` field — at the single point every log line passes
     # through, so a new caller can't route a secret around it.
-    print(json.dumps(redact_record(record)), file=sys.stderr)
+    try:
+        line = json.dumps(redact_record(record))
+    except Exception:  # noqa: BLE001 - a non-serializable extra field must not break the run
+        line = json.dumps({"timestamp": record["timestamp"], "level": level, "message": str(message), "run_id": run_id})
+    # BEST-EFFORT: an observability write (a closed/broken stderr, a full disk)
+    # must NEVER propagate. This logger is called from inside the engine's
+    # fail-closed paths — a raise here would escape past the run-status commit
+    # and strand the run at RUNNING, which is the opposite of what a log line is
+    # for. Swallow it; losing a log line is strictly better than losing the run.
+    try:
+        print(line, file=sys.stderr)
+    except Exception:  # noqa: BLE001 - see above
+        pass
