@@ -107,7 +107,7 @@ class RavanaToolExecutor:
                 return prior["result"]
 
         try:
-            result = await handler.call(arguments=arguments, idempotency_key=idempotency_key)
+            result = await handler.call(arguments=arguments, idempotency_key=idempotency_key, run_id=run_id)
         except Exception as exc:  # noqa: BLE001 - record the failure, then re-raise for the gateway
             if side_effecting:
                 self._record(run_id, node_id, tool, idempotency_key, status="FAILED", error=redact_secrets(str(exc)))

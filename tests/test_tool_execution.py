@@ -73,7 +73,7 @@ class CountingHandler:
     def is_side_effecting(self, arguments) -> bool:
         return self._side_effecting
 
-    async def call(self, *, arguments, idempotency_key):
+    async def call(self, *, arguments, idempotency_key, run_id=None):
         self.calls += 1
         return f"executed #{self.calls} for {idempotency_key}"
 
@@ -112,7 +112,7 @@ def test_failed_call_is_not_deduped_and_can_be_retried(con, graph):
         def is_side_effecting(self, arguments) -> bool:
             return True
 
-        async def call(self, *, arguments, idempotency_key):
+        async def call(self, *, arguments, idempotency_key, run_id=None):
             self.calls += 1
             if self.calls == 1:
                 raise ToolkitError("remote 503")
@@ -434,7 +434,7 @@ def test_executor_rejects_args_violating_input_schema(con, graph):
         def is_side_effecting(self, arguments) -> bool:
             return True
 
-        async def call(self, *, arguments, idempotency_key):
+        async def call(self, *, arguments, idempotency_key, run_id=None):
             self.calls += 1
             return "ran"
 
@@ -449,11 +449,12 @@ def test_executor_rejects_args_violating_input_schema(con, graph):
     assert con.execute("SELECT COUNT(*) c FROM tool_invocation").fetchone()["c"] == 0
 
 
-def test_registry_defers_code_interpreter_and_mcp(graph):
+def test_registry_defers_mcp_and_web_search(graph):
     resolver = EnvSecretResolver({})
     handlers = build_registry(graph, resolver)
-    # SDLC example has code_interpreter, test_runner (code_interpreter), github_mcp, web_search.
-    for tid in ("code_interpreter", "github_mcp", "web_search"):
+    # code_interpreter is now executable (its own slice); mcp_server/web_search
+    # remain deferred and refuse to run.
+    for tid in ("github_mcp", "web_search"):
         with pytest.raises(ToolkitError, match="not executable in this slice"):
             asyncio.run(handlers[tid].call(arguments={}, idempotency_key="k"))
 
