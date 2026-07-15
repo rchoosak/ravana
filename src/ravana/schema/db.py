@@ -229,14 +229,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
 -- the visit-scoped idempotency_key the gateway computes. A retry that
 -- reissues the same call position in the same logical node visit finds the
 -- prior SUCCEEDED row and returns its stored result instead of executing the
--- side effect again — this is what makes "connectors MUST dedupe" real. The
--- key is the PRIMARY KEY so the dedup check is a point lookup.
+-- side effect again. STARTED is committed before dispatch; if a process dies
+-- with an indeterminate outcome, a retry fails closed instead of risking a
+-- duplicate side effect. The key is the PRIMARY KEY for an atomic point claim.
 CREATE TABLE IF NOT EXISTS tool_invocation (
     idempotency_key TEXT PRIMARY KEY,
     run_id          TEXT NOT NULL REFERENCES run(id),
     node_id         TEXT NOT NULL,
     tool            TEXT NOT NULL,
-    status          TEXT NOT NULL,                 -- SUCCEEDED | FAILED
+    status          TEXT NOT NULL,                 -- STARTED | SUCCEEDED | FAILED
     result          TEXT,
     error           TEXT,
     created_at      TEXT NOT NULL

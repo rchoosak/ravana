@@ -40,6 +40,19 @@ class ToolkitError(Exception):
         self.kind = kind
 
 
+class ToolOutcomeUnknown(ToolkitError):
+    """A side-effecting tool started, but its terminal outcome cannot be proven.
+
+    The executor must leave this invocation STARTED so the same idempotency key
+    fails closed on retry instead of being treated as a safely retryable FAILED
+    call. This is distinct from an ordinary fatal error whose effect is known
+    not to have happened.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, kind=ToolFailureKind.FATAL)
+
+
 class ToolkitHandler(Protocol):
     # §8(a): every connector declares its input JSON schema. The result is a
     # plain string fed back to the model, so there is no separate output

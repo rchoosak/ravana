@@ -13,7 +13,11 @@ import pytest
 from ravana.compiler.graph import compile_workflow
 from ravana.runtime.secrets import EnvSecretResolver, SecretNotFound
 from ravana.runtime.tool_executor import RavanaToolExecutor
-from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+from ravana.runtime.toolkits.base import (
+    ToolFailureKind,
+    ToolkitError,
+    ToolOutcomeUnknown,
+)
 from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.loader import load_workflow_yaml
 from ravana.schema.util import now_iso
@@ -129,6 +133,103 @@ def test_failed_call_is_not_deduped_and_can_be_retried(con, graph):
     assert handler.calls == 2
     row = con.execute("SELECT status FROM tool_invocation WHERE idempotency_key = 'k1'").fetchone()
     assert row["status"] == "SUCCEEDED"
+
+
+def test_started_claim_prevents_duplicate_side_effect_after_process_crash(con, graph):
+    _seed_run(con)
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    class CrashAfterSideEffect:
+        input_schema = {"type": "object"}
+
+        def __init__(self):
+            self.effects = 0
+            self.crash = True
+
+        def is_side_effecting(self, arguments) -> bool:
+            return True
+
+        async def call(self, *, arguments, idempotency_key, run_id=None):
+            self.effects += 1
+            if self.crash:
+                raise SimulatedProcessCrash()
+            return "must not run again"
+
+    handler = CrashAfterSideEffect()
+    executor = _exec(con, {"git_connector": handler})
+
+    with pytest.raises(SimulatedProcessCrash):
+        asyncio.run(
+            executor.execute(
+                run_id="r1", node_id="n1", tool="git_connector", arguments={}, idempotency_key="k1"
+            )
+        )
+    row = con.execute(
+        "SELECT status FROM tool_invocation WHERE idempotency_key = 'k1'"
+    ).fetchone()
+    assert row["status"] == "STARTED"
+
+    handler.crash = False
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(
+            executor.execute(
+                run_id="r1", node_id="n1", tool="git_connector", arguments={}, idempotency_key="k1"
+            )
+        )
+    assert exc_info.value.kind is ToolFailureKind.FATAL
+    assert handler.effects == 1
+
+
+def test_indeterminate_tool_error_keeps_started_claim(con, graph):
+    _seed_run(con)
+
+    class UnknownAfterSideEffect:
+        input_schema = {"type": "object"}
+
+        def __init__(self):
+            self.effects = 0
+
+        def is_side_effecting(self, arguments) -> bool:
+            return True
+
+        async def call(self, *, arguments, idempotency_key, run_id=None):
+            self.effects += 1
+            raise ToolOutcomeUnknown("container cleanup failed")
+
+    handler = UnknownAfterSideEffect()
+    executor = _exec(con, {"code_interpreter": handler})
+
+    with pytest.raises(ToolOutcomeUnknown):
+        asyncio.run(
+            executor.execute(
+                run_id="r1",
+                node_id="n1",
+                tool="code_interpreter",
+                arguments={},
+                idempotency_key="k1",
+            )
+        )
+
+    row = con.execute(
+        "SELECT status, error FROM tool_invocation WHERE idempotency_key = 'k1'"
+    ).fetchone()
+    assert row["status"] == "STARTED"
+    assert "cleanup failed" in row["error"]
+
+    with pytest.raises(ToolkitError) as exc_info:
+        asyncio.run(
+            executor.execute(
+                run_id="r1",
+                node_id="n1",
+                tool="code_interpreter",
+                arguments={},
+                idempotency_key="k1",
+            )
+        )
+    assert exc_info.value.kind is ToolFailureKind.FATAL
+    assert handler.effects == 1
 
 
 def test_unknown_tool_raises(con, graph):

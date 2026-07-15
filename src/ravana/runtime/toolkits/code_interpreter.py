@@ -7,24 +7,32 @@ Security is layered:
     project (§10.1). The handler locates it from `run_id` at call time (the
     registry/gateway is built before the run exists) and refuses a path that
     escapes the runs dir.
-  - The agent's `filename` is forced to a bare name (no `/`, no `..`), so the
-    written script can't land outside the workspace.
+  - The agent's `filename` is forced to a bare name (no `/`, no `..`), and the
+    script is atomically published so a prior sandbox-created symlink cannot
+    redirect the host write outside the workspace.
   - Actual isolation (network/mount/quotas) is the SandboxRunner's job
     (sandbox.py) — injectable, so this handler is testable without Docker.
 
 The code *running* is a side effect on the workspace filesystem, so the call is
 side-effecting: RavanaToolExecutor dedupes a retried invocation on its logical
-key rather than re-running it. A non-zero exit (or a timeout) is a normal
-RESULT fed back to the model — only the sandbox being unable to run at all
-(SandboxError) is a TRANSIENT ToolkitError the engine retries.
+key rather than re-running it. A non-zero exit (or a cleanly terminated timeout)
+is a normal RESULT fed back to the model. A sandbox that never started is a
+TRANSIENT failure; an indeterminate outcome after failed cleanup is FATAL and
+keeps the invocation STARTED so it cannot be executed twice.
 """
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+from ravana.runtime.toolkits.base import (
+    ToolFailureKind,
+    ToolkitError,
+    ToolOutcomeUnknown,
+)
 from ravana.runtime.toolkits.sandbox import (
     DockerSandboxRunner,
     SandboxError,
@@ -32,6 +40,7 @@ from ravana.runtime.toolkits.sandbox import (
     SandboxResult,
     SandboxRunner,
     SandboxSpec,
+    SandboxOutcomeUnknown,
 )
 
 INPUT_SCHEMA: dict[str, Any] = {
@@ -76,14 +85,12 @@ class CodeInterpreterHandler:
                 f"code_interpreter: unsupported runtime {runtime!r} (one of {sorted(_RUNTIMES)})"
             )
         self._image, self._interp, self._default_filename = _RUNTIMES[runtime]
+        _validate_network_config(config)
         self._limits = SandboxLimits(
             memory_mb=_clamp_int(config.get("memory_mb", 2048), 64, _MAX_MEMORY_MB),
             cpus=_clamp_float(config.get("cpus", 2.0), 0.1, _MAX_CPUS),
             timeout_seconds=_clamp_int(config.get("timeout_seconds", 60), 1, _MAX_TIMEOUT_S),
         )
-        # §8: no default egress. Only an explicit config opt-in flips it (a real
-        # per-host allow-list is a later enhancement; today it's all-or-nothing).
-        self._network = bool(config.get("network", False))
         self._runs_dir = runs_dir
         self._runner = runner or DockerSandboxRunner()
         self.description = (
@@ -99,7 +106,7 @@ class CodeInterpreterHandler:
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str) -> str:
         workspace = self._workspace_for(run_id)
         filename = _safe_filename(arguments.get("filename"), self._default_filename)
-        (workspace / filename).write_text(str(arguments["code"]), encoding="utf-8")
+        _write_script(workspace, filename, str(arguments["code"]))
 
         args = [str(a) for a in arguments.get("args", [])]
         spec = SandboxSpec(
@@ -107,10 +114,13 @@ class CodeInterpreterHandler:
             argv=[*self._interp, filename, *args],
             workspace=workspace,
             limits=self._limits,
-            network=self._network,
         )
         try:
             result = await self._runner.run(spec)
+        except SandboxOutcomeUnknown as exc:
+            raise ToolOutcomeUnknown(
+                f"code_interpreter sandbox outcome is unknown: {exc}"
+            ) from exc
         except SandboxError as exc:
             # Infrastructure (docker absent/unreachable, image pull) — §3.6
             # "sandbox cold-start" is TRANSIENT: the engine retries the attempt.
@@ -126,15 +136,70 @@ class CodeInterpreterHandler:
                 "code_interpreter has no runs directory configured — the Local tier must wire runs_dir",
                 kind=ToolFailureKind.FATAL,
             )
+        if not run_id or "/" in run_id or "\\" in run_id or run_id in (".", ".."):
+            raise ToolkitError(
+                f"code_interpreter: refusing an invalid run id ({run_id!r})",
+                kind=ToolFailureKind.FATAL,
+            )
+
         runs_dir = self._runs_dir.resolve()
-        workspace = (runs_dir / run_id / "workspace").resolve()
-        # §10.1: the mount must stay under this run's dir — never the parent
-        # project. run_id is engine-generated (a UUID), but verify rather than
-        # trust, so a bad id can't walk the workspace outside runs_dir.
-        if not workspace.is_relative_to(runs_dir):
-            raise ToolkitError(f"code_interpreter: refusing a workspace path outside the runs dir ({run_id!r})", kind=ToolFailureKind.FATAL)
-        workspace.mkdir(parents=True, exist_ok=True)
+        run_dir = runs_dir / run_id
+        workspace = run_dir / "workspace"
+        try:
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            if run_dir.is_symlink():
+                raise ToolkitError(
+                    "code_interpreter: refusing a run directory symlink",
+                    kind=ToolFailureKind.FATAL,
+                )
+            run_dir.mkdir(exist_ok=True)
+            if workspace.is_symlink():
+                raise ToolkitError(
+                    "code_interpreter: refusing a workspace symlink",
+                    kind=ToolFailureKind.FATAL,
+                )
+            workspace.mkdir(exist_ok=True)
+        except ToolkitError:
+            raise
+        except OSError as exc:
+            raise ToolkitError(
+                f"code_interpreter: unable to prepare the run workspace ({type(exc).__name__})",
+                kind=ToolFailureKind.FATAL,
+            ) from exc
+
+        # Re-check after creation so an existing alias within runs_dir cannot
+        # point this run at another run's workspace.
+        if workspace.resolve() != workspace:
+            raise ToolkitError(
+                "code_interpreter: refusing an aliased workspace",
+                kind=ToolFailureKind.FATAL,
+            )
         return workspace
+
+
+def _write_script(workspace: Path, filename: str, code: str) -> None:
+    """Publish the script atomically so an existing symlink or hard link is
+    replaced as a directory entry instead of being followed by the host write."""
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=workspace,
+            prefix=".ravana-script-",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(code)
+        os.replace(temp_path, workspace / filename)
+        temp_path = None
+    except OSError as exc:
+        raise ToolkitError(
+            f"code_interpreter: unable to prepare the script ({type(exc).__name__})"
+        ) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _safe_filename(raw: Any, default: str) -> str:
@@ -147,6 +212,17 @@ def _safe_filename(raw: Any, default: str) -> str:
     if "/" in name or "\\" in name or name in (".", "..") or ".." in Path(name).parts or Path(name).is_absolute():
         raise ToolkitError(f"code_interpreter: 'filename' must be a bare name, not a path ({name!r})")
     return name
+
+
+def _validate_network_config(config: dict[str, Any]) -> None:
+    """Keep Docker egress disabled until Ravana can enforce the architecture's
+    required per-toolkit host allow-list. In particular, reject stringly values
+    such as ``"false"`` instead of treating them as truthy opt-ins."""
+    if "network" not in config or config["network"] is False:
+        return
+    raise ToolkitError(
+        "code_interpreter: network egress is disabled; host allow-list networking is not implemented"
+    )
 
 
 def _format_result(result: SandboxResult) -> str:
