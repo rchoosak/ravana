@@ -11,7 +11,8 @@ Security is layered:
     script is atomically published so a prior sandbox-created symlink cannot
     redirect the host write outside the workspace.
   - Actual isolation (network/mount/quotas) is the SandboxRunner's job
-    (sandbox.py) — injectable, so this handler is testable without Docker.
+    (sandbox.py) — injectable, so this handler is testable without a container
+    runtime.
 
 The code *running* is a side effect on the workspace filesystem, so the call is
 side-effecting: RavanaToolExecutor dedupes a retried invocation on its logical
@@ -65,7 +66,8 @@ _RUNTIMES: dict[str, tuple[str, list[str], str]] = {
 _MAX_MEMORY_MB = 8192
 _MAX_CPUS = 8.0
 _MAX_TIMEOUT_S = 300
-_OUTPUT_LIMIT = 10_000  # per stream, chars — a runaway print mustn't flood the transcript
+_MAX_WORKSPACE_MB = 8192
+_MAX_WORKSPACE_FILES = 100_000
 
 
 class CodeInterpreterHandler:
@@ -85,14 +87,27 @@ class CodeInterpreterHandler:
                 f"code_interpreter: unsupported runtime {runtime!r} (one of {sorted(_RUNTIMES)})"
             )
         self._image, self._interp, self._default_filename = _RUNTIMES[runtime]
+        sandbox_executable = _sandbox_executable(config)
         _validate_network_config(config)
         self._limits = SandboxLimits(
             memory_mb=_clamp_int(config.get("memory_mb", 2048), 64, _MAX_MEMORY_MB),
             cpus=_clamp_float(config.get("cpus", 2.0), 0.1, _MAX_CPUS),
             timeout_seconds=_clamp_int(config.get("timeout_seconds", 60), 1, _MAX_TIMEOUT_S),
+            workspace_bytes=(
+                _clamp_int(
+                    config.get("workspace_mb", 512), 16, _MAX_WORKSPACE_MB
+                )
+                * 1024
+                * 1024
+            ),
+            workspace_files=_clamp_int(
+                config.get("workspace_files", 10_000),
+                100,
+                _MAX_WORKSPACE_FILES,
+            ),
         )
         self._runs_dir = runs_dir
-        self._runner = runner or DockerSandboxRunner()
+        self._runner = runner or DockerSandboxRunner(docker=sandbox_executable)
         self.description = (
             f"Execute code in an isolated {runtime} sandbox (no network, workspace-only filesystem). "
             "Provide 'code'; optional 'filename' (a bare name) and 'args'. Returns exit code, stdout and stderr."
@@ -215,7 +230,7 @@ def _safe_filename(raw: Any, default: str) -> str:
 
 
 def _validate_network_config(config: dict[str, Any]) -> None:
-    """Keep Docker egress disabled until Ravana can enforce the architecture's
+    """Keep container egress disabled until Ravana can enforce the architecture's
     required per-toolkit host allow-list. In particular, reject stringly values
     such as ``"false"`` instead of treating them as truthy opt-ins."""
     if "network" not in config or config["network"] is False:
@@ -225,21 +240,29 @@ def _validate_network_config(config: dict[str, Any]) -> None:
     )
 
 
+def _sandbox_executable(config: dict[str, Any]) -> str:
+    """Resolve the supported local OCI runtime without ignoring the manifest.
+
+    Silently ignoring a managed/disabled/typoed backend would execute code in a
+    different trust boundary than the workflow author selected.
+    """
+    sandbox = config.get("sandbox", "docker")
+    if isinstance(sandbox, str) and sandbox in {"docker", "podman"}:
+        return sandbox
+    raise ToolkitError(
+        "code_interpreter: config.sandbox must be 'docker' or 'podman' in Phase 0b"
+    )
+
+
 def _format_result(result: SandboxResult) -> str:
     parts = [f"exit_code: {result.exit_code}"]
     if result.timed_out:
         parts.append("status: timed out")
     if result.stdout:
-        parts.append("stdout:\n" + _truncate(result.stdout))
+        parts.append("stdout:\n" + result.stdout)
     if result.stderr:
-        parts.append("stderr:\n" + _truncate(result.stderr))
+        parts.append("stderr:\n" + result.stderr)
     return "\n".join(parts)
-
-
-def _truncate(text: str) -> str:
-    if len(text) <= _OUTPUT_LIMIT:
-        return text
-    return text[:_OUTPUT_LIMIT] + f"\n… [truncated, {len(text) - _OUTPUT_LIMIT} more chars]"
 
 
 def _clamp_int(value: Any, low: int, high: int) -> int:

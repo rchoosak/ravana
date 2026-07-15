@@ -13,6 +13,7 @@ import time
 
 import pytest
 
+import ravana.runtime.toolkits.code_interpreter as code_interpreter_module
 from ravana.runtime.toolkits.base import (
     ToolFailureKind,
     ToolkitError,
@@ -70,6 +71,13 @@ def test_docker_argv_has_isolation_flags(tmp_path):
     assert argv[argv.index("--cpus") + 1] == "2.0"
     assert "--pids-limit" in argv
     assert argv[argv.index("--name") + 1] == "ravana-ci-abc"
+    assert argv[argv.index("--user") + 1] == (
+        f"{tmp_path.stat().st_uid}:{tmp_path.stat().st_gid}"
+    )
+    assert argv[argv.index("--log-driver") + 1] == "none"
+    assert "--log-opt" not in argv
+    ulimits = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--ulimit"]
+    assert f"fsize={SandboxLimits().workspace_bytes}:{SandboxLimits().workspace_bytes}" in ulimits
     # exactly ONE bind mount, scoped strictly to the run's workspace (§10.1)
     mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
     assert mounts == [f"{tmp_path.resolve()}:/workspace:rw"]
@@ -114,6 +122,32 @@ def test_node_runtime_uses_node_image_and_default_file(tmp_path):
 def test_unsupported_runtime_rejected_at_construction(tmp_path):
     with pytest.raises(ToolkitError, match="unsupported runtime"):
         CodeInterpreterHandler({"runtime": "ruby"}, runs_dir=tmp_path)
+
+
+@pytest.mark.parametrize("sandbox", ["e2b", "none", "dockre", None, True, []])
+def test_unsupported_sandbox_backend_is_rejected(tmp_path, sandbox):
+    with pytest.raises(ToolkitError, match="sandbox.*docker"):
+        CodeInterpreterHandler(
+            {"runtime": "python3.11", "sandbox": sandbox}, runs_dir=tmp_path
+        )
+
+
+def test_podman_backend_selects_podman_executable(tmp_path, monkeypatch):
+    selected = {}
+
+    def runner_factory(*, docker):
+        selected["executable"] = docker
+        return FakeRunner()
+
+    monkeypatch.setattr(
+        code_interpreter_module, "DockerSandboxRunner", runner_factory
+    )
+
+    CodeInterpreterHandler(
+        {"runtime": "python3.11", "sandbox": "podman"}, runs_dir=tmp_path
+    )
+
+    assert selected == {"executable": "podman"}
 
 
 @pytest.mark.parametrize("bad", ["../escape.py", "/etc/passwd", "sub/dir.py", "..", "a\\b.py"])
@@ -176,11 +210,21 @@ def test_network_egress_config_is_rejected_until_a_host_allowlist_exists(tmp_pat
 
 def test_limits_are_clamped_to_the_ceiling(tmp_path):
     runner = FakeRunner()
-    handler = _handler(tmp_path, runner=runner, memory_mb=99999, cpus=64, timeout_seconds=99999)
+    handler = _handler(
+        tmp_path,
+        runner=runner,
+        memory_mb=99999,
+        cpus=64,
+        timeout_seconds=99999,
+        workspace_mb=99999,
+        workspace_files=999999,
+    )
     asyncio.run(handler.call(arguments={"code": "x"}, idempotency_key="k", run_id="r"))
     assert runner.spec.limits.memory_mb == 8192  # ceiling
     assert runner.spec.limits.cpus == 8.0
     assert runner.spec.limits.timeout_seconds == 300
+    assert runner.spec.limits.workspace_bytes == 8192 * 1024 * 1024
+    assert runner.spec.limits.workspace_files == 100_000
 
 
 def test_default_limits(tmp_path):
@@ -257,6 +301,25 @@ def test_nonzero_exit_and_timeout_are_results_not_exceptions(tmp_path):
     assert "timed out" in out
 
 
+def test_runner_owns_output_truncation_metadata(tmp_path):
+    retained = "x" * 10_000
+    runner = FakeRunner(
+        SandboxResult(
+            exit_code=0,
+            stdout=retained + "\n... [truncated, 190000 more bytes]",
+            stderr="",
+        )
+    )
+
+    out = asyncio.run(
+        _handler(tmp_path, runner=runner).call(
+            arguments={"code": "x"}, idempotency_key="k", run_id="r"
+        )
+    )
+
+    assert "190000 more bytes" in out
+
+
 # --- Docker runner process boundary -----------------------------------------
 def _fake_docker(tmp_path, body: str):
     executable = tmp_path / "fake-docker"
@@ -331,6 +394,27 @@ def test_docker_exit_125_is_sandbox_infrastructure_failure(tmp_path):
         asyncio.run(DockerSandboxRunner(docker=str(docker)).run(_spec(tmp_path)))
 
 
+def test_any_terminal_exit_without_startup_marker_is_not_an_agent_result(tmp_path):
+    docker = _fake_docker(
+        tmp_path,
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[0] == 'rm': raise SystemExit(0)\n"
+        "if args[0] == 'container':\n"
+        "    sys.stderr.write('Error: No such object\\n')\n"
+        "    raise SystemExit(1)\n"
+        "sys.stderr.write('command could not start\\n')\n"
+        "raise SystemExit(127)\n",
+    )
+
+    with pytest.raises(SandboxError, match="before.*start|exit 127"):
+        asyncio.run(
+            DockerSandboxRunner(
+                docker=str(docker), cleanup_timeout_seconds=0.2
+            ).run(_spec(tmp_path))
+        )
+
+
 def test_agent_exit_125_is_a_result_and_dedupes_after_workspace_mutation(
     con, tmp_path
 ):
@@ -388,7 +472,12 @@ def test_agent_exit_125_is_a_result_and_dedupes_after_workspace_mutation(
 def test_docker_runner_bounds_captured_output_while_draining_the_process(tmp_path):
     docker = _fake_docker(
         tmp_path,
-        "import sys\nsys.stdout.write('x' * 200_000)\nsys.stderr.write('y' * 200_000)\n",
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "marker = args[args.index('ravana-launcher') + 1]\n"
+        "sys.stderr.write(marker + '\\n')\n"
+        "sys.stdout.write('x' * 200_000)\n"
+        "sys.stderr.write('y' * 200_000)\n",
     )
     limits = SandboxLimits(output_bytes=4096)
 
@@ -401,6 +490,64 @@ def test_docker_runner_bounds_captured_output_while_draining_the_process(tmp_pat
     assert len(result.stderr) < 5000
     assert "truncated" in result.stdout
     assert "truncated" in result.stderr
+
+
+def test_workspace_quota_stops_the_container(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    docker = _fake_docker(
+        tmp_path,
+        "import pathlib, sys, time\n"
+        "args = sys.argv[1:]\n"
+        "if args[0] == 'rm': raise SystemExit(0)\n"
+        "if args[0] == 'container':\n"
+        "    sys.stderr.write('Error: No such object\\n')\n"
+        "    raise SystemExit(1)\n"
+        "marker = args[args.index('ravana-launcher') + 1]\n"
+        "mount = args[args.index('-v') + 1].split(':/workspace:', 1)[0]\n"
+        "sys.stderr.write(marker + '\\n')\n"
+        "sys.stderr.flush()\n"
+        "(pathlib.Path(mount) / 'too-large.bin').write_bytes(b'x' * 4096)\n"
+        "time.sleep(60)\n",
+    )
+    limits = SandboxLimits(
+        timeout_seconds=2, workspace_bytes=1024, workspace_files=100
+    )
+
+    result = asyncio.run(
+        DockerSandboxRunner(
+            docker=str(docker), cleanup_timeout_seconds=0.3
+        ).run(
+            SandboxSpec(
+                image="python:3.11-slim",
+                argv=["python", "main.py"],
+                workspace=workspace,
+                limits=limits,
+            )
+        )
+    )
+
+    assert result.exit_code == 122
+    assert "workspace" in result.stderr and "limit" in result.stderr
+
+
+def test_workspace_measurement_failure_before_spawn_is_infrastructure_error(
+    tmp_path,
+):
+    workspace = tmp_path / "not-a-directory"
+    workspace.write_text("x")
+    docker = _fake_docker(tmp_path, "raise SystemExit(0)\n")
+
+    with pytest.raises(SandboxError, match="measured before start"):
+        asyncio.run(
+            DockerSandboxRunner(docker=str(docker)).run(
+                SandboxSpec(
+                    image="python:3.11-slim",
+                    argv=["python", "main.py"],
+                    workspace=workspace,
+                )
+            )
+        )
 
 
 def test_timeout_cleanup_failure_returns_within_a_hard_bound(tmp_path):
@@ -517,7 +664,31 @@ def test_repeated_cancellation_during_spawn_still_cleans_up_the_created_process(
     asyncio.run(scenario())
 
 
-def test_timeout_stops_client_then_removes_a_late_created_container(
+def test_timeout_before_launcher_start_is_transient(tmp_path, monkeypatch):
+    async def scenario() -> None:
+        run_process = _ControlledProcess()
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "run":
+                return run_process
+            if argv[1] == "rm":
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+        with pytest.raises(SandboxError, match="before.*start|never started"):
+            await DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.2
+            ).run(
+                _spec(tmp_path, limits=SandboxLimits(timeout_seconds=0.01))
+            )
+
+    asyncio.run(scenario())
+
+
+def test_timeout_keeps_checking_after_container_is_first_reported_absent(
     tmp_path, monkeypatch
 ):
     async def scenario() -> None:
@@ -529,6 +700,10 @@ def test_timeout_stops_client_then_removes_a_late_created_container(
         async def fake_create_subprocess_exec(*argv, **kwargs):
             nonlocal remove_calls, inspect_calls
             if argv[1] == "run":
+                marker = argv[argv.index("ravana-launcher") + 1]
+                run_process.stderr = asyncio.StreamReader()
+                run_process.stderr.feed_data(f"{marker}\n".encode())
+                run_process.stderr.feed_eof()
                 return run_process
             assert client_stopped.is_set()
             if argv[1] == "rm":
@@ -539,7 +714,9 @@ def test_timeout_stops_client_then_removes_a_late_created_container(
                     )
                 return _ControlledProcess(exit_code=0)
             inspect_calls += 1
-            if inspect_calls == 1:
+            if inspect_calls == 2:
+                # A daemon-side create becomes visible after the first absent
+                # observation. Cleanup must return to forced removal.
                 return _ControlledProcess(exit_code=0)
             return _ControlledProcess(
                 exit_code=1, stderr="Error: No such object"
@@ -554,8 +731,47 @@ def test_timeout_stops_client_then_removes_a_late_created_container(
 
         assert result.timed_out
         assert run_process.terminate_called
-        assert remove_calls == 2
-        assert inspect_calls == 2
+        # One absent observation is not stable: cleanup keeps polling so a
+        # daemon-side create that completes just after it cannot escape.
+        assert remove_calls >= 2
+        assert inspect_calls >= 4
+
+    asyncio.run(scenario())
+
+
+def test_main_process_creation_is_bounded_and_late_process_is_reaped(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        release_spawn = asyncio.Event()
+        late_process_stopped = asyncio.Event()
+        late_process = _ControlledProcess(
+            on_terminate=late_process_stopped.set,
+            on_kill=late_process_stopped.set,
+        )
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "run":
+                await release_spawn.wait()
+                return late_process
+            if argv[1] == "rm":
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+        started = time.monotonic()
+        with pytest.raises(SandboxOutcomeUnknown, match="process creation|spawn"):
+            await DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.1
+            ).run(
+                _spec(tmp_path, limits=SandboxLimits(timeout_seconds=0.01))
+            )
+        assert time.monotonic() - started < 0.3
+
+        release_spawn.set()
+        await asyncio.wait_for(late_process_stopped.wait(), timeout=0.3)
 
     asyncio.run(scenario())
 
@@ -585,16 +801,16 @@ def test_second_cancellation_cannot_interrupt_cleanup(tmp_path, monkeypatch):
                 docker=sys.executable, cleanup_timeout_seconds=0.5
             ).run(_spec(tmp_path))
         )
-        await run_started.wait()
+        await asyncio.wait_for(run_started.wait(), timeout=0.5)
         task.cancel()
-        await cleanup_started.wait()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done()
 
         release_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=1)
         assert run_process.terminate_called
 
     asyncio.run(scenario())
