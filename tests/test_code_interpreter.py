@@ -9,7 +9,9 @@ import asyncio
 import os
 import shlex
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -22,12 +24,14 @@ from ravana.runtime.toolkits.base import (
 from ravana.runtime.toolkits.code_interpreter import CodeInterpreterHandler
 from ravana.runtime.toolkits.sandbox import (
     DockerSandboxRunner,
+    SandboxCancelledBeforeStart,
     SandboxError,
     SandboxLimits,
     SandboxResult,
     SandboxSpec,
     SandboxOutcomeUnknown,
     build_docker_argv,
+    build_docker_start_argv,
 )
 
 
@@ -61,7 +65,7 @@ def test_docker_argv_has_isolation_flags(tmp_path):
     argv = build_docker_argv(
         _spec(tmp_path), name="ravana-ci-abc", startup_marker=startup_marker
     )
-    assert argv[:3] == ["docker", "run", "--rm"]  # ephemeral: filesystem never durable
+    assert argv[:3] == ["docker", "create", "--rm"]
     assert argv[argv.index("--network") + 1] == "none"  # §8: no default egress
     assert "--read-only" in argv  # root fs read-only
     assert argv[argv.index("--cap-drop") + 1] == "ALL"
@@ -92,11 +96,24 @@ def test_docker_argv_has_isolation_flags(tmp_path):
         "ravana-launcher",
     ]
     assert argv[-3:] == [startup_marker, "python", "main.py"]
+    assert build_docker_start_argv("a" * 64) == [
+        "docker",
+        "start",
+        "--attach",
+        "a" * 64,
+    ]
 
 
 # --- handler ----------------------------------------------------------------
 def _handler(tmp_path, *, runtime="python3.11", runner=None, **config):
     return CodeInterpreterHandler({"runtime": runtime, **config}, runs_dir=tmp_path, runner=runner or FakeRunner())
+
+
+def _capture_toolkit_outcome(call, *args):
+    try:
+        return call(*args)
+    except ToolkitError as exc:
+        return exc
 
 
 def test_writes_code_into_the_run_workspace_and_runs_it(tmp_path):
@@ -227,6 +244,75 @@ def test_limits_are_clamped_to_the_ceiling(tmp_path):
     assert runner.spec.limits.workspace_files == 100_000
 
 
+def test_script_over_workspace_quota_is_rejected_before_host_write(tmp_path):
+    runner = FakeRunner()
+    handler = _handler(tmp_path, runner=runner, workspace_mb=16)
+
+    with pytest.raises(ToolkitError, match="workspace byte limit"):
+        asyncio.run(
+            handler.call(
+                arguments={"code": "x" * (16 * 1024 * 1024 + 1)},
+                idempotency_key="k",
+                run_id="r",
+            )
+        )
+
+    workspace = tmp_path / "r" / "workspace"
+    assert not (workspace / "main.py").exists()
+    assert list(workspace.iterdir()) == []
+    assert runner.spec is None
+
+
+def test_parallel_script_publication_cannot_overcommit_workspace(
+    tmp_path, monkeypatch
+):
+    real_capacity_check = code_interpreter_module.workspace_capacity_violation
+    before_scan = threading.Barrier(2)
+    after_scan = threading.Barrier(2)
+
+    def concurrent_capacity_check(*args, **kwargs):
+        for barrier in (before_scan,):
+            try:
+                barrier.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+        result = real_capacity_check(*args, **kwargs)
+        for barrier in (after_scan,):
+            try:
+                barrier.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+        return result
+
+    monkeypatch.setattr(
+        code_interpreter_module,
+        "workspace_capacity_violation",
+        concurrent_capacity_check,
+    )
+
+    def publish(filename: str) -> str:
+        return asyncio.run(
+            _handler(tmp_path, workspace_mb=16).call(
+                arguments={"code": "x" * (10 * 1024 * 1024), "filename": filename},
+                idempotency_key=filename,
+                run_id="r",
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(
+            pool.map(
+                lambda filename: _capture_toolkit_outcome(publish, filename),
+                ("first.py", "second.py"),
+            )
+        )
+
+    workspace = tmp_path / "r" / "workspace"
+    published_bytes = sum(path.stat().st_size for path in workspace.iterdir())
+    assert sum(isinstance(outcome, ToolkitError) for outcome in outcomes) == 1
+    assert published_bytes <= 16 * 1024 * 1024
+
+
 def test_default_limits(tmp_path):
     runner = FakeRunner()
     asyncio.run(_handler(tmp_path, runner=runner).call(arguments={"code": "x"}, idempotency_key="k", run_id="r"))
@@ -291,6 +377,68 @@ def test_executor_threads_run_id_and_dedups_side_effect(con, tmp_path):
     assert runner.spec is None  # deduped — the sandbox was NOT invoked a second time
 
 
+def test_prestart_cancellation_marks_invocation_retryable(con, tmp_path, monkeypatch):
+    from ravana.runtime.tool_executor import RavanaToolExecutor
+    from tests.test_tool_execution import _seed_run
+
+    async def scenario() -> None:
+        _seed_run(con, run_id="run-cancel")
+        scan_started = asyncio.Event()
+
+        async def block_prestart_scan(*args, **kwargs):
+            scan_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(asyncio, "to_thread", block_prestart_scan)
+        executor = RavanaToolExecutor(
+            con,
+            {
+                "ci": _handler(
+                    tmp_path,
+                    runner=DockerSandboxRunner(docker=sys.executable),
+                )
+            },
+        )
+        task = asyncio.create_task(
+            executor.execute(
+                run_id="run-cancel",
+                node_id="n",
+                tool="ci",
+                arguments={"code": "print(1)"},
+                idempotency_key="cancel-key",
+            )
+        )
+        await scan_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        row = con.execute(
+            "SELECT status FROM tool_invocation WHERE idempotency_key = ?",
+            ("cancel-key",),
+        ).fetchone()
+        assert row["status"] == "FAILED"
+
+        retry_runner = FakeRunner(
+            SandboxResult(exit_code=0, stdout="retried", stderr="")
+        )
+        retry_executor = RavanaToolExecutor(
+            con, {"ci": _handler(tmp_path, runner=retry_runner)}
+        )
+        result = await retry_executor.execute(
+            run_id="run-cancel",
+            node_id="n",
+            tool="ci",
+            arguments={"code": "print(1)"},
+            idempotency_key="cancel-key",
+        )
+
+        assert "retried" in result
+        assert retry_runner.spec is not None
+
+    asyncio.run(scenario())
+
+
 def test_nonzero_exit_and_timeout_are_results_not_exceptions(tmp_path):
     nonzero = FakeRunner(SandboxResult(exit_code=1, stdout="", stderr="boom"))
     out = asyncio.run(_handler(tmp_path, runner=nonzero).call(arguments={"code": "x"}, idempotency_key="k", run_id="r"))
@@ -323,14 +471,36 @@ def test_runner_owns_output_truncation_metadata(tmp_path):
 # --- Docker runner process boundary -----------------------------------------
 def _fake_docker(tmp_path, body: str):
     executable = tmp_path / "fake-docker"
-    executable.write_text(f"#!{sys.executable}\n{body}")
+    create_argv = tmp_path / "fake-docker-create-argv.json"
+    container_id = "a" * 64
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, sys\n"
+        f"state = pathlib.Path({str(create_argv)!r})\n"
+        "if sys.argv[1] == 'create':\n"
+        "    state.write_text(json.dumps(sys.argv[1:]))\n"
+        f"    sys.stdout.write({container_id!r} + '\\n')\n"
+        "    raise SystemExit(0)\n"
+        "if sys.argv[1] == 'start':\n"
+        "    create_args = json.loads(state.read_text())\n"
+        "    sys.argv = [sys.argv[0], 'run', *create_args[1:]]\n"
+        f"{body}"
+    )
     executable.chmod(0o700)
     return executable
 
 
 def _fake_shell_docker(tmp_path, body: str):
     executable = tmp_path / "fake-docker"
-    executable.write_text(f"#!/bin/sh\n{body}")
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"create\" ]; then\n"
+        f"  echo {'a' * 64}\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = \"start\" ]; then set -- run; fi\n"
+        f"{body}"
+    )
     executable.chmod(0o700)
     return executable
 
@@ -340,6 +510,7 @@ class _ControlledProcess:
         self,
         *,
         exit_code=None,
+        stdout="",
         stderr="",
         terminate_completes=True,
         kill_completes=True,
@@ -347,6 +518,8 @@ class _ControlledProcess:
         on_kill=None,
     ):
         self.stdout = asyncio.StreamReader()
+        if stdout:
+            self.stdout.feed_data(stdout.encode())
         self.stdout.feed_eof()
         self.stderr = asyncio.StreamReader()
         if stderr:
@@ -384,10 +557,114 @@ class _ControlledProcess:
             self._done.set()
 
 
+_FAKE_CONTAINER_ID = "a" * 64
+
+
+def _created_container_process() -> _ControlledProcess:
+    return _ControlledProcess(
+        exit_code=0, stdout=f"{_FAKE_CONTAINER_ID}\n"
+    )
+
+
+def _feed_startup_marker(argv, process) -> None:
+    marker = argv[argv.index("ravana-launcher") + 1]
+    process.stderr = asyncio.StreamReader()
+    process.stderr.feed_data(f"{marker}\n".encode())
+    process.stderr.feed_eof()
+
+
+def test_runner_creates_container_before_starting_agent_code(tmp_path, monkeypatch):
+    async def scenario() -> None:
+        commands: list[str] = []
+        container_id = "a" * 64
+        run_process = _ControlledProcess(exit_code=0)
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            command = argv[1]
+            commands.append(command)
+            if command in {"create", "run"}:
+                marker = argv[argv.index("ravana-launcher") + 1]
+                run_process.stderr = asyncio.StreamReader()
+                run_process.stderr.feed_data(f"{marker}\n".encode())
+                run_process.stderr.feed_eof()
+            if command == "create":
+                return _ControlledProcess(
+                    exit_code=0, stdout=f"{container_id}\n"
+                )
+            if command in {"start", "run"}:
+                return run_process
+            raise AssertionError(f"unexpected command: {command}")
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        result = await DockerSandboxRunner(docker=sys.executable).run(
+            _spec(tmp_path)
+        )
+
+        assert result.exit_code == 0
+        assert commands[:2] == ["create", "start"]
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_container_creation_never_starts_agent_code(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        create_started = asyncio.Event()
+        create_stopped = asyncio.Event()
+        start_called = asyncio.Event()
+        create_process = _ControlledProcess(
+            stdout=f"{_FAKE_CONTAINER_ID}\n",
+            on_terminate=create_stopped.set,
+            on_kill=create_stopped.set,
+        )
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "create":
+                create_started.set()
+                return create_process
+            if argv[1] == "start":
+                start_called.set()
+                raise AssertionError("agent code must not start after cancellation")
+            if argv[1] == "rm":
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        task = asyncio.create_task(
+            DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.2
+            ).run(_spec(tmp_path))
+        )
+        await create_started.wait()
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(SandboxCancelledBeforeStart):
+            await task
+        assert create_stopped.is_set()
+        assert not start_called.is_set()
+
+    asyncio.run(scenario())
+
+
 def test_docker_exit_125_is_sandbox_infrastructure_failure(tmp_path):
     docker = _fake_docker(
         tmp_path,
-        "import sys\nsys.stderr.write('daemon unavailable\\n')\nraise SystemExit(125)\n",
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[0] == 'rm': raise SystemExit(0)\n"
+        "if args[0] == 'container':\n"
+        "    sys.stderr.write('Error: No such object\\n')\n"
+        "    raise SystemExit(1)\n"
+        "sys.stderr.write('daemon unavailable\\n')\n"
+        "raise SystemExit(125)\n",
     )
 
     with pytest.raises(SandboxError, match="exit 125|daemon unavailable"):
@@ -638,7 +915,10 @@ def test_repeated_cancellation_during_spawn_still_cleans_up_the_created_process(
         run_process = FakeProcess()
 
         async def fake_create_subprocess_exec(*argv, **kwargs):
-            if argv[1] == "run":
+            if argv[1] == "create":
+                _feed_startup_marker(argv, run_process)
+                return _created_container_process()
+            if argv[1] == "start":
                 spawn_started.set()
                 await release_spawn.wait()
                 return run_process
@@ -669,7 +949,9 @@ def test_timeout_before_launcher_start_is_transient(tmp_path, monkeypatch):
         run_process = _ControlledProcess()
 
         async def fake_create_subprocess_exec(*argv, **kwargs):
-            if argv[1] == "run":
+            if argv[1] == "create":
+                return _created_container_process()
+            if argv[1] == "start":
                 return run_process
             if argv[1] == "rm":
                 return _ControlledProcess(exit_code=0)
@@ -688,53 +970,46 @@ def test_timeout_before_launcher_start_is_transient(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_timeout_keeps_checking_after_container_is_first_reported_absent(
+def test_late_create_client_is_reaped_without_starting_agent_code(
     tmp_path, monkeypatch
 ):
     async def scenario() -> None:
-        client_stopped = asyncio.Event()
-        remove_calls = 0
-        inspect_calls = 0
-        run_process = _ControlledProcess(on_terminate=client_stopped.set)
+        release_create = asyncio.Event()
+        late_process_stopped = asyncio.Event()
+        start_called = asyncio.Event()
+        late_create_process = _ControlledProcess(
+            stdout=f"{_FAKE_CONTAINER_ID}\n",
+            on_terminate=late_process_stopped.set,
+            on_kill=late_process_stopped.set,
+        )
 
         async def fake_create_subprocess_exec(*argv, **kwargs):
-            nonlocal remove_calls, inspect_calls
-            if argv[1] == "run":
-                marker = argv[argv.index("ravana-launcher") + 1]
-                run_process.stderr = asyncio.StreamReader()
-                run_process.stderr.feed_data(f"{marker}\n".encode())
-                run_process.stderr.feed_eof()
-                return run_process
-            assert client_stopped.is_set()
+            if argv[1] == "create":
+                await release_create.wait()
+                return late_create_process
+            if argv[1] == "start":
+                start_called.set()
+                raise AssertionError("agent code must not start after create timeout")
             if argv[1] == "rm":
-                remove_calls += 1
-                if remove_calls == 1:
-                    return _ControlledProcess(
-                        exit_code=1, stderr="Error: No such container"
-                    )
-                return _ControlledProcess(exit_code=0)
-            inspect_calls += 1
-            if inspect_calls == 2:
-                # A daemon-side create becomes visible after the first absent
-                # observation. Cleanup must return to forced removal.
                 return _ControlledProcess(exit_code=0)
             return _ControlledProcess(
                 exit_code=1, stderr="Error: No such object"
             )
 
-        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-        result = await DockerSandboxRunner(
-            docker=sys.executable, cleanup_timeout_seconds=0.2
-        ).run(
-            _spec(tmp_path, limits=SandboxLimits(timeout_seconds=0.01))
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
         )
+        with pytest.raises(SandboxError, match="container creation"):
+            await DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.1
+            ).run(
+                _spec(tmp_path, limits=SandboxLimits(timeout_seconds=0.01))
+            )
+        assert not start_called.is_set()
 
-        assert result.timed_out
-        assert run_process.terminate_called
-        # One absent observation is not stable: cleanup keeps polling so a
-        # daemon-side create that completes just after it cannot escape.
-        assert remove_calls >= 2
-        assert inspect_calls >= 4
+        release_create.set()
+        await asyncio.wait_for(late_process_stopped.wait(), timeout=0.3)
+        assert not start_called.is_set()
 
     asyncio.run(scenario())
 
@@ -751,7 +1026,9 @@ def test_main_process_creation_is_bounded_and_late_process_is_reaped(
         )
 
         async def fake_create_subprocess_exec(*argv, **kwargs):
-            if argv[1] == "run":
+            if argv[1] == "create":
+                return _created_container_process()
+            if argv[1] == "start":
                 await release_spawn.wait()
                 return late_process
             if argv[1] == "rm":
@@ -776,6 +1053,82 @@ def test_main_process_creation_is_bounded_and_late_process_is_reaped(
     asyncio.run(scenario())
 
 
+def test_delayed_spawn_oserror_is_classified_as_sandbox_failure(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        cleanup_targets: list[str] = []
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "create":
+                return _created_container_process()
+            if argv[1] == "start":
+                await asyncio.sleep(0.02)
+                raise OSError("delayed spawn failure")
+            if argv[1] == "rm":
+                cleanup_targets.append(argv[-1])
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        with pytest.raises(SandboxError, match="failed to spawn"):
+            await DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.2
+            ).run(
+                _spec(tmp_path, limits=SandboxLimits(timeout_seconds=0.01))
+            )
+        assert cleanup_targets == [_FAKE_CONTAINER_ID]
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_wins_over_delayed_spawn_oserror(tmp_path, monkeypatch):
+    async def scenario() -> None:
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+        cleanup_targets: list[str] = []
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "create":
+                return _created_container_process()
+            if argv[1] == "start":
+                spawn_started.set()
+                await release_spawn.wait()
+                raise OSError("delayed spawn failure")
+            if argv[1] == "rm":
+                cleanup_targets.append(argv[-1])
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        task = asyncio.create_task(
+            DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.2
+            ).run(
+                _spec(tmp_path, limits=SandboxLimits(timeout_seconds=0.01))
+            )
+        )
+        await spawn_started.wait()
+        await asyncio.sleep(0.02)
+        task.cancel()
+        await asyncio.sleep(0)
+        release_spawn.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleanup_targets == [_FAKE_CONTAINER_ID]
+
+    asyncio.run(scenario())
+
+
 def test_second_cancellation_cannot_interrupt_cleanup(tmp_path, monkeypatch):
     async def scenario() -> None:
         run_started = asyncio.Event()
@@ -784,7 +1137,10 @@ def test_second_cancellation_cannot_interrupt_cleanup(tmp_path, monkeypatch):
         run_process = _ControlledProcess()
 
         async def fake_create_subprocess_exec(*argv, **kwargs):
-            if argv[1] == "run":
+            if argv[1] == "create":
+                _feed_startup_marker(argv, run_process)
+                return _created_container_process()
+            if argv[1] == "start":
                 run_started.set()
                 return run_process
             if argv[1] == "rm":
@@ -824,7 +1180,10 @@ def test_cleanup_uses_one_shared_deadline(tmp_path, monkeypatch):
         )
 
         async def fake_create_subprocess_exec(*argv, **kwargs):
-            assert argv[1] == "run"
+            if argv[1] == "create":
+                _feed_startup_marker(argv, run_process)
+                return _created_container_process()
+            assert argv[1] == "start"
             return run_process
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
@@ -852,7 +1211,10 @@ def test_cleanup_deadline_bounds_control_process_creation(tmp_path, monkeypatch)
         late_process = _ControlledProcess(on_kill=late_process_killed.set)
 
         async def fake_create_subprocess_exec(*argv, **kwargs):
-            if argv[1] == "run":
+            if argv[1] == "create":
+                _feed_startup_marker(argv, run_process)
+                return _created_container_process()
+            if argv[1] == "start":
                 return run_process
             control_spawn_started.set()
             await release_control_spawn.wait()

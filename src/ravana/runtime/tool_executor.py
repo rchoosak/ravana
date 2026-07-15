@@ -29,6 +29,7 @@ from ravana.runtime.schema_validate import validate_json
 from ravana.runtime.secrets import redact_secrets
 from ravana.runtime.toolkits.base import (
     ToolFailureKind,
+    ToolRetrySafeCancellation,
     ToolkitError,
     ToolkitHandler,
     ToolOutcomeUnknown,
@@ -120,6 +121,17 @@ class RavanaToolExecutor:
                     node_id,
                     tool,
                     idempotency_key,
+                    error=redact_secrets(str(exc)),
+                )
+            raise
+        except ToolRetrySafeCancellation as exc:
+            if side_effecting:
+                self._record(
+                    run_id,
+                    node_id,
+                    tool,
+                    idempotency_key,
+                    status="FAILED",
                     error=redact_secrets(str(exc)),
                 )
             raise

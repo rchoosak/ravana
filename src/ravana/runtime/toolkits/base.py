@@ -8,6 +8,7 @@ dedup in RavanaToolExecutor.
 
 from __future__ import annotations
 
+import asyncio
 from enum import Enum
 from typing import Any, Protocol
 
@@ -51,6 +52,15 @@ class ToolOutcomeUnknown(ToolkitError):
 
     def __init__(self, message: str):
         super().__init__(message, kind=ToolFailureKind.FATAL)
+
+
+class ToolRetrySafeCancellation(asyncio.CancelledError):
+    """Cancellation occurred before a non-repeatable tool effect could begin.
+
+    The executor may mark a claimed side-effecting invocation FAILED so the
+    same logical call can retry. Handlers must only raise this when they can
+    prove no non-repeatable effect was possible.
+    """
 
 
 class ToolkitHandler(Protocol):

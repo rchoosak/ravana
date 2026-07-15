@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import shutil
 import stat
 import uuid
@@ -72,6 +73,10 @@ class SandboxOutcomeUnknown(SandboxError):
     """
 
 
+class SandboxCancelledBeforeStart(asyncio.CancelledError):
+    """Cancellation occurred before any request could start agent code."""
+
+
 class SandboxRunner(Protocol):
     async def run(self, spec: SandboxSpec) -> SandboxResult: ...
 
@@ -85,10 +90,15 @@ _LOG_DRIVER = "none"
 def build_docker_argv(
     spec: SandboxSpec, *, name: str, startup_marker: str
 ) -> list[str]:
-    """The `docker run` argv enforcing §8's isolation. Pure and deterministic so
+    """The `docker create` argv enforcing §8's isolation. Pure and deterministic so
     every security flag is asserted in tests without invoking Docker:
 
-    - `--rm`: the container filesystem is never durable (§8).
+    `DockerSandboxRunner` completes this non-executing create first, captures
+    the immutable container ID, then uses `docker start --attach <id>`. That
+    lifecycle prevents a daemon-side create delayed past client cancellation
+    from ever starting agent code.
+
+    - `--rm`: the container filesystem is removed after the started process exits.
     - `--network none`: no egress until a per-host allow-list can be enforced (§8).
     - `--memory`/`--memory-swap` equal: a hard RAM cap with no swap escape hatch.
     - `--cpus`, `--pids-limit`: CPU quota and fork-bomb ceiling.
@@ -105,7 +115,7 @@ def build_docker_argv(
     limits = spec.limits
     argv = [
         "docker",
-        "run",
+        "create",
         "--rm",
         "--name",
         name,
@@ -155,24 +165,29 @@ def build_docker_argv(
     return argv
 
 
+def build_docker_start_argv(container_id: str) -> list[str]:
+    """Start and attach only after create returned a concrete identity."""
+    return ["docker", "start", "--attach", container_id]
+
+
 _OUTPUT_READ_CHUNK = 64 * 1024
 _DEFAULT_CLEANUP_TIMEOUT_SECONDS = 10.0
 _PODMAN_CLEANUP_TIMEOUT_SECONDS = 30.0
 _WORKSPACE_POLL_SECONDS = 0.05
 _CLEANUP_POLL_SECONDS = 0.02
-_CLEANUP_STABLE_ABSENCE_SECONDS = 0.05
 _WORKSPACE_LIMIT_EXIT_CODE = 122
+_CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{12,64}")
 
 
 @dataclass(frozen=True)
-class _WorkspaceViolation:
+class WorkspaceViolation:
     message: str
-    monitor_failed: bool = False
+    measurement_failed: bool = False
 
 
 def _workspace_violation(
     workspace: Path, *, max_bytes: int, max_files: int
-) -> _WorkspaceViolation | None:
+) -> WorkspaceViolation | None:
     """Measure a mutable workspace without following sandbox-created symlinks."""
     total_bytes = 0
     total_files = 0
@@ -189,7 +204,7 @@ def _workspace_violation(
                             continue
                         total_files += 1
                         if total_files > max_files:
-                            return _WorkspaceViolation(
+                            return WorkspaceViolation(
                                 "workspace file limit exceeded "
                                 f"({total_files} > {max_files})"
                             )
@@ -198,7 +213,7 @@ def _workspace_violation(
                             continue
                         total_bytes += stat_result.st_size
                         if total_bytes > max_bytes:
-                            return _WorkspaceViolation(
+                            return WorkspaceViolation(
                                 "workspace byte limit exceeded "
                                 f"({total_bytes} > {max_bytes})"
                             )
@@ -207,11 +222,44 @@ def _workspace_violation(
                 # The next polling pass will measure the current tree again.
                 continue
     except OSError as exc:
-        return _WorkspaceViolation(
+        return WorkspaceViolation(
             f"workspace usage could not be measured ({type(exc).__name__})",
-            monitor_failed=True,
+            measurement_failed=True,
         )
     return None
+
+
+def workspace_capacity_violation(
+    workspace: Path,
+    *,
+    limits: SandboxLimits,
+    additional_bytes: int,
+    additional_files: int,
+) -> WorkspaceViolation | None:
+    """Check capacity before a host-side atomic publish enters the workspace.
+
+    The additional file must coexist briefly with the current destination, so
+    reserve both its bytes and directory entry before creating the temporary
+    file. This keeps host preparation under the same aggregate limits enforced
+    while the sandbox is running.
+    """
+    if additional_bytes < 0 or additional_files < 0:
+        raise ValueError("additional workspace usage must not be negative")
+    if additional_bytes > limits.workspace_bytes:
+        return WorkspaceViolation(
+            "workspace byte limit exceeded "
+            f"({additional_bytes} > {limits.workspace_bytes})"
+        )
+    if additional_files > limits.workspace_files:
+        return WorkspaceViolation(
+            "workspace file limit exceeded "
+            f"({additional_files} > {limits.workspace_files})"
+        )
+    return _workspace_violation(
+        workspace,
+        max_bytes=limits.workspace_bytes - additional_bytes,
+        max_files=limits.workspace_files - additional_files,
+    )
 
 
 class _BoundedOutput:
@@ -245,9 +293,10 @@ class _BoundedOutput:
 
 class DockerSandboxRunner:
     """Runs a SandboxSpec through a local Docker-compatible OCI CLI. The
-    wall-clock timeout is enforced from OUTSIDE the container — on expiry the
-    container is force-removed by name, because killing the runtime client
-    client process alone would leave the container running."""
+    container is created first and started only after its immutable ID is
+    known. The wall-clock timeout is enforced from OUTSIDE the container; on
+    expiry that ID is force-removed because killing the attached runtime client
+    alone could leave agent code running."""
 
     def __init__(
         self,
@@ -280,14 +329,26 @@ class DockerSandboxRunner:
     async def _run_container(
         self, spec: SandboxSpec, name: str, startup_marker: str
     ) -> SandboxResult:
-        initial_violation = await asyncio.to_thread(
-            _workspace_violation,
-            spec.workspace,
-            max_bytes=spec.limits.workspace_bytes,
-            max_files=spec.limits.workspace_files,
-        )
+        try:
+            initial_violation = await asyncio.to_thread(
+                _workspace_violation,
+                spec.workspace,
+                max_bytes=spec.limits.workspace_bytes,
+                max_files=spec.limits.workspace_files,
+            )
+        except asyncio.CancelledError as exc:
+            # A caller can safely retry because container provisioning has not
+            # begun and no agent code could have run.
+            raise SandboxCancelledBeforeStart(
+                "sandbox cancelled before process creation"
+            ) from exc
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            raise SandboxCancelledBeforeStart(
+                "sandbox cancelled before process creation"
+            )
         if initial_violation is not None:
-            if initial_violation.monitor_failed:
+            if initial_violation.measurement_failed:
                 raise SandboxError(
                     "sandbox workspace could not be measured before start: "
                     f"{initial_violation.message}"
@@ -299,17 +360,27 @@ class DockerSandboxRunner:
             )
 
         try:
-            argv = build_docker_argv(
+            create_argv = build_docker_argv(
                 spec, name=name, startup_marker=startup_marker
             )
         except OSError as exc:
             raise SandboxError(
                 f"sandbox workspace could not be prepared ({type(exc).__name__})"
             ) from exc
-        argv[0] = self._docker
         run_deadline = (
             asyncio.get_running_loop().time() + spec.limits.timeout_seconds
         )
+        create_argv[0] = self._docker
+        container_id = await self._create_container(
+            create_argv, name, run_deadline
+        )
+        return await self._start_container(
+            spec, container_id, startup_marker, run_deadline
+        )
+
+    async def _create_container(
+        self, argv: list[str], name: str, run_deadline: float
+    ) -> str:
         spawn_task = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -323,27 +394,322 @@ class DockerSandboxRunner:
                 asyncio.shield(spawn_task), timeout=self._remaining(run_deadline)
             )
         except asyncio.TimeoutError:
-            return await self._finish_expired_spawn(
-                spec, spawn_task, name, startup_marker
-            )
+            return await self._finish_expired_create(spawn_task, name)
         except asyncio.CancelledError as exc:
-            await self._cancel_pending_spawn(spawn_task, name, exc)
-            raise
+            await self._cancel_pending_spawn(
+                spawn_task, name, exc, identity_known=False
+            )
+            raise SandboxCancelledBeforeStart(
+                "sandbox cancelled during container creation"
+            ) from exc
         except OSError as exc:
-            raise SandboxError(f"failed to spawn the sandbox ({type(exc).__name__})") from exc
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise SandboxCancelledBeforeStart(
+                    "sandbox cancelled during container creation"
+                ) from exc
+            raise SandboxError(
+                f"failed to create the sandbox container ({type(exc).__name__})"
+            ) from exc
 
-        # A cancellation can race the spawn task's completion: wait_for may
-        # return the process handle while the surrounding Task already carries
-        # a pending cancellation request. Honor it before entering the long
-        # process wait, while the handle is available for bounded cleanup.
         current_task = asyncio.current_task()
         if current_task is not None and current_task.cancelling():
             cancellation = asyncio.CancelledError()
-            await self._cancel_pending_spawn(spawn_task, name, cancellation)
+            await self._cancel_pending_spawn(
+                spawn_task, name, cancellation, identity_known=False
+            )
+            raise SandboxCancelledBeforeStart(
+                "sandbox cancelled during container creation"
+            ) from cancellation
+
+        return await self._wait_for_created_container(
+            proc, name, run_deadline
+        )
+
+    async def _wait_for_created_container(
+        self,
+        proc: asyncio.subprocess.Process,
+        name: str,
+        run_deadline: float,
+    ) -> str:
+        process_waiter = asyncio.create_task(proc.wait())
+        if proc.stdout is None or proc.stderr is None:
+            cleanup_error, _, was_cancelled = await self._finish_uninterruptibly(
+                proc,
+                process_waiter,
+                name,
+                (),
+                identity_known=False,
+            )
+            if was_cancelled:
+                raise SandboxCancelledBeforeStart(
+                    "sandbox cancelled during container creation"
+                )
+            detail = f"; {cleanup_error}" if cleanup_error else ""
+            raise SandboxError(
+                f"container creation exposed no output streams{detail}"
+            )
+
+        stdout = _BoundedOutput(4096)
+        stderr = _BoundedOutput(4096)
+        readers = (
+            asyncio.create_task(stdout.drain(proc.stdout)),
+            asyncio.create_task(stderr.drain(proc.stderr)),
+        )
+        try:
+            if not await self._wait_bounded(process_waiter, run_deadline):
+                cleanup_error, output_error, was_cancelled = (
+                    await self._finish_uninterruptibly(
+                        proc,
+                        process_waiter,
+                        name,
+                        readers,
+                        identity_known=False,
+                    )
+                )
+                if was_cancelled:
+                    raise SandboxCancelledBeforeStart(
+                        "sandbox cancelled during container creation"
+                    )
+                errors = [
+                    error for error in (cleanup_error, output_error) if error
+                ]
+                detail = f"; {'; '.join(errors)}" if errors else ""
+                raise SandboxError(
+                    f"sandbox container creation exceeded its deadline{detail}"
+                )
+            output_error = await self._settle_readers(
+                readers, self._new_cleanup_deadline()
+            )
+        except SandboxCancelledBeforeStart:
+            raise
+        except asyncio.CancelledError as exc:
+            cleanup_error, output_error, _ = await self._finish_uninterruptibly(
+                proc,
+                process_waiter,
+                name,
+                readers,
+                identity_known=proc.returncode is not None,
+            )
+            errors = [error for error in (cleanup_error, output_error) if error]
+            cancelled = SandboxCancelledBeforeStart(
+                "sandbox cancelled during container creation"
+            )
+            if errors:
+                cancelled.add_note(
+                    f"container creation cleanup failed: {'; '.join(errors)}"
+                )
+            raise cancelled from exc
+
+        if output_error is not None:
+            cleanup_error, was_cancelled = await self._cleanup_container_uninterruptibly(
+                name,
+                self._new_cleanup_deadline(),
+                identity_known=True,
+            )
+            if was_cancelled:
+                raise SandboxCancelledBeforeStart(
+                    "sandbox cancelled during container creation"
+                )
+            detail = f"; {cleanup_error}" if cleanup_error else ""
+            raise SandboxError(
+                f"container creation output failed ({output_error}){detail}"
+            )
+
+        return_code = proc.returncode if proc.returncode is not None else -1
+        captured_stderr = stderr.text().strip()
+        if return_code != 0:
+            cleanup_error, was_cancelled = await self._cleanup_container_uninterruptibly(
+                name,
+                self._new_cleanup_deadline(),
+                identity_known=True,
+            )
+            if was_cancelled:
+                raise SandboxCancelledBeforeStart(
+                    "sandbox cancelled during container creation"
+                )
+            details = [detail for detail in (captured_stderr, cleanup_error) if detail]
+            suffix = f": {'; '.join(details)}" if details else ""
+            raise SandboxError(
+                f"container runtime failed before sandbox start "
+                f"(create exit {return_code}){suffix}"
+            )
+
+        container_id = stdout.text().strip()
+        if not _CONTAINER_ID_PATTERN.fullmatch(container_id):
+            cleanup_error, was_cancelled = await self._cleanup_container_uninterruptibly(
+                name,
+                self._new_cleanup_deadline(),
+                identity_known=True,
+            )
+            if was_cancelled:
+                raise SandboxCancelledBeforeStart(
+                    "sandbox cancelled during container creation"
+                )
+            detail = f"; {cleanup_error}" if cleanup_error else ""
+            raise SandboxError(
+                f"container creation returned an invalid identity{detail}"
+            )
+        return container_id
+
+    async def _finish_expired_create(
+        self,
+        spawn_task: asyncio.Task[asyncio.subprocess.Process],
+        name: str,
+    ) -> str:
+        cleanup_deadline = self._new_cleanup_deadline()
+        recovery_deadline = self._spawn_recovery_deadline(cleanup_deadline)
+        try:
+            proc, spawn_was_cancelled = await self._await_spawn_uninterruptibly(
+                spawn_task, recovery_deadline
+            )
+        except asyncio.TimeoutError:
+            self._schedule_late_create_cleanup(spawn_task, name)
+            cleanup_error, was_cancelled = await self._cleanup_container_uninterruptibly(
+                name, cleanup_deadline, identity_known=False
+            )
+            current_task = asyncio.current_task()
+            if was_cancelled or (
+                current_task is not None and current_task.cancelling()
+            ):
+                raise SandboxCancelledBeforeStart(
+                    "sandbox cancelled during container creation"
+                )
+            detail = f"; {cleanup_error}" if cleanup_error else ""
+            raise SandboxError(
+                f"sandbox container creation exceeded its hard deadline{detail}"
+            )
+        except OSError as exc:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise SandboxCancelledBeforeStart(
+                    "sandbox cancelled during container creation"
+                ) from exc
+            raise SandboxError(
+                f"failed to create the sandbox container ({type(exc).__name__})"
+            ) from exc
+
+        process_waiter = asyncio.create_task(proc.wait())
+        readers: tuple[asyncio.Task[None], ...] = ()
+        if proc.stdout is not None and proc.stderr is not None:
+            discard_stdout = _BoundedOutput(0)
+            discard_stderr = _BoundedOutput(0)
+            readers = (
+                asyncio.create_task(discard_stdout.drain(proc.stdout)),
+                asyncio.create_task(discard_stderr.drain(proc.stderr)),
+            )
+        cleanup_error, output_error, cleanup_was_cancelled = (
+            await self._finish_uninterruptibly(
+                proc,
+                process_waiter,
+                name,
+                readers,
+                deadline=cleanup_deadline,
+                identity_known=False,
+            )
+        )
+        if spawn_was_cancelled or cleanup_was_cancelled:
+            raise SandboxCancelledBeforeStart(
+                "sandbox cancelled during container creation"
+            )
+        errors = [error for error in (cleanup_error, output_error) if error]
+        detail = f"; {'; '.join(errors)}" if errors else ""
+        raise SandboxError(
+            f"sandbox container creation exceeded its hard deadline{detail}"
+        )
+
+    async def _start_container(
+        self,
+        spec: SandboxSpec,
+        container_id: str,
+        startup_marker: str,
+        run_deadline: float,
+    ) -> SandboxResult:
+        if self._remaining(run_deadline) <= 0:
+            cleanup_error, was_cancelled = await self._cleanup_container_uninterruptibly(
+                container_id,
+                self._new_cleanup_deadline(),
+                identity_known=True,
+            )
+            current_task = asyncio.current_task()
+            if was_cancelled or (
+                current_task is not None and current_task.cancelling()
+            ):
+                raise SandboxCancelledBeforeStart(
+                    "sandbox cancelled before command start"
+                )
+            detail = f"; {cleanup_error}" if cleanup_error else ""
+            raise SandboxError(
+                f"sandbox deadline expired before command start{detail}"
+            )
+
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            cleanup_error, _ = await self._cleanup_container_uninterruptibly(
+                container_id,
+                self._new_cleanup_deadline(),
+                identity_known=True,
+            )
+            cancellation = SandboxCancelledBeforeStart(
+                "sandbox cancelled before command start"
+            )
+            if cleanup_error:
+                cancellation.add_note(
+                    f"created container cleanup failed: {cleanup_error}"
+                )
             raise cancellation
 
+        argv = build_docker_start_argv(container_id)
+        argv[0] = self._docker
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        )
+        try:
+            proc = await asyncio.wait_for(
+                asyncio.shield(spawn_task), timeout=self._remaining(run_deadline)
+            )
+        except asyncio.TimeoutError:
+            return await self._finish_expired_spawn(
+                spec, spawn_task, container_id, startup_marker
+            )
+        except asyncio.CancelledError as exc:
+            await self._cancel_pending_spawn(spawn_task, container_id, exc)
+            raise
+        except OSError as exc:
+            cleanup_error, was_cancelled = await self._cleanup_container_uninterruptibly(
+                container_id,
+                self._new_cleanup_deadline(),
+                identity_known=True,
+            )
+            current_task = asyncio.current_task()
+            if was_cancelled or (
+                current_task is not None and current_task.cancelling()
+            ):
+                raise asyncio.CancelledError from exc
+            detail = f"; {cleanup_error}" if cleanup_error else ""
+            raise SandboxError(
+                "failed to start the sandbox container "
+                f"({type(exc).__name__}){detail}"
+            ) from exc
+
+        # A cancellation can race the spawn task's completion: wait_for may
+        # return the process handle while the surrounding Task already carries
+        # a pending cancellation request. Honor it while the known container ID
+        # is still available for bounded cleanup.
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            post_start_cancellation = asyncio.CancelledError()
+            await self._cancel_pending_spawn(
+                spawn_task, container_id, post_start_cancellation
+            )
+            raise post_start_cancellation
+
         return await self._run_spawned_process(
-            spec, proc, name, startup_marker, run_deadline
+            spec, proc, container_id, startup_marker, run_deadline
         )
 
     async def _run_spawned_process(
@@ -416,7 +782,7 @@ class DockerSandboxRunner:
                             f"sandbox quota cleanup failed: {'; '.join(errors)}"
                         )
                     raise cancel_error
-                if errors or violation.monitor_failed:
+                if errors or violation.measurement_failed:
                     detail = "; ".join([violation.message, *errors])
                     raise SandboxOutcomeUnknown(
                         f"sandbox workspace enforcement failed: {detail}"
@@ -461,7 +827,7 @@ class DockerSandboxRunner:
             max_files=spec.limits.workspace_files,
         )
         if final_violation is not None:
-            if final_violation.monitor_failed:
+            if final_violation.measurement_failed:
                 raise SandboxOutcomeUnknown(
                     f"sandbox workspace enforcement failed: {final_violation.message}"
                 )
@@ -474,10 +840,6 @@ class DockerSandboxRunner:
         captured_stderr = _strip_startup_marker(stderr.text(), startup_marker)
         if not stderr.sentinel_seen:
             detail = f": {captured_stderr.strip()}" if captured_stderr.strip() else ""
-            if return_code == 125:
-                raise SandboxError(
-                    f"container runtime failed before sandbox start (exit 125){detail}"
-                )
             cleanup_error, _, was_cancelled = await self._finish_uninterruptibly(
                 proc, process_waiter, name, ()
             )
@@ -487,6 +849,10 @@ class DockerSandboxRunner:
                 raise SandboxOutcomeUnknown(
                     "sandbox exited without startup proof and cleanup failed: "
                     f"{cleanup_error}"
+                )
+            if return_code == 125:
+                raise SandboxError(
+                    f"container runtime failed before sandbox start (exit 125){detail}"
                 )
             raise SandboxError(
                 "container runtime exited before sandbox start "
@@ -560,7 +926,7 @@ class DockerSandboxRunner:
             )
         except asyncio.TimeoutError:
             self._schedule_late_run_cleanup(spawn_task, name)
-            cleanup_error, was_cancelled = await self._cleanup_name_uninterruptibly(
+            cleanup_error, was_cancelled = await self._cleanup_container_uninterruptibly(
                 name, cleanup_deadline
             )
             if was_cancelled:
@@ -569,6 +935,31 @@ class DockerSandboxRunner:
             raise SandboxOutcomeUnknown(
                 f"sandbox process creation exceeded its hard deadline{detail}"
             )
+        except OSError as exc:
+            # The spawn may finish after the run deadline while recovery is
+            # waiting for its handle. It is still an infrastructure failure,
+            # just like an immediate create_subprocess_exec error, unless the
+            # recovery wait consumed cancellation first. Post-spawn
+            # cancellation remains fail-closed and takes precedence.
+            cleanup_error, cleanup_was_cancelled = (
+                await self._cleanup_container_uninterruptibly(
+                    name, cleanup_deadline
+                )
+            )
+            current_task = asyncio.current_task()
+            if cleanup_was_cancelled or (
+                current_task is not None and current_task.cancelling()
+            ):
+                cancellation = asyncio.CancelledError()
+                if cleanup_error:
+                    cancellation.add_note(
+                        f"created container cleanup failed: {cleanup_error}"
+                    )
+                raise cancellation from exc
+            detail = f"; {cleanup_error}" if cleanup_error else ""
+            raise SandboxError(
+                f"failed to spawn the sandbox ({type(exc).__name__}){detail}"
+            ) from exc
 
         process_waiter = asyncio.create_task(proc.wait())
         if proc.stdout is None or proc.stderr is None:
@@ -618,8 +1009,10 @@ class DockerSandboxRunner:
     async def _cancel_pending_spawn(
         self,
         spawn_task: asyncio.Task[asyncio.subprocess.Process],
-        name: str,
+        container: str,
         cancellation: asyncio.CancelledError,
+        *,
+        identity_known: bool = True,
     ) -> None:
         cleanup_deadline = self._new_cleanup_deadline()
         recovery_deadline = self._spawn_recovery_deadline(cleanup_deadline)
@@ -628,9 +1021,14 @@ class DockerSandboxRunner:
                 spawn_task, recovery_deadline
             )
         except asyncio.TimeoutError:
-            self._schedule_late_run_cleanup(spawn_task, name)
-            cleanup_error, _ = await self._cleanup_name_uninterruptibly(
-                name, cleanup_deadline
+            if identity_known:
+                self._schedule_late_run_cleanup(spawn_task, container)
+            else:
+                self._schedule_late_create_cleanup(spawn_task, container)
+            cleanup_error, _ = await self._cleanup_container_uninterruptibly(
+                container,
+                cleanup_deadline,
+                identity_known=identity_known,
             )
             detail = cleanup_error or "process creation did not finish"
             cancellation.add_note(
@@ -656,9 +1054,10 @@ class DockerSandboxRunner:
         cleanup_error, output_error, _ = await self._finish_uninterruptibly(
             proc,
             process_waiter,
-            name,
+            container,
             readers,
             deadline=cleanup_deadline,
+            identity_known=identity_known,
         )
         errors = [error for error in (cleanup_error, output_error) if error]
         if errors:
@@ -683,7 +1082,7 @@ class DockerSandboxRunner:
         )
 
     @staticmethod
-    async def _watch_workspace(spec: SandboxSpec) -> _WorkspaceViolation:
+    async def _watch_workspace(spec: SandboxSpec) -> WorkspaceViolation:
         while True:
             try:
                 violation = await asyncio.to_thread(
@@ -693,9 +1092,9 @@ class DockerSandboxRunner:
                     max_files=spec.limits.workspace_files,
                 )
             except Exception as exc:  # pragma: no cover - defensive executor boundary
-                return _WorkspaceViolation(
+                return WorkspaceViolation(
                     f"workspace monitor failed ({type(exc).__name__})",
-                    monitor_failed=True,
+                    measurement_failed=True,
                 )
             if violation is not None:
                 return violation
@@ -719,77 +1118,89 @@ class DockerSandboxRunner:
         self,
         proc: asyncio.subprocess.Process,
         process_waiter: asyncio.Task[int],
-        name: str,
+        container: str,
         deadline: float,
+        *,
+        identity_known: bool,
     ) -> str | None:
         errors: list[str] = []
         client_error = await self._stop_client(proc, process_waiter, deadline)
         if client_error is not None:
             errors.append(client_error)
 
-        # Stop the client first. During image pull/create, removing by name
-        # before the client exits can report "no such container" and then let a
-        # late daemon-side create escape the timeout boundary.
-        absence_error = await self._remove_until_stably_absent(name, deadline)
+        # A completed create gives us an immutable ID (or a terminally-resolved
+        # name), so one verified absence is final. During an interrupted create,
+        # absence alone is not proof: only observing and removing that pending
+        # create closes the race.
+        remove = (
+            self._remove_known_container
+            if identity_known
+            else self._remove_pending_create
+        )
+        absence_error = await remove(container, deadline)
         if absence_error is not None:
             errors.append(absence_error)
         return "; ".join(errors) or None
 
-    async def _remove_until_stably_absent(
-        self, name: str, deadline: float
+    async def _remove_known_container(
+        self, container_id: str, deadline: float
     ) -> str | None:
-        """Remove and inspect until absence survives a short quiescence window.
-
-        One missing lookup is not proof: a daemon-side create accepted before
-        the runtime client was killed can become visible just after that lookup.
-        """
-        loop = asyncio.get_running_loop()
-        stable_window = min(
-            _CLEANUP_STABLE_ABSENCE_SECONDS,
-            self._cleanup_timeout_seconds / 2,
-        )
-        absent_since: float | None = None
+        """Remove a previously-created immutable identity until it is absent."""
         last_error: str | None = None
         while self._remaining(deadline) > 0:
-            remove_error = None
-            if absent_since is None:
-                remove_error = await self._force_remove_container(name, deadline)
-            absent, verify_error = await self._container_is_absent(name, deadline)
-            now = loop.time()
+            _, remove_error = await self._force_remove_container(
+                container_id, deadline
+            )
+            absent, verify_error = await self._container_is_absent(
+                container_id, deadline
+            )
             if absent:
-                if absent_since is None:
-                    absent_since = now
-                if now - absent_since >= stable_window:
-                    return None
-                last_error = remove_error
-            else:
-                absent_since = None
-                last_error = verify_error or remove_error or (
-                    "container still exists after forced cleanup"
-                )
+                return None
+            last_error = verify_error or remove_error or (
+                "container still exists after forced cleanup"
+            )
 
             delay = min(_CLEANUP_POLL_SECONDS, self._remaining(deadline))
             if delay > 0:
                 await asyncio.sleep(delay)
-
-        if absent_since is not None:
-            return "container absence was not stable before cleanup deadline"
         return last_error or "container cleanup deadline expired"
 
-    async def _force_remove_container(
+    async def _remove_pending_create(
         self, name: str, deadline: float
     ) -> str | None:
-        # Removing by name stops the daemon-owned container too. Merely killing
-        # the runtime client can leave the agent code running in the container.
+        """Wait for an interrupted create to become removable by its name."""
+        removed = False
+        last_error: str | None = None
+        while self._remaining(deadline) > 0:
+            removed_now, remove_error = await self._force_remove_container(
+                name, deadline
+            )
+            removed = removed or removed_now
+            absent, verify_error = await self._container_is_absent(name, deadline)
+            if removed and absent:
+                return None
+            last_error = verify_error or remove_error or (
+                "pending container create was not observed before cleanup deadline"
+            )
+            delay = min(_CLEANUP_POLL_SECONDS, self._remaining(deadline))
+            if delay > 0:
+                await asyncio.sleep(delay)
+        return last_error or "pending container cleanup deadline expired"
+
+    async def _force_remove_container(
+        self, container: str, deadline: float
+    ) -> tuple[bool, str | None]:
         return_code, detail, command_error = await self._run_docker_control(
-            "rm", "--force", name, deadline=deadline
+            "rm", "--force", container, deadline=deadline
         )
         if command_error is not None:
-            return f"container cleanup {command_error}"
+            return False, f"container cleanup {command_error}"
+        if return_code == 0:
+            return True, None
         if return_code != 0 and not _is_missing_container_error(detail):
             suffix = f": {detail}" if detail else ""
-            return f"container cleanup exited {return_code}{suffix}"
-        return None
+            return False, f"container cleanup exited {return_code}{suffix}"
+        return False, None
 
     async def _container_is_absent(
         self, name: str, deadline: float
@@ -900,6 +1311,32 @@ class DockerSandboxRunner:
     def _schedule_late_run_cleanup(
         self,
         spawn_task: asyncio.Task[asyncio.subprocess.Process],
+        container_id: str,
+    ) -> None:
+        async def reap() -> None:
+            try:
+                proc = await asyncio.shield(spawn_task)
+            except BaseException:
+                return
+            process_waiter = asyncio.create_task(proc.wait())
+            readers: tuple[asyncio.Task[None], ...] = ()
+            if proc.stdout is not None and proc.stderr is not None:
+                discard_stdout = _BoundedOutput(0)
+                discard_stderr = _BoundedOutput(0)
+                readers = (
+                    asyncio.create_task(discard_stdout.drain(proc.stdout)),
+                    asyncio.create_task(discard_stderr.drain(proc.stderr)),
+                )
+            with contextlib.suppress(BaseException):
+                await self._finish_uninterruptibly(
+                    proc, process_waiter, container_id, readers
+                )
+
+        asyncio.create_task(reap())
+
+    def _schedule_late_create_cleanup(
+        self,
+        spawn_task: asyncio.Task[asyncio.subprocess.Process],
         name: str,
     ) -> None:
         async def reap() -> None:
@@ -918,7 +1355,11 @@ class DockerSandboxRunner:
                 )
             with contextlib.suppress(BaseException):
                 await self._finish_uninterruptibly(
-                    proc, process_waiter, name, readers
+                    proc,
+                    process_waiter,
+                    name,
+                    readers,
+                    identity_known=False,
                 )
 
         asyncio.create_task(reap())
@@ -941,11 +1382,20 @@ class DockerSandboxRunner:
                     raise
                 was_cancelled = True
 
-    async def _cleanup_name_uninterruptibly(
-        self, name: str, deadline: float
+    async def _cleanup_container_uninterruptibly(
+        self,
+        container: str,
+        deadline: float,
+        *,
+        identity_known: bool = True,
     ) -> tuple[str | None, bool]:
+        remove = (
+            self._remove_known_container
+            if identity_known
+            else self._remove_pending_create
+        )
         cleanup_task = asyncio.create_task(
-            self._remove_until_stably_absent(name, deadline)
+            remove(container, deadline)
         )
         was_cancelled = False
         while True:
@@ -964,12 +1414,17 @@ class DockerSandboxRunner:
         readers: tuple[asyncio.Task[None], ...],
         *,
         deadline: float | None = None,
+        identity_known: bool = True,
     ) -> tuple[str | None, str | None, bool]:
         deadline = deadline or self._new_cleanup_deadline()
 
         async def finish() -> tuple[str | None, str | None]:
             cleanup_error = await self._cleanup_process(
-                proc, process_waiter, name, deadline
+                proc,
+                process_waiter,
+                name,
+                deadline,
+                identity_known=identity_known,
             )
             output_error = (
                 await self._settle_readers(readers, deadline) if readers else None

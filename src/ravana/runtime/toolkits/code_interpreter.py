@@ -24,24 +24,31 @@ keeps the invocation STARTED so it cannot be executed twice.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
+import stat
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from ravana.runtime.toolkits.base import (
     ToolFailureKind,
+    ToolRetrySafeCancellation,
     ToolkitError,
     ToolOutcomeUnknown,
 )
 from ravana.runtime.toolkits.sandbox import (
     DockerSandboxRunner,
+    SandboxCancelledBeforeStart,
     SandboxError,
     SandboxLimits,
     SandboxResult,
     SandboxRunner,
     SandboxSpec,
     SandboxOutcomeUnknown,
+    workspace_capacity_violation,
 )
 
 INPUT_SCHEMA: dict[str, Any] = {
@@ -121,7 +128,12 @@ class CodeInterpreterHandler:
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str) -> str:
         workspace = self._workspace_for(run_id)
         filename = _safe_filename(arguments.get("filename"), self._default_filename)
-        _write_script(workspace, filename, str(arguments["code"]))
+        _write_script(
+            workspace,
+            filename,
+            str(arguments["code"]),
+            limits=self._limits,
+        )
 
         args = [str(a) for a in arguments.get("args", [])]
         spec = SandboxSpec(
@@ -132,6 +144,10 @@ class CodeInterpreterHandler:
         )
         try:
             result = await self._runner.run(spec)
+        except SandboxCancelledBeforeStart as exc:
+            raise ToolRetrySafeCancellation(
+                "code_interpreter cancelled before sandbox execution"
+            ) from exc
         except SandboxOutcomeUnknown as exc:
             raise ToolOutcomeUnknown(
                 f"code_interpreter sandbox outcome is unknown: {exc}"
@@ -192,20 +208,79 @@ class CodeInterpreterHandler:
         return workspace
 
 
-def _write_script(workspace: Path, filename: str, code: str) -> None:
+def _write_script(
+    workspace: Path,
+    filename: str,
+    code: str,
+    *,
+    limits: SandboxLimits,
+) -> None:
     """Publish the script atomically so an existing symlink or hard link is
     replaced as a directory entry instead of being followed by the host write."""
+    encoded = code.encode("utf-8")
+    with _workspace_publication_lock(workspace):
+        violation = workspace_capacity_violation(
+            workspace,
+            limits=limits,
+            additional_bytes=len(encoded),
+            additional_files=1,
+        )
+        if violation is not None:
+            kind = (
+                ToolFailureKind.TRANSIENT
+                if violation.measurement_failed
+                else ToolFailureKind.MODEL_ADDRESSABLE
+            )
+            raise ToolkitError(
+                f"code_interpreter: {violation.message}", kind=kind
+            )
+
+        _publish_script(workspace, filename, encoded)
+
+
+@contextlib.contextmanager
+def _workspace_publication_lock(workspace: Path) -> Iterator[None]:
+    """Serialize quota measurement and publication across local processes."""
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd: int | None = None
+    locked = False
+    try:
+        fd = os.open(workspace.parent / ".ravana-workspace.lock", flags, 0o600)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("workspace publication lock is not a regular file")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        locked = True
+        yield
+    except ToolkitError:
+        raise
+    except OSError as exc:
+        raise ToolkitError(
+            "code_interpreter: unable to lock the run workspace "
+            f"({type(exc).__name__})",
+            kind=ToolFailureKind.TRANSIENT,
+        ) from exc
+    finally:
+        if fd is not None:
+            if locked:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _publish_script(workspace: Path, filename: str, encoded: bytes) -> None:
+    """Atomically replace the destination while the quota lock is held."""
+
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
+            mode="wb",
             dir=workspace,
             prefix=".ravana-script-",
             delete=False,
         ) as temp_file:
             temp_path = Path(temp_file.name)
-            temp_file.write(code)
+            temp_file.write(encoded)
         os.replace(temp_path, workspace / filename)
         temp_path = None
     except OSError as exc:
