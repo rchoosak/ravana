@@ -103,7 +103,15 @@ def _build_llm_gateway(con: sqlite3.Connection, graph: CompiledGraph) -> LLMGate
     # pointers. An agent with no api_key_ref falls back to the provider SDK's
     # own env var (ANTHROPIC_API_KEY / OPENAI_API_KEY).
     resolver = EnvSecretResolver()
-    handlers = build_registry(graph, resolver)
+    # §10.1: code_interpreter scopes each run's workspace under .ravana/runs/. A
+    # real `run` always has a .ravana (it's how `_connect` found the DB); guard
+    # the lookup so building the gateway out of that context (a unit test) still
+    # works — code_interpreter just isn't runnable without a runs dir.
+    try:
+        runs_dir: Path | None = find_ravana_dir() / "runs"
+    except click.ClickException:
+        runs_dir = None
+    handlers = build_registry(graph, resolver, runs_dir=runs_dir)
     executor = RavanaToolExecutor(con, handlers)
     return LLMGateway(graph, _adapters_for_graph(graph), tool_executor=executor, secret_resolver=resolver)
 

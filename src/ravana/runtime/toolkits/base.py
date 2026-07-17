@@ -8,6 +8,7 @@ dedup in RavanaToolExecutor.
 
 from __future__ import annotations
 
+import asyncio
 from enum import Enum
 from typing import Any, Protocol
 
@@ -40,6 +41,28 @@ class ToolkitError(Exception):
         self.kind = kind
 
 
+class ToolOutcomeUnknown(ToolkitError):
+    """A side-effecting tool started, but its terminal outcome cannot be proven.
+
+    The executor must leave this invocation STARTED so the same idempotency key
+    fails closed on retry instead of being treated as a safely retryable FAILED
+    call. This is distinct from an ordinary fatal error whose effect is known
+    not to have happened.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, kind=ToolFailureKind.FATAL)
+
+
+class ToolRetrySafeCancellation(asyncio.CancelledError):
+    """Cancellation occurred before a non-repeatable tool effect could begin.
+
+    The executor may mark a claimed side-effecting invocation FAILED so the
+    same logical call can retry. Handlers must only raise this when they can
+    prove no non-repeatable effect was possible.
+    """
+
+
 class ToolkitHandler(Protocol):
     # §8(a): every connector declares its input JSON schema. The result is a
     # plain string fed back to the model, so there is no separate output
@@ -68,6 +91,10 @@ class ToolkitHandler(Protocol):
         cached replay."""
         ...
 
-    async def call(self, *, arguments: dict[str, Any], idempotency_key: str) -> str: ...
+    # `run_id` identifies the current run so a handler that needs per-run
+    # resources can locate them — code_interpreter uses it to find `runs/<run_id>
+    # /workspace` (§10.1). Handlers that don't need it ignore it. It is not the
+    # idempotency key (that's the logical-invocation key above).
+    async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str) -> str: ...
 
     async def aclose(self) -> None: ...

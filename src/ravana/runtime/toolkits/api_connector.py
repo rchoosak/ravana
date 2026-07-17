@@ -93,7 +93,7 @@ class ApiConnectorHandler:
         if inspect.isawaitable(result):
             await result
 
-    async def call(self, *, arguments: dict[str, Any], idempotency_key: str) -> str:
+    async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str | None = None) -> str:
         # Validate BEFORE resolving the token or building headers, so a
         # rejected request never has the bearer credential attached to it.
         method = _method_of(arguments)

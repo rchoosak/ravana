@@ -8,16 +8,18 @@ silently accepting a config they can't honor.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ravana.compiler.graph import CompiledGraph
 from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.api_connector import ApiConnectorHandler
 from ravana.runtime.toolkits.base import ToolkitError, ToolkitHandler
+from ravana.runtime.toolkits.code_interpreter import CodeInterpreterHandler
+from ravana.runtime.toolkits.sandbox import SandboxRunner
 
-# Toolkit types deferred to the sandbox slice, with the reason each needs it.
+# Toolkit types still deferred to a later slice, with the reason each needs it.
 _DEFERRED = {
-    "code_interpreter": "Docker sandbox execution — highest blast radius (§8), lands in the sandbox slice",
     "mcp_server": "stdio MCP subprocess via the mcp SDK — lands in the sandbox slice",
     "web_search": "provider HTTP call (e.g. Tavily) — lands with the connector-providers slice",
 }
@@ -28,9 +30,13 @@ def build_registry(
     resolver: SecretResolver,
     *,
     clients: dict[str, Any] | None = None,
+    runs_dir: Path | None = None,
+    sandbox_runner: SandboxRunner | None = None,
 ) -> dict[str, ToolkitHandler]:
     """Returns {toolkit_id: handler}. `clients` optionally injects a per-toolkit
-    transport (tests pass fakes keyed by toolkit id)."""
+    transport (tests pass fakes keyed by toolkit id); `runs_dir` is the
+    `.ravana/runs` directory code_interpreter scopes each run's workspace under
+    (§10.1); `sandbox_runner` overrides the Docker runner (tests pass a fake)."""
     clients = clients or {}
     handlers: dict[str, ToolkitHandler] = {}
     for toolkit_id, toolkit in graph.toolkits_by_id.items():
@@ -43,6 +49,12 @@ def build_registry(
                 config=toolkit.config,
                 get_auth_token=_auth_provider(resolver, toolkit.auth_ref),
                 client=clients.get(toolkit_id),
+            )
+        elif toolkit.type == "code_interpreter":
+            # §8/§10.1: agent code runs in a per-run, network-isolated sandbox
+            # whose only writable mount is runs/<run_id>/workspace.
+            handlers[toolkit_id] = CodeInterpreterHandler(
+                config=toolkit.config, runs_dir=runs_dir, runner=sandbox_runner
             )
         elif toolkit.type in _DEFERRED:
             handlers[toolkit_id] = _DeferredHandler(toolkit_id, toolkit.type)
@@ -84,7 +96,7 @@ class _DeferredHandler:
     def is_side_effecting(self, arguments) -> bool:  # never reached — call() always raises
         return False
 
-    async def call(self, *, arguments, idempotency_key):
+    async def call(self, *, arguments, idempotency_key, run_id=None):
         raise ToolkitError(f"toolkit '{self._toolkit_id}' is not executable in this slice: {self._reason}")
 
     async def aclose(self) -> None:
