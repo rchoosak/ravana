@@ -25,10 +25,11 @@ import re
 import shutil
 import stat
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,7 @@ _PODMAN_CLEANUP_TIMEOUT_SECONDS = 30.0
 _WORKSPACE_POLL_SECONDS = 0.05
 _WORKSPACE_WORKER_CLEANUP_SECONDS = 1.0
 _MIN_WORKSPACE_SCAN_TIMEOUT_SECONDS = 1.0
+_SCRIPT_STAGE_CHUNK_CHARACTERS = 64 * 1024
 _CLEANUP_POLL_SECONDS = 0.02
 _WORKSPACE_LIMIT_EXIT_CODE = 122
 _CONTAINER_ID_PATTERN = re.compile(r"[0-9a-f]{12,64}")
@@ -188,6 +190,152 @@ _create_workspace_subprocess_exec = asyncio.create_subprocess_exec
 class WorkspaceViolation:
     message: str
     measurement_failed: bool = False
+
+
+class WorkspaceStagingError(Exception):
+    """A killable host-side script staging worker failed."""
+
+
+class WorkspaceStagingCleanupError(WorkspaceStagingError):
+    """A staging file or worker could not be cleaned up safely."""
+
+
+class AsyncResourceLifecycle:
+    """Seal an async resource and wait for every admitted operation to leave."""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._active = 0
+        self._closing = False
+        self._changed = asyncio.Event()
+
+    def enter(self) -> None:
+        if self._closing:
+            raise RuntimeError(f"{self._label} is closed")
+        self._active += 1
+
+    def exit(self) -> None:
+        if self._active <= 0:
+            raise RuntimeError(f"{self._label} operation ownership underflow")
+        self._active -= 1
+        self._changed.set()
+
+    async def aclose(self, *, timeout_seconds: float) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self._closing = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while self._active:
+            remaining = max(0.0, deadline - loop.time())
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self._label} operations did not finish before shutdown"
+                )
+            self._changed.clear()
+            if not self._active:
+                break
+            try:
+                await asyncio.wait_for(
+                    self._changed.wait(), timeout=remaining
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"{self._label} operations did not finish before shutdown"
+                ) from exc
+
+
+class WorkspaceWorkerSupervisor:
+    """Own late worker reapers until completion or explicit close failure."""
+
+    def __init__(self) -> None:
+        self._reapers: set[asyncio.Task[Any]] = set()
+        self._errors: list[str] = []
+        self._active_operations = 0
+        self._closing = False
+        self._closed = False
+        self._changed = asyncio.Event()
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._reapers)
+
+    def begin_operation(self) -> None:
+        if self._closing or self._closed:
+            raise WorkspaceStagingCleanupError(
+                "workspace worker supervisor is closed"
+            )
+        self._active_operations += 1
+        self._changed.set()
+
+    def end_operation(self) -> None:
+        if self._active_operations <= 0:
+            raise RuntimeError("workspace worker operation ownership underflow")
+        self._active_operations -= 1
+        self._changed.set()
+
+    def track(self, task: asyncio.Task[Any]) -> None:
+        if self._closed:
+            task.cancel()
+            raise WorkspaceStagingCleanupError(
+                "workspace worker supervisor is closed"
+            )
+        self._reapers.add(task)
+        self._changed.set()
+
+        def consume(completed: asyncio.Task[Any]) -> None:
+            self._reapers.discard(completed)
+            self._changed.set()
+            if completed.cancelled():
+                self._errors.append(
+                    "workspace worker cleanup task was cancelled"
+                )
+                return
+            try:
+                error = completed.exception()
+            except BaseException as exc:
+                self._errors.append(
+                    "workspace worker cleanup status failed "
+                    f"({type(exc).__name__})"
+                )
+                return
+            if error is not None:
+                self._errors.append(
+                    f"workspace worker cleanup failed ({type(error).__name__})"
+                )
+
+        task.add_done_callback(consume)
+
+    async def aclose(self, *, timeout_seconds: float) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if self._closed:
+            return
+        self._closing = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while self._active_operations or self._reapers:
+            remaining = max(0.0, deadline - loop.time())
+            if remaining <= 0:
+                raise WorkspaceStagingCleanupError(
+                    "workspace worker operations did not finish before shutdown"
+                )
+            self._changed.clear()
+            if not self._active_operations and not self._reapers:
+                break
+            try:
+                await asyncio.wait_for(
+                    self._changed.wait(), timeout=remaining
+                )
+            except asyncio.TimeoutError as exc:
+                raise WorkspaceStagingCleanupError(
+                    "workspace worker operations did not finish before shutdown"
+                ) from exc
+        self._closed = True
+        if self._errors:
+            errors = "; ".join(self._errors)
+            self._errors.clear()
+            raise WorkspaceStagingCleanupError(errors)
 
 
 def _workspace_violation(
@@ -274,6 +422,7 @@ async def workspace_capacity_violation_async(
     additional_bytes: int,
     additional_files: int,
     timeout_seconds: float,
+    supervisor: WorkspaceWorkerSupervisor,
 ) -> WorkspaceViolation | None:
     """Measure publication capacity in a worker that can be killed on timeout."""
     if additional_bytes < 0 or additional_files < 0:
@@ -293,6 +442,7 @@ async def workspace_capacity_violation_async(
         max_bytes=limits.workspace_bytes - additional_bytes,
         max_files=limits.workspace_files - additional_files,
         timeout_seconds=timeout_seconds,
+        supervisor=supervisor,
     )
 
 
@@ -318,12 +468,220 @@ def _workspace_worker_argv(
     return argv
 
 
+def _script_stage_worker_argv(stage_fd: int) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "ravana.runtime.toolkits.script_stage",
+        str(stage_fd),
+    ]
+
+
+async def stage_workspace_script_async(
+    workspace: Path,
+    code: str,
+    *,
+    timeout_seconds: float,
+    supervisor: WorkspaceWorkerSupervisor,
+) -> Path:
+    supervisor.begin_operation()
+    try:
+        return await _stage_workspace_script_owned(
+            workspace,
+            code,
+            timeout_seconds=timeout_seconds,
+            supervisor=supervisor,
+        )
+    finally:
+        supervisor.end_operation()
+
+
+async def _stage_workspace_script_owned(
+    workspace: Path,
+    code: str,
+    *,
+    timeout_seconds: float,
+    supervisor: WorkspaceWorkerSupervisor,
+) -> Path:
+    """Write code to a unique temp path in a killable worker.
+
+    The worker never receives the destination filename. Only the parent may
+    atomically publish the staged file after every pre-publication check passes.
+    """
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    try:
+        stage_fd, raw_temp_path = tempfile.mkstemp(
+            dir=workspace,
+            prefix=".ravana-script-",
+        )
+    except OSError as exc:
+        raise WorkspaceStagingError(
+            f"script staging file could not be created ({type(exc).__name__})"
+        ) from exc
+    temp_path = Path(raw_temp_path)
+    spawn_task = asyncio.create_task(
+        _create_workspace_subprocess_exec(
+            *_script_stage_worker_argv(stage_fd),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            pass_fds=(stage_fd,),
+        )
+    )
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.shield(spawn_task),
+            timeout=max(0.0, deadline - loop.time()),
+        )
+    except asyncio.CancelledError as exc:
+        _schedule_workspace_worker_spawn_cleanup(
+            spawn_task,
+            supervisor=supervisor,
+            cleanup_fd=stage_fd,
+            cleanup_path=temp_path,
+        )
+        _remove_workspace_temp_after_error(temp_path, exc)
+        raise
+    except asyncio.TimeoutError as exc:
+        _schedule_workspace_worker_spawn_cleanup(
+            spawn_task,
+            supervisor=supervisor,
+            cleanup_fd=stage_fd,
+            cleanup_path=temp_path,
+        )
+        _remove_workspace_temp_after_error(temp_path, exc)
+        raise WorkspaceStagingError(
+            "script staging worker exceeded its deadline while starting"
+        ) from exc
+    except OSError as exc:
+        _cleanup_unspawned_stage(stage_fd, temp_path, exc)
+        raise WorkspaceStagingError(
+            f"script staging worker failed to start ({type(exc).__name__})"
+        ) from exc
+    except Exception as exc:
+        _cleanup_unspawned_stage(stage_fd, temp_path, exc)
+        raise WorkspaceStagingError(
+            f"script staging worker failed to start ({type(exc).__name__})"
+        ) from exc
+    except BaseException as exc:
+        _cleanup_unspawned_stage(stage_fd, temp_path, exc)
+        raise
+
+    try:
+        _close_workspace_stage_fd(stage_fd)
+    except WorkspaceStagingCleanupError as exc:
+        await _abort_staged_worker(
+            proc,
+            temp_path,
+            supervisor=supervisor,
+            cause=exc,
+        )
+        raise
+
+    if proc.stdin is None:
+        error = WorkspaceStagingError(
+            "script staging worker exposed no input stream"
+        )
+        await _abort_staged_worker(
+            proc,
+            temp_path,
+            supervisor=supervisor,
+            cause=error,
+        )
+        raise error
+
+    try:
+        for offset in range(0, len(code), _SCRIPT_STAGE_CHUNK_CHARACTERS):
+            remaining = max(0.0, deadline - loop.time())
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            chunk = code[offset : offset + _SCRIPT_STAGE_CHUNK_CHARACTERS]
+            proc.stdin.write(chunk.encode("utf-8"))
+            await asyncio.wait_for(proc.stdin.drain(), timeout=remaining)
+            await asyncio.sleep(0)
+        proc.stdin.close()
+        await asyncio.wait_for(
+            proc.wait(), timeout=max(0.0, deadline - loop.time())
+        )
+    except asyncio.CancelledError as exc:
+        await _abort_staged_worker(
+            proc,
+            temp_path,
+            supervisor=supervisor,
+            cause=exc,
+        )
+        raise
+    except asyncio.TimeoutError as exc:
+        await _abort_staged_worker(
+            proc,
+            temp_path,
+            supervisor=supervisor,
+            cause=exc,
+        )
+        raise WorkspaceStagingError(
+            "script staging worker exceeded its deadline"
+        ) from exc
+    except Exception as exc:
+        await _abort_staged_worker(
+            proc,
+            temp_path,
+            supervisor=supervisor,
+            cause=exc,
+        )
+        raise WorkspaceStagingError(
+            f"script staging worker failed ({type(exc).__name__})"
+        ) from exc
+    except BaseException as exc:
+        await _abort_staged_worker(
+            proc,
+            temp_path,
+            supervisor=supervisor,
+            cause=exc,
+        )
+        raise
+
+    if proc.returncode != 0:
+        cleanup_workspace_staged_file(temp_path)
+        raise WorkspaceStagingError(
+            f"script staging worker exited {proc.returncode}"
+        )
+    return temp_path
+
+
 async def _workspace_violation_in_worker(
     workspace: Path,
     *,
     max_bytes: int,
     max_files: int,
     timeout_seconds: float | None,
+    supervisor: WorkspaceWorkerSupervisor,
+    watch: bool = False,
+) -> WorkspaceViolation | None:
+    supervisor.begin_operation()
+    try:
+        return await _workspace_violation_in_owned_worker(
+            workspace,
+            max_bytes=max_bytes,
+            max_files=max_files,
+            timeout_seconds=timeout_seconds,
+            supervisor=supervisor,
+            watch=watch,
+        )
+    finally:
+        supervisor.end_operation()
+
+
+async def _workspace_violation_in_owned_worker(
+    workspace: Path,
+    *,
+    max_bytes: int,
+    max_files: int,
+    timeout_seconds: float | None,
+    supervisor: WorkspaceWorkerSupervisor,
     watch: bool = False,
 ) -> WorkspaceViolation | None:
     """Run a one-shot scan or monitor in a subprocess with bounded teardown."""
@@ -351,10 +709,14 @@ async def _workspace_violation_in_worker(
                 asyncio.shield(spawn_task), timeout=max(0.0, deadline - loop.time())
             )
     except asyncio.CancelledError:
-        _schedule_workspace_worker_spawn_cleanup(spawn_task)
+        _schedule_workspace_worker_spawn_cleanup(
+            spawn_task, supervisor=supervisor
+        )
         raise
     except asyncio.TimeoutError:
-        _schedule_workspace_worker_spawn_cleanup(spawn_task)
+        _schedule_workspace_worker_spawn_cleanup(
+            spawn_task, supervisor=supervisor
+        )
         return WorkspaceViolation(
             "workspace measurement exceeded its deadline",
             measurement_failed=True,
@@ -366,7 +728,9 @@ async def _workspace_violation_in_worker(
         )
 
     if proc.stdout is None:
-        await _terminate_workspace_worker_uninterruptibly(proc)
+        await _terminate_workspace_worker_uninterruptibly(
+            proc, supervisor=supervisor
+        )
         return WorkspaceViolation(
             "workspace measurement worker exposed no output",
             measurement_failed=True,
@@ -381,23 +745,31 @@ async def _workspace_violation_in_worker(
                 communicate, timeout=max(0.0, deadline - loop.time())
             )
     except asyncio.CancelledError:
-        await _terminate_workspace_worker_uninterruptibly(proc)
+        await _terminate_workspace_worker_uninterruptibly(
+            proc, supervisor=supervisor
+        )
         raise
     except asyncio.TimeoutError:
-        await _terminate_workspace_worker_uninterruptibly(proc)
+        await _terminate_workspace_worker_uninterruptibly(
+            proc, supervisor=supervisor
+        )
         return WorkspaceViolation(
             "workspace measurement exceeded its deadline",
             measurement_failed=True,
         )
     except Exception as exc:
-        await _terminate_workspace_worker_uninterruptibly(proc)
+        await _terminate_workspace_worker_uninterruptibly(
+            proc, supervisor=supervisor
+        )
         return WorkspaceViolation(
             "workspace measurement communication failed "
             f"({type(exc).__name__})",
             measurement_failed=True,
         )
     except BaseException:
-        await _terminate_workspace_worker_uninterruptibly(proc)
+        await _terminate_workspace_worker_uninterruptibly(
+            proc, supervisor=supervisor
+        )
         raise
 
     if proc.returncode != 0:
@@ -431,28 +803,131 @@ async def _workspace_violation_in_worker(
 
 def _schedule_workspace_worker_spawn_cleanup(
     spawn_task: asyncio.Task[asyncio.subprocess.Process],
+    *,
+    supervisor: WorkspaceWorkerSupervisor,
+    cleanup_fd: int | None = None,
+    cleanup_path: Path | None = None,
 ) -> None:
     async def reap() -> None:
         try:
-            proc = await asyncio.shield(spawn_task)
-        except BaseException:
-            return
-        await _terminate_workspace_worker_uninterruptibly(proc)
+            try:
+                proc = await asyncio.shield(spawn_task)
+            except BaseException:
+                return
+            await _terminate_workspace_worker_uninterruptibly(
+                proc, supervisor=supervisor
+            )
+        finally:
+            _cleanup_late_worker_resources(
+                cleanup_fd=cleanup_fd,
+                cleanup_path=cleanup_path,
+            )
 
-    asyncio.create_task(reap())
+    supervisor.track(asyncio.create_task(reap()))
+
+
+def cleanup_workspace_staged_file(temp_path: Path) -> None:
+    try:
+        temp_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise WorkspaceStagingCleanupError(
+            f"script staging file cleanup failed ({type(exc).__name__})"
+        ) from exc
+
+
+def _remove_workspace_temp_after_error(
+    temp_path: Path, cause: BaseException
+) -> None:
+    try:
+        cleanup_workspace_staged_file(temp_path)
+    except WorkspaceStagingCleanupError as cleanup_error:
+        raise cleanup_error from cause
+
+
+def _cleanup_unspawned_stage(
+    stage_fd: int,
+    temp_path: Path,
+    cause: BaseException,
+) -> None:
+    try:
+        _cleanup_late_worker_resources(
+            cleanup_fd=stage_fd,
+            cleanup_path=temp_path,
+        )
+    except WorkspaceStagingCleanupError as cleanup_error:
+        raise cleanup_error from cause
+
+
+def _cleanup_late_worker_resources(
+    *,
+    cleanup_fd: int | None,
+    cleanup_path: Path | None,
+) -> None:
+    errors: list[str] = []
+    if cleanup_fd is not None:
+        try:
+            _close_workspace_stage_fd(cleanup_fd)
+        except WorkspaceStagingCleanupError as exc:
+            errors.append(str(exc))
+    if cleanup_path is not None:
+        try:
+            cleanup_workspace_staged_file(cleanup_path)
+        except WorkspaceStagingCleanupError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise WorkspaceStagingCleanupError("; ".join(errors))
+
+
+async def _abort_staged_worker(
+    proc: asyncio.subprocess.Process,
+    temp_path: Path,
+    *,
+    supervisor: WorkspaceWorkerSupervisor,
+    cause: BaseException,
+) -> None:
+    errors: list[str] = []
+    try:
+        await _terminate_workspace_worker_uninterruptibly(
+            proc, supervisor=supervisor
+        )
+    except BaseException as exc:
+        errors.append(
+            f"script staging worker cleanup failed ({type(exc).__name__})"
+        )
+    try:
+        cleanup_workspace_staged_file(temp_path)
+    except WorkspaceStagingCleanupError as exc:
+        errors.append(str(exc))
+    if errors:
+        raise WorkspaceStagingCleanupError("; ".join(errors)) from cause
+
+
+def _close_workspace_stage_fd(stage_fd: int) -> None:
+    try:
+        os.close(stage_fd)
+    except OSError as exc:
+        raise WorkspaceStagingCleanupError(
+            f"script staging descriptor cleanup failed ({type(exc).__name__})"
+        ) from exc
 
 
 async def _terminate_workspace_worker_uninterruptibly(
     proc: asyncio.subprocess.Process,
+    *,
+    supervisor: WorkspaceWorkerSupervisor,
 ) -> None:
     async def terminate() -> None:
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
-        with contextlib.suppress(asyncio.TimeoutError):
+        wait_task = asyncio.create_task(proc.wait())
+        try:
             await asyncio.wait_for(
-                proc.wait(), timeout=_WORKSPACE_WORKER_CLEANUP_SECONDS
+                asyncio.shield(wait_task),
+                timeout=_WORKSPACE_WORKER_CLEANUP_SECONDS,
             )
+        except asyncio.TimeoutError:
+            supervisor.track(wait_task)
 
     terminate_task = asyncio.create_task(terminate())
     while True:
@@ -517,8 +992,21 @@ class DockerSandboxRunner:
             raise ValueError("cleanup_timeout_seconds must be positive")
         self._docker = docker
         self._cleanup_timeout_seconds = cleanup_timeout_seconds
+        self._workspace_workers = WorkspaceWorkerSupervisor()
+        self._lifecycle = AsyncResourceLifecycle("sandbox runner")
+        self._resources_closed = False
 
     async def run(self, spec: SandboxSpec) -> SandboxResult:
+        try:
+            self._lifecycle.enter()
+        except RuntimeError as exc:
+            raise SandboxError("sandbox runner is closed") from exc
+        try:
+            return await self._run(spec)
+        finally:
+            self._lifecycle.exit()
+
+    async def _run(self, spec: SandboxSpec) -> SandboxResult:
         if shutil.which(self._docker) is None:
             raise SandboxError(
                 f"'{self._docker}' not found on PATH — the Local tier needs "
@@ -527,6 +1015,17 @@ class DockerSandboxRunner:
         name = f"ravana-ci-{_short_id()}"
         startup_marker = f"ravana-started-{uuid.uuid4().hex}"
         return await self._run_container(spec, name, startup_marker)
+
+    async def aclose(self) -> None:
+        await self._lifecycle.aclose(
+            timeout_seconds=self._cleanup_timeout_seconds
+        )
+        if self._resources_closed:
+            return
+        await self._workspace_workers.aclose(
+            timeout_seconds=self._cleanup_timeout_seconds
+        )
+        self._resources_closed = True
 
     async def _run_container(
         self, spec: SandboxSpec, name: str, startup_marker: str
@@ -540,6 +1039,7 @@ class DockerSandboxRunner:
                     _MIN_WORKSPACE_SCAN_TIMEOUT_SECONDS,
                     spec.limits.timeout_seconds,
                 ),
+                supervisor=self._workspace_workers,
             )
         except asyncio.CancelledError as exc:
             # A caller can safely retry because container provisioning has not
@@ -968,6 +1468,19 @@ class DockerSandboxRunner:
             if not done:
                 if await self._stop_task(workspace_monitor):
                     raise asyncio.CancelledError
+                if not workspace_monitor.cancelled():
+                    violation = workspace_monitor.result()
+                    cleanup_started = True
+                    return await self._finish_workspace_violation(
+                        proc,
+                        process_waiter,
+                        name,
+                        readers,
+                        stdout,
+                        stderr,
+                        startup_marker,
+                        violation,
+                    )
                 cleanup_started = True
                 return await self._finish_timeout(
                     spec,
@@ -983,32 +1496,32 @@ class DockerSandboxRunner:
             if workspace_monitor in done:
                 violation = workspace_monitor.result()
                 cleanup_started = True
-                cleanup_error, output_error, was_cancelled = (
-                    await self._finish_uninterruptibly(
-                        proc, process_waiter, name, readers
-                    )
-                )
-                errors = [
-                    error for error in (cleanup_error, output_error) if error
-                ]
-                if was_cancelled:
-                    cancel_error = asyncio.CancelledError()
-                    if errors:
-                        cancel_error.add_note(
-                            f"sandbox quota cleanup failed: {'; '.join(errors)}"
-                        )
-                    raise cancel_error
-                if errors or violation.measurement_failed:
-                    detail = "; ".join([violation.message, *errors])
-                    raise SandboxOutcomeUnknown(
-                        f"sandbox workspace enforcement failed: {detail}"
-                    )
-                return self._workspace_limit_result(
-                    stdout, stderr, startup_marker, violation.message
+                return await self._finish_workspace_violation(
+                    proc,
+                    process_waiter,
+                    name,
+                    readers,
+                    stdout,
+                    stderr,
+                    startup_marker,
+                    violation,
                 )
 
             if await self._stop_task(workspace_monitor):
                 raise asyncio.CancelledError
+            if not workspace_monitor.cancelled():
+                violation = workspace_monitor.result()
+                cleanup_started = True
+                return await self._finish_workspace_violation(
+                    proc,
+                    process_waiter,
+                    name,
+                    readers,
+                    stdout,
+                    stderr,
+                    startup_marker,
+                    violation,
+                )
         except asyncio.CancelledError as exc:
             await self._stop_task(workspace_monitor)
             if not cleanup_started:
@@ -1115,6 +1628,7 @@ class DockerSandboxRunner:
                 max_bytes=spec.limits.workspace_bytes,
                 max_files=spec.limits.workspace_files,
                 timeout_seconds=self._remaining(terminal_deadline),
+                supervisor=self._workspace_workers,
             )
         except asyncio.CancelledError:
             raise
@@ -1355,6 +1869,41 @@ class DockerSandboxRunner:
             )
         return False
 
+    async def _finish_workspace_violation(
+        self,
+        proc: asyncio.subprocess.Process,
+        process_waiter: asyncio.Task[int],
+        name: str,
+        readers: tuple[asyncio.Task[None], ...],
+        stdout: _BoundedOutput,
+        stderr: _BoundedOutput,
+        startup_marker: str,
+        violation: WorkspaceViolation,
+    ) -> SandboxResult:
+        cleanup_error, output_error, was_cancelled = (
+            await self._finish_uninterruptibly(
+                proc, process_waiter, name, readers
+            )
+        )
+        errors = [
+            error for error in (cleanup_error, output_error) if error
+        ]
+        if was_cancelled:
+            cancel_error = asyncio.CancelledError()
+            if errors:
+                cancel_error.add_note(
+                    f"sandbox quota cleanup failed: {'; '.join(errors)}"
+                )
+            raise cancel_error
+        if errors or violation.measurement_failed:
+            detail = "; ".join([violation.message, *errors])
+            raise SandboxOutcomeUnknown(
+                f"sandbox workspace enforcement failed: {detail}"
+            )
+        return self._workspace_limit_result(
+            stdout, stderr, startup_marker, violation.message
+        )
+
     @staticmethod
     def _workspace_limit_result(
         stdout: _BoundedOutput,
@@ -1371,14 +1920,16 @@ class DockerSandboxRunner:
             ),
         )
 
-    @staticmethod
-    async def _watch_workspace(spec: SandboxSpec) -> WorkspaceViolation:
+    async def _watch_workspace(
+        self, spec: SandboxSpec
+    ) -> WorkspaceViolation:
         try:
             violation = await _workspace_violation_in_worker(
                 spec.workspace,
                 max_bytes=spec.limits.workspace_bytes,
                 max_files=spec.limits.workspace_files,
                 timeout_seconds=None,
+                supervisor=self._workspace_workers,
                 watch=True,
             )
         except Exception as exc:  # pragma: no cover - defensive executor boundary

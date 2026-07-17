@@ -29,7 +29,6 @@ import contextlib
 import fcntl
 import os
 import stat
-import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -41,6 +40,7 @@ from ravana.runtime.toolkits.base import (
     ToolOutcomeUnknown,
 )
 from ravana.runtime.toolkits.sandbox import (
+    AsyncResourceLifecycle,
     DockerSandboxRunner,
     SandboxCancelledBeforeStart,
     SandboxError,
@@ -49,8 +49,15 @@ from ravana.runtime.toolkits.sandbox import (
     SandboxRunner,
     SandboxSpec,
     SandboxOutcomeUnknown,
+    WorkspaceStagingCleanupError,
+    WorkspaceStagingError,
+    WorkspaceWorkerSupervisor,
+    cleanup_workspace_staged_file,
+    stage_workspace_script_async,
     workspace_capacity_violation_async,
 )
+
+_SCRIPT_SIZE_CHUNK_CHARACTERS = 64 * 1024
 
 INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -77,6 +84,7 @@ _MAX_TIMEOUT_S = 300
 _MAX_WORKSPACE_MB = 8192
 _MAX_WORKSPACE_FILES = 100_000
 _WORKSPACE_LOCK_POLL_SECONDS = 0.02
+_WORKSPACE_WORKER_CLOSE_SECONDS = 1.0
 
 
 class CodeInterpreterHandler:
@@ -117,6 +125,11 @@ class CodeInterpreterHandler:
         )
         self._runs_dir = runs_dir
         self._runner = runner or DockerSandboxRunner(docker=sandbox_executable)
+        self._workspace_workers = WorkspaceWorkerSupervisor()
+        self._lifecycle = AsyncResourceLifecycle(
+            "code_interpreter handler"
+        )
+        self._resources_closed = False
         self.description = (
             f"Execute code in an isolated {runtime} sandbox (no network, workspace-only filesystem). "
             "Provide 'code'; optional 'filename' (a bare name) and 'args'. Returns exit code, stdout and stderr."
@@ -128,6 +141,29 @@ class CodeInterpreterHandler:
         return True
 
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str) -> str:
+        try:
+            self._lifecycle.enter()
+        except RuntimeError as exc:
+            raise ToolkitError(
+                "code_interpreter handler is closed",
+                kind=ToolFailureKind.FATAL,
+            ) from exc
+        try:
+            return await self._call(
+                arguments=arguments,
+                idempotency_key=idempotency_key,
+                run_id=run_id,
+            )
+        finally:
+            self._lifecycle.exit()
+
+    async def _call(
+        self,
+        *,
+        arguments: dict[str, Any],
+        idempotency_key: str,
+        run_id: str,
+    ) -> str:
         workspace = self._workspace_for(run_id)
         filename = _safe_filename(arguments.get("filename"), self._default_filename)
         args = [str(a) for a in arguments.get("args", [])]
@@ -145,6 +181,7 @@ class CodeInterpreterHandler:
                 filename,
                 str(arguments["code"]),
                 limits=self._limits,
+                supervisor=self._workspace_workers,
             )
             try:
                 result = await self._runner.run(spec)
@@ -163,7 +200,28 @@ class CodeInterpreterHandler:
         return _format_result(result)
 
     async def aclose(self) -> None:
-        return None
+        await self._lifecycle.aclose(
+            timeout_seconds=_WORKSPACE_WORKER_CLOSE_SECONDS
+        )
+        if self._resources_closed:
+            return
+        first_error: Exception | None = None
+        try:
+            await self._workspace_workers.aclose(
+                timeout_seconds=_WORKSPACE_WORKER_CLOSE_SECONDS
+            )
+        except Exception as exc:
+            first_error = exc
+
+        close_runner = getattr(self._runner, "aclose", None)
+        if close_runner is not None:
+            try:
+                await close_runner()
+            except Exception as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+        self._resources_closed = True
 
     def _workspace_for(self, run_id: str) -> Path:
         if self._runs_dir is None:
@@ -218,19 +276,36 @@ async def _write_script(
     code: str,
     *,
     limits: SandboxLimits,
+    supervisor: WorkspaceWorkerSupervisor,
 ) -> None:
-    encoded = code.encode("utf-8")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + limits.timeout_seconds
     try:
+        encoded_size = await _utf8_size(
+            code,
+            stop_after_bytes=limits.workspace_bytes,
+            deadline=deadline,
+        )
         violation = await workspace_capacity_violation_async(
             workspace,
             limits=limits,
-            additional_bytes=len(encoded),
+            additional_bytes=encoded_size,
             additional_files=1,
-            timeout_seconds=limits.timeout_seconds,
+            timeout_seconds=max(0.0, deadline - loop.time()),
+            supervisor=supervisor,
         )
     except asyncio.CancelledError as exc:
         raise ToolRetrySafeCancellation(
             "code_interpreter cancelled during workspace measurement"
+        ) from exc
+    except asyncio.TimeoutError as exc:
+        raise ToolkitError(
+            "code_interpreter: script preparation exceeded its deadline",
+            kind=ToolFailureKind.TRANSIENT,
+        ) from exc
+    except WorkspaceStagingCleanupError as exc:
+        raise ToolOutcomeUnknown(
+            f"code_interpreter workspace worker cleanup failed: {exc}"
         ) from exc
 
     if violation is not None:
@@ -243,12 +318,80 @@ async def _write_script(
             f"code_interpreter: {violation.message}", kind=kind
         )
 
-    current_task = asyncio.current_task()
-    if current_task is not None and current_task.cancelling():
+    temp_path: Path | None = None
+    try:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise WorkspaceStagingError(
+                "script staging worker exceeded its deadline"
+            )
+        temp_path = await stage_workspace_script_async(
+            workspace,
+            code,
+            timeout_seconds=remaining,
+            supervisor=supervisor,
+        )
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            raise asyncio.CancelledError
+
+        staged_stat = temp_path.lstat()
+        if (
+            not stat.S_ISREG(staged_stat.st_mode)
+            or staged_stat.st_size != encoded_size
+        ):
+            raise WorkspaceStagingError(
+                "script staging worker returned an invalid file"
+            )
+        os.replace(temp_path, workspace / filename)
+        temp_path = None
+    except asyncio.CancelledError as exc:
         raise ToolRetrySafeCancellation(
             "code_interpreter cancelled before script publication"
-        )
-    _publish_script(workspace, filename, encoded)
+        ) from exc
+    except WorkspaceStagingCleanupError as exc:
+        raise ToolOutcomeUnknown(
+            f"code_interpreter script cleanup failed: {exc}"
+        ) from exc
+    except WorkspaceStagingError as exc:
+        raise ToolkitError(
+            f"code_interpreter: unable to prepare the script ({exc})",
+            kind=ToolFailureKind.TRANSIENT,
+        ) from exc
+    except OSError as exc:
+        raise ToolkitError(
+            "code_interpreter: unable to prepare the script "
+            f"({type(exc).__name__})",
+            kind=ToolFailureKind.TRANSIENT,
+        ) from exc
+    finally:
+        if temp_path is not None:
+            try:
+                cleanup_workspace_staged_file(temp_path)
+            except WorkspaceStagingCleanupError as exc:
+                raise ToolOutcomeUnknown(
+                    f"code_interpreter script cleanup failed: {exc}"
+                ) from exc
+
+
+async def _utf8_size(
+    value: str,
+    *,
+    stop_after_bytes: int,
+    deadline: float,
+) -> int:
+    """Count UTF-8 bytes in bounded chunks without monopolizing the loop."""
+    total = 0
+    loop = asyncio.get_running_loop()
+    for offset in range(0, len(value), _SCRIPT_SIZE_CHUNK_CHARACTERS):
+        if loop.time() >= deadline:
+            raise asyncio.TimeoutError
+        chunk = value[offset : offset + _SCRIPT_SIZE_CHUNK_CHARACTERS]
+        total += len(chunk.encode("utf-8"))
+        if total > stop_after_bytes:
+            return total
+        await asyncio.sleep(0)
+    return total
 
 
 @contextlib.asynccontextmanager
@@ -302,30 +445,6 @@ async def _workspace_execution_lock(
                     fcntl.flock(fd, fcntl.LOCK_UN)
             with contextlib.suppress(OSError):
                 os.close(fd)
-
-
-def _publish_script(workspace: Path, filename: str, encoded: bytes) -> None:
-    """Atomically replace the destination while the quota lock is held."""
-
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=workspace,
-            prefix=".ravana-script-",
-            delete=False,
-        ) as temp_file:
-            temp_path = Path(temp_file.name)
-            temp_file.write(encoded)
-        os.replace(temp_path, workspace / filename)
-        temp_path = None
-    except OSError as exc:
-        raise ToolkitError(
-            f"code_interpreter: unable to prepare the script ({type(exc).__name__})"
-        ) from exc
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
 
 
 def _safe_filename(raw: Any, default: str) -> str:

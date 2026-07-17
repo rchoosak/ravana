@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import multiprocessing
 import os
 import shlex
+import signal
 import sys
 import threading
 import time
@@ -117,6 +119,87 @@ def _capture_toolkit_outcome(call, *args):
         return call(*args)
     except ToolkitError as exc:
         return exc
+
+
+async def _wait_for_pid_file(
+    pid_file,
+    task: asyncio.Task,
+    *,
+    timeout_seconds: float = 0.5,
+) -> int:
+    async def wait_until_ready() -> int:
+        while True:
+            try:
+                worker_pid = int(pid_file.read_text())
+            except (FileNotFoundError, OSError, ValueError):
+                worker_pid = 0
+            if worker_pid > 0:
+                return worker_pid
+            if task.done():
+                await task
+                raise AssertionError("task completed before its worker became ready")
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(
+        wait_until_ready(), timeout=timeout_seconds
+    )
+
+
+async def _await_task_with_hard_timeout(
+    task: asyncio.Task,
+    *,
+    timeout_seconds: float,
+    emergency_pid: int | None = None,
+):
+    done, _ = await asyncio.wait({task}, timeout=timeout_seconds)
+    if task not in done:
+        if emergency_pid is not None:
+            try:
+                os.kill(emergency_pid, 9)
+            except ProcessLookupError:
+                pass
+        task.cancel()
+        await asyncio.wait({task}, timeout=0.2)
+        raise AssertionError(
+            f"task did not finish within {timeout_seconds} seconds"
+        )
+    return await task
+
+
+def _run_async_scenario_in_killable_process(
+    scenario,
+    *,
+    timeout_seconds: float = 3.0,
+) -> None:
+    def force_stop() -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            if process.is_alive():
+                process.kill()
+        process.join(1)
+        if process.is_alive():
+            process.kill()
+            process.join(1)
+
+    def run() -> None:
+        os.setsid()
+        asyncio.run(scenario())
+
+    process = multiprocessing.get_context("fork").Process(target=run)
+    process.start()
+    process.join(timeout_seconds)
+    if process.is_alive():
+        force_stop()
+        assert not process.is_alive()
+        raise AssertionError(
+            f"async scenario exceeded {timeout_seconds} seconds"
+        )
+    if process.exitcode != 0:
+        force_stop()
+        raise AssertionError(
+            f"async scenario process exited {process.exitcode}"
+        )
 
 
 def test_writes_code_into_the_run_workspace_and_runs_it(tmp_path):
@@ -266,6 +349,230 @@ def test_script_over_workspace_quota_is_rejected_before_host_write(tmp_path):
     assert runner.spec is None
 
 
+def test_cancellation_during_script_staging_is_bounded_and_never_publishes(
+    tmp_path, monkeypatch
+):
+    pid_file = tmp_path / "script-stage.pid"
+
+    def stalled_stage_worker_argv(temp_path):
+        return [
+            sys.executable,
+            "-c",
+            (
+                "import os, pathlib, time, sys; "
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                "time.sleep(60)"
+            ),
+            str(pid_file),
+        ]
+
+    monkeypatch.setattr(
+        sandbox_module, "_script_stage_worker_argv", stalled_stage_worker_argv
+    )
+
+    async def scenario() -> None:
+        workspace = tmp_path / "r" / "workspace"
+        workspace.mkdir(parents=True)
+        destination = workspace / "main.py"
+        destination.write_text("old")
+        runner = FakeRunner()
+        task = asyncio.create_task(
+            _handler(tmp_path, runner=runner).call(
+                arguments={"code": "x" * (4 * 1024 * 1024)},
+                idempotency_key="cancelled-stage",
+                run_id="r",
+            )
+        )
+        worker_pid = await _wait_for_pid_file(pid_file, task)
+
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=0.1)
+
+        task.cancel()
+        with pytest.raises(ToolRetrySafeCancellation):
+            await _await_task_with_hard_timeout(
+                task,
+                timeout_seconds=0.5,
+                emergency_pid=worker_pid,
+            )
+
+        assert runner.spec is None
+        assert destination.read_text() == "old"
+        assert list(workspace.glob(".ravana-script-*")) == []
+        with pytest.raises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+
+    _run_async_scenario_in_killable_process(scenario)
+
+
+def test_cancelled_late_stage_spawn_cannot_mutate_workspace_after_unlock(
+    tmp_path, monkeypatch
+):
+    async def capacity_available(*args, **kwargs):
+        return None
+
+    real_spawn = sandbox_module._create_workspace_subprocess_exec
+
+    async def scenario() -> None:
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+
+        async def delayed_spawn(*args, **kwargs):
+            spawn_started.set()
+            await release_spawn.wait()
+            return await real_spawn(*args, **kwargs)
+
+        monkeypatch.setattr(
+            code_interpreter_module,
+            "workspace_capacity_violation_async",
+            capacity_available,
+        )
+        monkeypatch.setattr(
+            sandbox_module,
+            "_create_workspace_subprocess_exec",
+            delayed_spawn,
+        )
+        workspace = tmp_path / "r" / "workspace"
+        workspace.mkdir(parents=True)
+        destination = workspace / "main.py"
+        destination.write_text("old")
+        handler = _handler(tmp_path, runner=FakeRunner())
+        task = asyncio.create_task(
+            handler.call(
+                arguments={"code": "print('new')"},
+                idempotency_key="late-stage",
+                run_id="r",
+            )
+        )
+        await asyncio.wait_for(spawn_started.wait(), timeout=0.2)
+
+        try:
+            task.cancel()
+            with pytest.raises(ToolRetrySafeCancellation):
+                await _await_task_with_hard_timeout(
+                    task, timeout_seconds=0.5
+                )
+
+            assert destination.read_text() == "old"
+            assert list(workspace.glob(".ravana-script-*")) == []
+        finally:
+            release_spawn.set()
+            await handler.aclose()
+
+        assert destination.read_text() == "old"
+        assert list(workspace.glob(".ravana-script-*")) == []
+
+    _run_async_scenario_in_killable_process(scenario)
+
+
+def test_script_cleanup_failure_is_outcome_unknown(tmp_path, monkeypatch):
+    runner = FakeRunner()
+    handler = _handler(tmp_path, runner=runner)
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("forced replace failure")
+
+    def fail_cleanup(temp_path):
+        raise sandbox_module.WorkspaceStagingCleanupError(
+            "forced cleanup failure"
+        )
+
+    monkeypatch.setattr(code_interpreter_module.os, "replace", fail_replace)
+    monkeypatch.setattr(
+        code_interpreter_module,
+        "cleanup_workspace_staged_file",
+        fail_cleanup,
+    )
+
+    with pytest.raises(ToolOutcomeUnknown, match="cleanup failed"):
+        asyncio.run(
+            handler.call(
+                arguments={"code": "print(1)"},
+                idempotency_key="cleanup-failure",
+                run_id="r",
+            )
+        )
+
+    workspace = tmp_path / "r" / "workspace"
+    assert runner.spec is None
+    staged_files = list(workspace.glob(".ravana-script-*"))
+    assert len(staged_files) == 1
+    staged_files[0].unlink()
+
+
+def test_unexpected_stage_spawn_failure_closes_fd_and_removes_temp(
+    tmp_path, monkeypatch
+):
+    async def capacity_available(*args, **kwargs):
+        return None
+
+    async def fail_spawn(*args, **kwargs):
+        raise RuntimeError("forced spawn failure")
+
+    monkeypatch.setattr(
+        code_interpreter_module,
+        "workspace_capacity_violation_async",
+        capacity_available,
+    )
+    monkeypatch.setattr(
+        sandbox_module,
+        "_create_workspace_subprocess_exec",
+        fail_spawn,
+    )
+    runner = FakeRunner()
+
+    with pytest.raises(ToolkitError, match="failed to start"):
+        asyncio.run(
+            _handler(tmp_path, runner=runner).call(
+                arguments={"code": "print(1)"},
+                idempotency_key="unexpected-spawn",
+                run_id="r",
+            )
+        )
+
+    workspace = tmp_path / "r" / "workspace"
+    assert runner.spec is None
+    assert list(workspace.glob(".ravana-script-*")) == []
+
+
+def test_stage_fd_cleanup_failure_is_outcome_unknown(
+    tmp_path, monkeypatch
+):
+    captured_fds: list[int] = []
+
+    def fail_close(stage_fd):
+        captured_fds.append(stage_fd)
+        raise sandbox_module.WorkspaceStagingCleanupError(
+            "forced descriptor cleanup failure"
+        )
+
+    monkeypatch.setattr(
+        sandbox_module, "_close_workspace_stage_fd", fail_close
+    )
+    runner = FakeRunner()
+
+    try:
+        with pytest.raises(ToolOutcomeUnknown, match="cleanup failed"):
+            asyncio.run(
+                _handler(tmp_path, runner=runner).call(
+                    arguments={"code": "print(1)"},
+                    idempotency_key="fd-cleanup-failure",
+                    run_id="r",
+                )
+            )
+    finally:
+        for stage_fd in captured_fds:
+            try:
+                os.close(stage_fd)
+            except OSError:
+                pass
+
+    workspace = tmp_path / "r" / "workspace"
+    assert runner.spec is None
+    assert list(workspace.glob(".ravana-script-*")) == []
+
+
 def test_parallel_script_publication_cannot_overcommit_workspace(
     tmp_path, monkeypatch
 ):
@@ -275,6 +582,7 @@ def test_parallel_script_publication_cannot_overcommit_workspace(
 
     def concurrent_capacity_check_sync(*args, **kwargs):
         kwargs.pop("timeout_seconds")
+        kwargs.pop("supervisor")
         for barrier in (before_scan,):
             try:
                 barrier.wait(timeout=0.2)
@@ -447,22 +755,22 @@ def test_cancellation_during_workspace_scan_is_bounded_and_does_not_publish(
                 run_id="r",
             )
         )
-        while not pid_file.exists():
-            await asyncio.sleep(0.01)
-        worker_pid = int(pid_file.read_text())
+        worker_pid = await _wait_for_pid_file(pid_file, task)
 
-        started = time.monotonic()
         task.cancel()
         with pytest.raises(ToolRetrySafeCancellation):
-            await task
+            await _await_task_with_hard_timeout(
+                task,
+                timeout_seconds=0.5,
+                emergency_pid=worker_pid,
+            )
 
-        assert time.monotonic() - started < 0.5
         assert runner.spec is None
         assert not (tmp_path / "r" / "workspace" / "main.py").exists()
         with pytest.raises(ProcessLookupError):
             os.kill(worker_pid, 0)
 
-    asyncio.run(scenario())
+    _run_async_scenario_in_killable_process(scenario)
 
 
 def test_default_limits(tmp_path):
@@ -578,12 +886,14 @@ def test_prestart_cancellation_marks_invocation_retryable(con, tmp_path, monkeyp
                 idempotency_key="cancel-key",
             )
         )
-        while not pid_file.exists():
-            await asyncio.sleep(0.01)
-        worker_pid = int(pid_file.read_text())
+        worker_pid = await _wait_for_pid_file(pid_file, task)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await _await_task_with_hard_timeout(
+                task,
+                timeout_seconds=0.5,
+                emergency_pid=worker_pid,
+            )
         with pytest.raises(ProcessLookupError):
             os.kill(worker_pid, 0)
 
@@ -610,7 +920,7 @@ def test_prestart_cancellation_marks_invocation_retryable(con, tmp_path, monkeyp
         assert "retried" in result
         assert retry_runner.spec is not None
 
-    asyncio.run(scenario())
+    _run_async_scenario_in_killable_process(scenario)
 
 
 def test_nonzero_exit_and_timeout_are_results_not_exceptions(tmp_path):
@@ -786,6 +1096,40 @@ def test_runner_creates_container_before_starting_agent_code(tmp_path, monkeypat
 
         assert result.exit_code == 0
         assert commands[:2] == ["create", "start"]
+
+    asyncio.run(scenario())
+
+
+def test_runner_close_cannot_finish_while_an_admitted_run_continues(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        runner = DockerSandboxRunner(
+            docker=sys.executable, cleanup_timeout_seconds=0.01
+        )
+        run_started = asyncio.Event()
+        release_run = asyncio.Event()
+
+        async def delayed_run(*args, **kwargs):
+            run_started.set()
+            await release_run.wait()
+            return SandboxResult(exit_code=0, stdout="", stderr="")
+
+        monkeypatch.setattr(runner, "_run_container", delayed_run)
+        run_task = asyncio.create_task(runner.run(_spec(tmp_path)))
+        await asyncio.wait_for(run_started.wait(), timeout=0.2)
+
+        with pytest.raises(TimeoutError, match="did not finish"):
+            await runner.aclose()
+        assert not run_task.done()
+
+        release_run.set()
+        result = await asyncio.wait_for(run_task, timeout=0.2)
+        assert result.exit_code == 0
+        await runner.aclose()
+
+        with pytest.raises(SandboxError, match="closed"):
+            await runner.run(_spec(tmp_path))
 
     asyncio.run(scenario())
 
@@ -1056,6 +1400,79 @@ def test_cancellation_during_workspace_monitor_shutdown_is_not_swallowed(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "process_exited",
+    [True, False],
+    ids=["process-exit", "run-timeout"],
+)
+def test_workspace_violation_winning_during_monitor_stop_is_not_discarded(
+    tmp_path, monkeypatch, process_exited
+):
+    async def scenario() -> None:
+        startup_marker = "ravana-started-monitor-race"
+        run_process = _ControlledProcess(
+            exit_code=0 if process_exited else None,
+            stderr=f"{startup_marker}\n",
+        )
+        runner = DockerSandboxRunner(
+            docker=sys.executable, cleanup_timeout_seconds=0.2
+        )
+        release_monitor = asyncio.Event()
+        real_stop_task = runner._stop_task
+
+        async def monitor(spec):
+            await release_monitor.wait()
+            return sandbox_module.WorkspaceViolation(
+                "workspace byte limit exceeded (2048 > 1024)"
+            )
+
+        async def stop_after_monitor_completes(task):
+            release_monitor.set()
+            await asyncio.sleep(0)
+            return await real_stop_task(task)
+
+        async def finish_without_external_cleanup(*args, **kwargs):
+            return None, None, False
+
+        async def verify_absent(*args, **kwargs):
+            return None, False
+
+        async def clean_final_scan(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(runner, "_watch_workspace", monitor)
+        monkeypatch.setattr(runner, "_stop_task", stop_after_monitor_completes)
+        monkeypatch.setattr(
+            runner, "_finish_uninterruptibly", finish_without_external_cleanup
+        )
+        monkeypatch.setattr(
+            runner, "_verify_attached_exit_uninterruptibly", verify_absent
+        )
+        monkeypatch.setattr(
+            sandbox_module, "_workspace_violation_in_worker", clean_final_scan
+        )
+
+        result = await runner._run_spawned_process(
+            _spec(
+                tmp_path,
+                limits=SandboxLimits(
+                    workspace_bytes=1024, workspace_files=100
+                ),
+            ),
+            run_process,
+            _FAKE_CONTAINER_ID,
+            startup_marker,
+            asyncio.get_running_loop().time() + (
+                1 if process_exited else 0
+            ),
+        )
+
+        assert result.exit_code == 122
+        assert "workspace byte limit exceeded" in result.stderr
+
+    asyncio.run(scenario())
+
+
 def test_initial_workspace_scan_is_deadline_bounded_before_container_creation(
     tmp_path, monkeypatch
 ):
@@ -1123,6 +1540,7 @@ def test_workspace_scan_communication_failure_kills_and_reaps_worker(
 
     async def scenario() -> None:
         worker = BrokenWorkerProcess()
+        supervisor = sandbox_module.WorkspaceWorkerSupervisor()
 
         async def spawn_worker(*args, **kwargs):
             return worker
@@ -1137,6 +1555,7 @@ def test_workspace_scan_communication_failure_kills_and_reaps_worker(
             max_bytes=1024,
             max_files=10,
             timeout_seconds=0.2,
+            supervisor=supervisor,
         )
 
         assert violation is not None
@@ -1144,6 +1563,172 @@ def test_workspace_scan_communication_failure_kills_and_reaps_worker(
         assert "RuntimeError" in violation.message
         assert worker.kill_called is True
         assert worker.wait_called is True
+        await supervisor.aclose(timeout_seconds=0.2)
+
+    asyncio.run(scenario())
+
+
+def test_delayed_workspace_worker_spawn_cleanup_is_tracked_and_reaped(
+    monkeypatch,
+):
+    class LateWorker:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.kill_called = False
+            self.reaped = asyncio.Event()
+
+        def kill(self) -> None:
+            self.kill_called = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.reaped.set()
+            return self.returncode
+
+    async def scenario() -> None:
+        release_spawn = asyncio.Event()
+        worker = LateWorker()
+        supervisor = sandbox_module.WorkspaceWorkerSupervisor()
+
+        async def delayed_spawn():
+            await release_spawn.wait()
+            return worker
+
+        spawn_task = asyncio.create_task(delayed_spawn())
+        sandbox_module._schedule_workspace_worker_spawn_cleanup(
+            spawn_task, supervisor=supervisor
+        )
+
+        assert supervisor.pending_count == 1
+        with pytest.raises(
+            sandbox_module.WorkspaceStagingCleanupError,
+            match="did not finish",
+        ):
+            await supervisor.aclose(timeout_seconds=0.01)
+        release_spawn.set()
+        await asyncio.wait_for(worker.reaped.wait(), timeout=0.2)
+        await supervisor.aclose(timeout_seconds=0.2)
+
+        assert worker.kill_called is True
+        assert supervisor.pending_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_workspace_worker_wait_continues_after_foreground_cleanup_deadline(
+    monkeypatch,
+):
+    class SlowReapWorker:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.kill_called = False
+            self.wait_started = asyncio.Event()
+            self.release_wait = asyncio.Event()
+            self.reaped = asyncio.Event()
+
+        def kill(self) -> None:
+            self.kill_called = True
+
+        async def wait(self):
+            self.wait_started.set()
+            await self.release_wait.wait()
+            self.returncode = -9
+            self.reaped.set()
+            return self.returncode
+
+    async def scenario() -> None:
+        worker = SlowReapWorker()
+        supervisor = sandbox_module.WorkspaceWorkerSupervisor()
+        monkeypatch.setattr(
+            sandbox_module, "_WORKSPACE_WORKER_CLEANUP_SECONDS", 0.01
+        )
+
+        await sandbox_module._terminate_workspace_worker_uninterruptibly(
+            worker, supervisor=supervisor
+        )
+
+        assert worker.kill_called is True
+        assert worker.wait_started.is_set()
+        assert supervisor.pending_count == 1
+
+        worker.release_wait.set()
+        await asyncio.wait_for(worker.reaped.wait(), timeout=0.2)
+        await supervisor.aclose(timeout_seconds=0.2)
+
+        assert supervisor.pending_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_workspace_worker_background_cleanup_error_surfaces_on_close(
+    tmp_path, monkeypatch
+):
+    class FinishedWorker:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.reaped = asyncio.Event()
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self):
+            self.reaped.set()
+            return self.returncode
+
+    async def scenario() -> None:
+        worker = FinishedWorker()
+        supervisor = sandbox_module.WorkspaceWorkerSupervisor()
+        cleanup_path = tmp_path / ".ravana-script-test"
+        cleanup_path.write_text("stale")
+
+        async def spawn_worker():
+            return worker
+
+        def fail_cleanup(temp_path):
+            raise sandbox_module.WorkspaceStagingCleanupError(
+                "forced cleanup failure"
+            )
+
+        monkeypatch.setattr(
+            sandbox_module,
+            "cleanup_workspace_staged_file",
+            fail_cleanup,
+        )
+        sandbox_module._schedule_workspace_worker_spawn_cleanup(
+            asyncio.create_task(spawn_worker()),
+            supervisor=supervisor,
+            cleanup_path=cleanup_path,
+        )
+        await asyncio.wait_for(worker.reaped.wait(), timeout=0.2)
+
+        with pytest.raises(
+            sandbox_module.WorkspaceStagingCleanupError,
+            match="cleanup failed",
+        ):
+            await supervisor.aclose(timeout_seconds=0.2)
+
+    asyncio.run(scenario())
+
+
+def test_workspace_worker_supervisor_rejects_work_after_close():
+    async def scenario() -> None:
+        supervisor = sandbox_module.WorkspaceWorkerSupervisor()
+        await supervisor.aclose(timeout_seconds=0.1)
+
+        with pytest.raises(
+            sandbox_module.WorkspaceStagingCleanupError,
+            match="closed",
+        ):
+            supervisor.begin_operation()
+
+        late_task = asyncio.create_task(asyncio.sleep(0))
+        with pytest.raises(
+            sandbox_module.WorkspaceStagingCleanupError,
+            match="closed",
+        ):
+            supervisor.track(late_task)
+        await asyncio.sleep(0)
+        assert late_task.cancelled()
 
     asyncio.run(scenario())
 
@@ -1420,13 +2005,18 @@ def test_cancelling_runner_cleans_up_the_started_process(tmp_path):
                 _spec(tmp_path)
             )
         )
-        while not pid_file.exists():
-            await asyncio.sleep(0.01)
+        worker_pid = await _wait_for_pid_file(
+            pid_file, task, timeout_seconds=1.0
+        )
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await _await_task_with_hard_timeout(
+                task,
+                timeout_seconds=0.5,
+                emergency_pid=worker_pid,
+            )
 
-    asyncio.run(cancel_started_runner())
+    _run_async_scenario_in_killable_process(cancel_started_runner)
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_file.read_text()), 0)
 
@@ -1493,7 +2083,7 @@ def test_repeated_cancellation_during_spawn_still_cleans_up_the_created_process(
             await task
         assert run_process.terminated
 
-    asyncio.run(scenario())
+    _run_async_scenario_in_killable_process(scenario)
 
 
 def test_timeout_before_launcher_start_is_transient(tmp_path, monkeypatch):
@@ -1783,10 +2373,12 @@ def test_second_cancellation_cannot_interrupt_cleanup(tmp_path, monkeypatch):
 
         release_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=1)
+            await _await_task_with_hard_timeout(
+                task, timeout_seconds=1
+            )
         assert run_process.terminate_called
 
-    asyncio.run(scenario())
+    _run_async_scenario_in_killable_process(scenario)
 
 
 def test_cleanup_uses_one_shared_deadline(tmp_path, monkeypatch):
