@@ -6,6 +6,7 @@ SandboxRunner, so nothing here needs a Docker daemon.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import shlex
 import sys
@@ -16,8 +17,10 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import ravana.runtime.toolkits.code_interpreter as code_interpreter_module
+import ravana.runtime.toolkits.sandbox as sandbox_module
 from ravana.runtime.toolkits.base import (
     ToolFailureKind,
+    ToolRetrySafeCancellation,
     ToolkitError,
     ToolOutcomeUnknown,
 )
@@ -266,11 +269,12 @@ def test_script_over_workspace_quota_is_rejected_before_host_write(tmp_path):
 def test_parallel_script_publication_cannot_overcommit_workspace(
     tmp_path, monkeypatch
 ):
-    real_capacity_check = code_interpreter_module.workspace_capacity_violation
+    real_capacity_check = sandbox_module.workspace_capacity_violation
     before_scan = threading.Barrier(2)
     after_scan = threading.Barrier(2)
 
-    def concurrent_capacity_check(*args, **kwargs):
+    def concurrent_capacity_check_sync(*args, **kwargs):
+        kwargs.pop("timeout_seconds")
         for barrier in (before_scan,):
             try:
                 barrier.wait(timeout=0.2)
@@ -284,9 +288,14 @@ def test_parallel_script_publication_cannot_overcommit_workspace(
                 pass
         return result
 
+    async def concurrent_capacity_check(*args, **kwargs):
+        return await asyncio.to_thread(
+            concurrent_capacity_check_sync, *args, **kwargs
+        )
+
     monkeypatch.setattr(
         code_interpreter_module,
-        "workspace_capacity_violation",
+        "workspace_capacity_violation_async",
         concurrent_capacity_check,
     )
 
@@ -311,6 +320,149 @@ def test_parallel_script_publication_cannot_overcommit_workspace(
     published_bytes = sum(path.stat().st_size for path in workspace.iterdir())
     assert sum(isinstance(outcome, ToolkitError) for outcome in outcomes) == 1
     assert published_bytes <= 16 * 1024 * 1024
+
+
+def test_parallel_calls_cannot_overwrite_the_active_default_script(tmp_path):
+    class SequencedRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def run(self, spec: SandboxSpec) -> SandboxResult:
+            self.calls += 1
+            if self.calls == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            code = (spec.workspace / "main.py").read_text()
+            return SandboxResult(exit_code=0, stdout=code, stderr="")
+
+    async def scenario() -> None:
+        runner = SequencedRunner()
+        handler = _handler(tmp_path, runner=runner)
+        first = asyncio.create_task(
+            handler.call(
+                arguments={"code": "print('first')"},
+                idempotency_key="first",
+                run_id="r",
+            )
+        )
+        await runner.first_started.wait()
+        second = asyncio.create_task(
+            handler.call(
+                arguments={"code": "print('second')"},
+                idempotency_key="second",
+                run_id="r",
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        workspace = tmp_path / "r" / "workspace"
+        assert (workspace / "main.py").read_text() == "print('first')"
+
+        runner.release_first.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert "print('first')" in first_result
+        assert "print('second')" in second_result
+
+    asyncio.run(scenario())
+
+
+def test_workspace_lock_wait_is_cancellable_without_blocking_event_loop(
+    tmp_path
+):
+    workspace = tmp_path / "r" / "workspace"
+    workspace.mkdir(parents=True)
+    lock_path = workspace.parent / ".ravana-workspace.lock"
+    lock_held = threading.Event()
+
+    def hold_workspace_lock() -> None:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            lock_held.set()
+            time.sleep(0.2)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    holder = threading.Thread(target=hold_workspace_lock)
+    holder.start()
+    assert lock_held.wait(timeout=0.2)
+
+    async def scenario() -> None:
+        runner = FakeRunner()
+        task = asyncio.create_task(
+            _handler(tmp_path, runner=runner).call(
+                arguments={"code": "print(1)"},
+                idempotency_key="waiting-lock",
+                run_id="r",
+            )
+        )
+        started = time.monotonic()
+        await asyncio.sleep(0.02)
+        assert time.monotonic() - started < 0.1
+
+        task.cancel()
+        with pytest.raises(ToolRetrySafeCancellation):
+            await task
+        assert runner.spec is None
+        assert not (workspace / "main.py").exists()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        holder.join(timeout=0.5)
+    assert not holder.is_alive()
+
+
+def test_cancellation_during_workspace_scan_is_bounded_and_does_not_publish(
+    tmp_path, monkeypatch
+):
+    pid_file = tmp_path / "workspace-scan.pid"
+
+    def stalled_worker_argv(*args, **kwargs):
+        return [
+            sys.executable,
+            "-c",
+            (
+                "import os, pathlib, time, sys; "
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                "time.sleep(60)"
+            ),
+            str(pid_file),
+        ]
+
+    monkeypatch.setattr(
+        sandbox_module, "_workspace_worker_argv", stalled_worker_argv
+    )
+
+    async def scenario() -> None:
+        runner = FakeRunner()
+        task = asyncio.create_task(
+            _handler(tmp_path, runner=runner).call(
+                arguments={"code": "print(1)"},
+                idempotency_key="cancelled-scan",
+                run_id="r",
+            )
+        )
+        while not pid_file.exists():
+            await asyncio.sleep(0.01)
+        worker_pid = int(pid_file.read_text())
+
+        started = time.monotonic()
+        task.cancel()
+        with pytest.raises(ToolRetrySafeCancellation):
+            await task
+
+        assert time.monotonic() - started < 0.5
+        assert runner.spec is None
+        assert not (tmp_path / "r" / "workspace" / "main.py").exists()
+        with pytest.raises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+
+    asyncio.run(scenario())
 
 
 def test_default_limits(tmp_path):
@@ -383,13 +535,31 @@ def test_prestart_cancellation_marks_invocation_retryable(con, tmp_path, monkeyp
 
     async def scenario() -> None:
         _seed_run(con, run_id="run-cancel")
-        scan_started = asyncio.Event()
+        pid_file = tmp_path / "prestart-scan.pid"
 
-        async def block_prestart_scan(*args, **kwargs):
-            scan_started.set()
-            await asyncio.Event().wait()
+        async def capacity_available(*args, **kwargs):
+            return None
 
-        monkeypatch.setattr(asyncio, "to_thread", block_prestart_scan)
+        def stalled_worker_argv(*args, **kwargs):
+            return [
+                sys.executable,
+                "-c",
+                (
+                    "import os, pathlib, time, sys; "
+                    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                    "time.sleep(60)"
+                ),
+                str(pid_file),
+            ]
+
+        monkeypatch.setattr(
+            code_interpreter_module,
+            "workspace_capacity_violation_async",
+            capacity_available,
+        )
+        monkeypatch.setattr(
+            sandbox_module, "_workspace_worker_argv", stalled_worker_argv
+        )
         executor = RavanaToolExecutor(
             con,
             {
@@ -408,10 +578,14 @@ def test_prestart_cancellation_marks_invocation_retryable(con, tmp_path, monkeyp
                 idempotency_key="cancel-key",
             )
         )
-        await scan_started.wait()
+        while not pid_file.exists():
+            await asyncio.sleep(0.01)
+        worker_pid = int(pid_file.read_text())
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        with pytest.raises(ProcessLookupError):
+            os.kill(worker_pid, 0)
 
         row = con.execute(
             "SELECT status FROM tool_invocation WHERE idempotency_key = ?",
@@ -481,6 +655,10 @@ def _fake_docker(tmp_path, body: str):
         "    state.write_text(json.dumps(sys.argv[1:]))\n"
         f"    sys.stdout.write({container_id!r} + '\\n')\n"
         "    raise SystemExit(0)\n"
+        "if sys.argv[1] == 'rm': raise SystemExit(0)\n"
+        "if sys.argv[1] == 'container':\n"
+        "    sys.stderr.write('Error: No such object\\n')\n"
+        "    raise SystemExit(1)\n"
         "if sys.argv[1] == 'start':\n"
         "    create_args = json.loads(state.read_text())\n"
         "    sys.argv = [sys.argv[0], 'run', *create_args[1:]]\n"
@@ -593,6 +771,10 @@ def test_runner_creates_container_before_starting_agent_code(tmp_path, monkeypat
                 )
             if command in {"start", "run"}:
                 return run_process
+            if command == "container":
+                return _ControlledProcess(
+                    exit_code=1, stderr="Error: No such object"
+                )
             raise AssertionError(f"unexpected command: {command}")
 
         monkeypatch.setattr(
@@ -744,6 +926,376 @@ def test_agent_exit_125_is_a_result_and_dedupes_after_workspace_mutation(
         "SELECT status FROM tool_invocation WHERE idempotency_key = 'key-125'"
     ).fetchone()
     assert row["status"] == "SUCCEEDED"
+
+
+def test_attached_client_exit_with_live_container_is_outcome_unknown(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        run_process = _ControlledProcess(exit_code=0)
+        container_exists = True
+        cleanup_targets: list[str] = []
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            nonlocal container_exists
+            if argv[1] == "create":
+                _feed_startup_marker(argv, run_process)
+                return _created_container_process()
+            if argv[1] == "start":
+                return run_process
+            if argv[1] == "rm":
+                cleanup_targets.append(argv[-1])
+                container_exists = False
+                return _ControlledProcess(exit_code=0)
+            if container_exists:
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        with pytest.raises(SandboxOutcomeUnknown, match="container|attached"):
+            await DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.2
+            ).run(_spec(tmp_path))
+
+        assert cleanup_targets == [_FAKE_CONTAINER_ID]
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_during_terminal_output_drain_removes_container(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        run_process = _ControlledProcess(exit_code=0)
+        run_process.stderr = asyncio.StreamReader()
+        cleanup_targets: list[str] = []
+        start_returned = asyncio.Event()
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "create":
+                marker = argv[argv.index("ravana-launcher") + 1]
+                run_process.stderr.feed_data(f"{marker}\n".encode())
+                return _created_container_process()
+            if argv[1] == "start":
+                start_returned.set()
+                return run_process
+            if argv[1] == "rm":
+                cleanup_targets.append(argv[-1])
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        task = asyncio.create_task(
+            DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.2
+            ).run(_spec(tmp_path))
+        )
+        await start_returned.wait()
+        await asyncio.sleep(0.02)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleanup_targets == [_FAKE_CONTAINER_ID]
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_during_workspace_monitor_shutdown_is_not_swallowed(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        run_process = _ControlledProcess(exit_code=0)
+        runner = DockerSandboxRunner(
+            docker=sys.executable, cleanup_timeout_seconds=0.2
+        )
+        monitor_stopping = asyncio.Event()
+        allow_monitor_stop = asyncio.Event()
+
+        async def stalled_monitor(spec):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                monitor_stopping.set()
+                await allow_monitor_stop.wait()
+                raise
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "create":
+                marker = argv[argv.index("ravana-launcher") + 1]
+                run_process.stderr = asyncio.StreamReader()
+                run_process.stderr.feed_data(f"{marker}\n".encode())
+                run_process.stderr.feed_eof()
+                return _created_container_process()
+            if argv[1] == "start":
+                return run_process
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(runner, "_watch_workspace", stalled_monitor)
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        task = asyncio.create_task(runner.run(_spec(tmp_path)))
+        await monitor_stopping.wait()
+        task.cancel()
+        allow_monitor_stop.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_initial_workspace_scan_is_deadline_bounded_before_container_creation(
+    tmp_path, monkeypatch
+):
+    pid_file = tmp_path / "deadline-scan.pid"
+
+    def stalled_worker_argv(*args, **kwargs):
+        return [
+            sys.executable,
+            "-c",
+            (
+                "import os, pathlib, time, sys; "
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                "time.sleep(60)"
+            ),
+            str(pid_file),
+        ]
+
+    monkeypatch.setattr(
+        sandbox_module, "_workspace_worker_argv", stalled_worker_argv
+    )
+    monkeypatch.setattr(
+        sandbox_module, "_MIN_WORKSPACE_SCAN_TIMEOUT_SECONDS", 0.01
+    )
+
+    async def scenario() -> None:
+        runner = DockerSandboxRunner(docker=sys.executable)
+        started = time.monotonic()
+        with pytest.raises(SandboxError, match="measurement.*deadline"):
+            await runner.run(
+                _spec(tmp_path, limits=SandboxLimits(timeout_seconds=0.1))
+            )
+
+        assert pid_file.exists()
+        worker_pid = int(pid_file.read_text())
+        assert time.monotonic() - started < 0.5
+        with pytest.raises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+
+    asyncio.run(scenario())
+
+
+def test_workspace_scan_communication_failure_kills_and_reaps_worker(
+    tmp_path, monkeypatch
+):
+    class BrokenWorkerProcess:
+        def __init__(self) -> None:
+            self.stdout = object()
+            self.returncode = None
+            self.kill_called = False
+            self.wait_called = False
+            self._killed = asyncio.Event()
+
+        async def communicate(self):
+            raise RuntimeError("worker pipe failed")
+
+        def kill(self) -> None:
+            self.kill_called = True
+            self.returncode = -9
+            self._killed.set()
+
+        async def wait(self):
+            self.wait_called = True
+            await self._killed.wait()
+            return self.returncode
+
+    async def scenario() -> None:
+        worker = BrokenWorkerProcess()
+
+        async def spawn_worker(*args, **kwargs):
+            return worker
+
+        monkeypatch.setattr(
+            sandbox_module,
+            "_create_workspace_subprocess_exec",
+            spawn_worker,
+        )
+        violation = await sandbox_module._workspace_violation_in_worker(
+            tmp_path,
+            max_bytes=1024,
+            max_files=10,
+            timeout_seconds=0.2,
+        )
+
+        assert violation is not None
+        assert violation.measurement_failed is True
+        assert "RuntimeError" in violation.message
+        assert worker.kill_called is True
+        assert worker.wait_called is True
+
+    asyncio.run(scenario())
+
+
+def test_terminal_output_failure_reserves_part_of_the_cleanup_deadline(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        run_process = _ControlledProcess(exit_code=0)
+        runner = DockerSandboxRunner(
+            docker=sys.executable, cleanup_timeout_seconds=0.2
+        )
+        real_settle_readers = runner._settle_readers
+        settle_calls = 0
+        terminal_deadlines: list[float | None] = []
+
+        async def staged_settle_readers(readers, deadline):
+            nonlocal settle_calls
+            settle_calls += 1
+            if settle_calls == 1:
+                return await real_settle_readers(readers, deadline)
+            terminal_deadlines.append(deadline)
+            return "forced terminal drain failure"
+
+        async def recorded_finish(
+            proc,
+            process_waiter,
+            name,
+            readers,
+            *,
+            deadline=None,
+            identity_known=True,
+        ):
+            terminal_deadlines.append(deadline)
+            return None, None, False
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "create":
+                marker = argv[argv.index("ravana-launcher") + 1]
+                run_process.stderr = asyncio.StreamReader()
+                run_process.stderr.feed_data(f"{marker}\n".encode())
+                run_process.stderr.feed_eof()
+                return _created_container_process()
+            if argv[1] == "start":
+                return run_process
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(runner, "_settle_readers", staged_settle_readers)
+        monkeypatch.setattr(runner, "_finish_uninterruptibly", recorded_finish)
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+
+        with pytest.raises(SandboxOutcomeUnknown, match="output"):
+            await runner.run(_spec(tmp_path))
+
+        assert len(terminal_deadlines) == 2
+        assert terminal_deadlines[0] is not None
+        assert terminal_deadlines[1] is not None
+        assert terminal_deadlines[1] > terminal_deadlines[0]
+
+    asyncio.run(scenario())
+
+
+def test_terminal_output_deadline_reserves_time_to_remove_container(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        run_process = _ControlledProcess(exit_code=0)
+        run_process.stderr = asyncio.StreamReader()
+        cleanup_targets: list[str] = []
+        container_exists = True
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            nonlocal container_exists
+            if argv[1] == "create":
+                marker = argv[argv.index("ravana-launcher") + 1]
+                run_process.stderr.feed_data(f"{marker}\n".encode())
+                return _created_container_process()
+            if argv[1] == "start":
+                return run_process
+            if argv[1] == "rm":
+                cleanup_targets.append(argv[-1])
+                container_exists = False
+                return _ControlledProcess(exit_code=0)
+            if container_exists:
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        with pytest.raises(SandboxOutcomeUnknown, match="output"):
+            await DockerSandboxRunner(
+                docker=sys.executable, cleanup_timeout_seconds=0.1
+            ).run(_spec(tmp_path))
+
+        assert cleanup_targets == [_FAKE_CONTAINER_ID]
+
+    asyncio.run(scenario())
+
+
+def test_final_workspace_scan_exception_is_outcome_unknown_after_start(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        run_process = _ControlledProcess(exit_code=0)
+        runner = DockerSandboxRunner(
+            docker=sys.executable, cleanup_timeout_seconds=0.2
+        )
+
+        async def dormant_monitor(spec):
+            await asyncio.Future()
+
+        scan_calls = 0
+
+        async def broken_final_scan(*args, **kwargs):
+            nonlocal scan_calls
+            scan_calls += 1
+            if scan_calls == 1:
+                return None
+            raise RuntimeError("quota scanner crashed")
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "create":
+                marker = argv[argv.index("ravana-launcher") + 1]
+                run_process.stderr = asyncio.StreamReader()
+                run_process.stderr.feed_data(f"{marker}\n".encode())
+                run_process.stderr.feed_eof()
+                return _created_container_process()
+            if argv[1] == "start":
+                return run_process
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(runner, "_watch_workspace", dormant_monitor)
+        monkeypatch.setattr(
+            sandbox_module, "_workspace_violation_in_worker", broken_final_scan
+        )
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+
+        with pytest.raises(SandboxOutcomeUnknown, match="workspace enforcement"):
+            await runner.run(_spec(tmp_path))
+
+    asyncio.run(scenario())
 
 
 def test_docker_runner_bounds_captured_output_while_draining_the_process(tmp_path):
@@ -1125,6 +1677,71 @@ def test_cancellation_wins_over_delayed_spawn_oserror(tmp_path, monkeypatch):
         with pytest.raises(asyncio.CancelledError):
             await task
         assert cleanup_targets == [_FAKE_CONTAINER_ID]
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_start_spawn_failure_cleans_container_and_reopens_ledger(
+    con, tmp_path, monkeypatch
+):
+    from ravana.runtime.tool_executor import RavanaToolExecutor
+    from tests.test_tool_execution import _seed_run
+
+    async def scenario() -> None:
+        _seed_run(con, run_id="run-start-cancel")
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+        cleanup_targets: list[str] = []
+
+        async def fake_create_subprocess_exec(*argv, **kwargs):
+            if argv[1] == "create":
+                return _created_container_process()
+            if argv[1] == "start":
+                spawn_started.set()
+                await release_spawn.wait()
+                raise OSError("delayed start spawn failure")
+            if argv[1] == "rm":
+                cleanup_targets.append(argv[-1])
+                return _ControlledProcess(exit_code=0)
+            return _ControlledProcess(
+                exit_code=1, stderr="Error: No such object"
+            )
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+        )
+        executor = RavanaToolExecutor(
+            con,
+            {
+                "ci": _handler(
+                    tmp_path,
+                    runner=DockerSandboxRunner(docker=sys.executable),
+                )
+            },
+        )
+        task = asyncio.create_task(
+            executor.execute(
+                run_id="run-start-cancel",
+                node_id="n",
+                tool="ci",
+                arguments={"code": "print(1)"},
+                idempotency_key="start-cancel-key",
+            )
+        )
+        await spawn_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        release_spawn.set()
+
+        with pytest.raises(ToolRetrySafeCancellation):
+            await task
+
+        assert cleanup_targets == [_FAKE_CONTAINER_ID]
+        row = con.execute(
+            "SELECT status FROM tool_invocation WHERE idempotency_key = ?",
+            ("start-cancel-key",),
+        ).fetchone()
+        assert row["status"] == "FAILED"
 
     asyncio.run(scenario())
 

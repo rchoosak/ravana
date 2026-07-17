@@ -24,12 +24,13 @@ keeps the invocation STARTED so it cannot be executed twice.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import os
 import stat
 import tempfile
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,7 @@ from ravana.runtime.toolkits.sandbox import (
     SandboxRunner,
     SandboxSpec,
     SandboxOutcomeUnknown,
-    workspace_capacity_violation,
+    workspace_capacity_violation_async,
 )
 
 INPUT_SCHEMA: dict[str, Any] = {
@@ -75,6 +76,7 @@ _MAX_CPUS = 8.0
 _MAX_TIMEOUT_S = 300
 _MAX_WORKSPACE_MB = 8192
 _MAX_WORKSPACE_FILES = 100_000
+_WORKSPACE_LOCK_POLL_SECONDS = 0.02
 
 
 class CodeInterpreterHandler:
@@ -128,13 +130,6 @@ class CodeInterpreterHandler:
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str) -> str:
         workspace = self._workspace_for(run_id)
         filename = _safe_filename(arguments.get("filename"), self._default_filename)
-        _write_script(
-            workspace,
-            filename,
-            str(arguments["code"]),
-            limits=self._limits,
-        )
-
         args = [str(a) for a in arguments.get("args", [])]
         spec = SandboxSpec(
             image=self._image,
@@ -142,20 +137,29 @@ class CodeInterpreterHandler:
             workspace=workspace,
             limits=self._limits,
         )
-        try:
-            result = await self._runner.run(spec)
-        except SandboxCancelledBeforeStart as exc:
-            raise ToolRetrySafeCancellation(
-                "code_interpreter cancelled before sandbox execution"
-            ) from exc
-        except SandboxOutcomeUnknown as exc:
-            raise ToolOutcomeUnknown(
-                f"code_interpreter sandbox outcome is unknown: {exc}"
-            ) from exc
-        except SandboxError as exc:
-            # Infrastructure (docker absent/unreachable, image pull) — §3.6
-            # "sandbox cold-start" is TRANSIENT: the engine retries the attempt.
-            raise ToolkitError(f"code_interpreter sandbox unavailable: {exc}", kind=ToolFailureKind.TRANSIENT) from exc
+        async with _workspace_execution_lock(
+            workspace, timeout_seconds=self._limits.timeout_seconds
+        ):
+            await _write_script(
+                workspace,
+                filename,
+                str(arguments["code"]),
+                limits=self._limits,
+            )
+            try:
+                result = await self._runner.run(spec)
+            except SandboxCancelledBeforeStart as exc:
+                raise ToolRetrySafeCancellation(
+                    "code_interpreter cancelled before sandbox execution"
+                ) from exc
+            except SandboxOutcomeUnknown as exc:
+                raise ToolOutcomeUnknown(
+                    f"code_interpreter sandbox outcome is unknown: {exc}"
+                ) from exc
+            except SandboxError as exc:
+                # Infrastructure (docker absent/unreachable, image pull) — §3.6
+                # "sandbox cold-start" is TRANSIENT: the engine retries the attempt.
+                raise ToolkitError(f"code_interpreter sandbox unavailable: {exc}", kind=ToolFailureKind.TRANSIENT) from exc
         return _format_result(result)
 
     async def aclose(self) -> None:
@@ -208,64 +212,96 @@ class CodeInterpreterHandler:
         return workspace
 
 
-def _write_script(
+async def _write_script(
     workspace: Path,
     filename: str,
     code: str,
     *,
     limits: SandboxLimits,
 ) -> None:
-    """Publish the script atomically so an existing symlink or hard link is
-    replaced as a directory entry instead of being followed by the host write."""
     encoded = code.encode("utf-8")
-    with _workspace_publication_lock(workspace):
-        violation = workspace_capacity_violation(
+    try:
+        violation = await workspace_capacity_violation_async(
             workspace,
             limits=limits,
             additional_bytes=len(encoded),
             additional_files=1,
+            timeout_seconds=limits.timeout_seconds,
         )
-        if violation is not None:
-            kind = (
-                ToolFailureKind.TRANSIENT
-                if violation.measurement_failed
-                else ToolFailureKind.MODEL_ADDRESSABLE
-            )
-            raise ToolkitError(
-                f"code_interpreter: {violation.message}", kind=kind
-            )
+    except asyncio.CancelledError as exc:
+        raise ToolRetrySafeCancellation(
+            "code_interpreter cancelled during workspace measurement"
+        ) from exc
 
-        _publish_script(workspace, filename, encoded)
+    if violation is not None:
+        kind = (
+            ToolFailureKind.TRANSIENT
+            if violation.measurement_failed
+            else ToolFailureKind.MODEL_ADDRESSABLE
+        )
+        raise ToolkitError(
+            f"code_interpreter: {violation.message}", kind=kind
+        )
+
+    current_task = asyncio.current_task()
+    if current_task is not None and current_task.cancelling():
+        raise ToolRetrySafeCancellation(
+            "code_interpreter cancelled before script publication"
+        )
+    _publish_script(workspace, filename, encoded)
 
 
-@contextlib.contextmanager
-def _workspace_publication_lock(workspace: Path) -> Iterator[None]:
-    """Serialize quota measurement and publication across local processes."""
+@contextlib.asynccontextmanager
+async def _workspace_execution_lock(
+    workspace: Path, *, timeout_seconds: float
+) -> AsyncIterator[None]:
+    """Own one mutable run workspace from publication through execution."""
     flags = os.O_RDWR | os.O_CREAT
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd: int | None = None
     locked = False
     try:
-        fd = os.open(workspace.parent / ".ravana-workspace.lock", flags, 0o600)
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise OSError("workspace publication lock is not a regular file")
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        locked = True
+        try:
+            fd = os.open(workspace.parent / ".ravana-workspace.lock", flags, 0o600)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("workspace publication lock is not a regular file")
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_seconds
+            while not locked:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except BlockingIOError:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise ToolkitError(
+                            "code_interpreter: timed out waiting for the run workspace",
+                            kind=ToolFailureKind.TRANSIENT,
+                        )
+                    try:
+                        await asyncio.sleep(
+                            min(_WORKSPACE_LOCK_POLL_SECONDS, remaining)
+                        )
+                    except asyncio.CancelledError as exc:
+                        raise ToolRetrySafeCancellation(
+                            "code_interpreter cancelled before workspace ownership"
+                        ) from exc
+        except (ToolkitError, ToolRetrySafeCancellation):
+            raise
+        except OSError as exc:
+            raise ToolkitError(
+                "code_interpreter: unable to lock the run workspace "
+                f"({type(exc).__name__})",
+                kind=ToolFailureKind.TRANSIENT,
+            ) from exc
         yield
-    except ToolkitError:
-        raise
-    except OSError as exc:
-        raise ToolkitError(
-            "code_interpreter: unable to lock the run workspace "
-            f"({type(exc).__name__})",
-            kind=ToolFailureKind.TRANSIENT,
-        ) from exc
     finally:
         if fd is not None:
             if locked:
                 with contextlib.suppress(OSError):
                     fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _publish_script(workspace: Path, filename: str, encoded: bytes) -> None:
