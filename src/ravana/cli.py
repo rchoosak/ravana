@@ -25,6 +25,7 @@ from ravana.engine.dod import ProseVerdict
 from ravana.engine.loop import TERMINAL_STATUSES, resume_hitl, start_run
 from ravana.runtime.base import AgentRuntime, ProseJudge
 from ravana.runtime.gateway import LLMGateway
+from ravana.runtime.git_workspace import is_git_repo, provision_run_workspace
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
 from ravana.runtime.providers.base import ProviderAdapter
@@ -34,6 +35,7 @@ from ravana.runtime.tool_executor import RavanaToolExecutor
 from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.db import init_db
 from ravana.schema.loader import load_workflow_yaml
+from ravana.schema.util import new_id
 
 RAVANA_DIR = ".ravana"
 
@@ -135,6 +137,23 @@ def _prose_verdict_for(runtime: AgentRuntime) -> ProseVerdict | None:
     return runtime.judge_prose if isinstance(runtime, ProseJudge) else None
 
 
+def _provision_git_workspace(graph: CompiledGraph, backend: str, run_id: str) -> None:
+    """§10.1: before a run that can execute code, clone the project into an
+    isolated per-run workspace on branch `ravana/run-<id>`. Gated to the cases
+    where it matters — the LLM backend with a `code_interpreter` toolkit — and a
+    no-op when the project isn't a git repo (code_interpreter then falls back to
+    a plain workspace dir). This runs BEFORE start_run with the same `run_id`, so
+    the clone and the run share one id."""
+    if backend != "llm":
+        return
+    if not any(t.type == "code_interpreter" for t in graph.toolkits_by_id.values()):
+        return
+    project = find_ravana_dir().parent
+    if not is_git_repo(project):
+        return
+    provision_run_workspace(base_repo=project, runs_dir=find_ravana_dir() / "runs", run_id=run_id)
+
+
 async def _start_with_cleanup(
     con: sqlite3.Connection,
     graph: CompiledGraph,
@@ -143,6 +162,7 @@ async def _start_with_cleanup(
     org_id: str,
     workflow_id: str,
     input_payload: dict[str, Any],
+    run_id: str | None = None,
 ) -> str:
     try:
         return await start_run(
@@ -154,6 +174,7 @@ async def _start_with_cleanup(
             triggered_by="cli-user",
             input_payload=input_payload,
             dod_prose_verdict=_prose_verdict_for(runtime),
+            run_id=run_id,
         )
     finally:
         await runtime.aclose()
@@ -238,6 +259,11 @@ def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: 
     input_payload = json.loads(input_json)
     runtime = _build_runtime(con, graph, backend, mock_fixture)
 
+    # §10.1: provision the isolated git workspace under the SAME id the run uses,
+    # before the run starts (so the clone is ready whenever code_interpreter runs).
+    run_id = new_id()
+    _provision_git_workspace(graph, backend, run_id)
+
     run_id = asyncio.run(
         _start_with_cleanup(
             con,
@@ -246,6 +272,7 @@ def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: 
             org_id=org,
             workflow_id=workflow_id,
             input_payload=input_payload,
+            run_id=run_id,
         )
     )
     _print_run_status(con, run_id)

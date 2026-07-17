@@ -159,3 +159,64 @@ def test_cli_resume_scope_closes_runtime_on_failure(monkeypatch, sdlc_graph, con
             )
         )
     assert runtime.closed
+
+
+# --- §10.1 git workspace provisioning wiring -------------------------------
+def _no_toolkit_graph():
+    from ravana.compiler.graph import compile_workflow
+    from ravana.schema.models import WorkflowDoc
+
+    return compile_workflow(
+        WorkflowDoc.model_validate(
+            {
+                "apiVersion": "ravana/v1",
+                "kind": "Workflow",
+                "metadata": {"name": "x", "version": 1},
+                "spec": {
+                    "agents": [{"id": "a", "name": "A", "llm": {"provider": "anthropic", "model": "m"}, "system_prompt": "p"}],
+                    "graph": {"entry": "n", "nodes": [{"id": "n", "agent": "a"}], "edges": []},
+                },
+            }
+        )
+    )
+
+
+def test_provision_git_workspace_skips_mock_backend(sdlc_graph, monkeypatch):
+    # Must not even look for .ravana on the mock backend (returns before it).
+    monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: pytest.fail("find_ravana_dir should not be called"))
+    cli_module._provision_git_workspace(sdlc_graph, "mock", "r")  # no exception
+
+
+def test_provision_git_workspace_skips_without_code_interpreter(monkeypatch):
+    monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: pytest.fail("find_ravana_dir should not be called"))
+    cli_module._provision_git_workspace(_no_toolkit_graph(), "llm", "r")  # gated off, no-op
+
+
+def test_provision_git_workspace_clones_for_llm_code_interpreter(tmp_path, sdlc_graph, monkeypatch):
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not installed")
+    project = tmp_path
+    subprocess.run(["git", "-C", str(project), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(project), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(project), "config", "user.name", "T"], check=True)
+    (project / "f.txt").write_text("x")
+    subprocess.run(["git", "-C", str(project), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(project), "commit", "-q", "-m", "init"], check=True)
+    ravana = project / ".ravana"
+    (ravana / "runs").mkdir(parents=True)
+    monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: ravana)
+
+    cli_module._provision_git_workspace(sdlc_graph, "llm", "run-x")
+    ws = ravana / "runs" / "run-x" / "workspace"
+    assert (ws / ".git").exists() and (ws / "f.txt").exists()
+
+
+def test_provision_git_workspace_noop_when_project_not_git(tmp_path, sdlc_graph, monkeypatch):
+    ravana = tmp_path / ".ravana"
+    (ravana / "runs").mkdir(parents=True)
+    monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: ravana)
+    cli_module._provision_git_workspace(sdlc_graph, "llm", "run-x")  # parent isn't a git repo
+    assert not (ravana / "runs" / "run-x").exists()  # nothing provisioned

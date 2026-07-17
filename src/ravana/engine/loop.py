@@ -203,9 +203,13 @@ async def start_run(
     input_payload: dict[str, Any] | None = None,
     dod_prose_verdict: ProseVerdict | None = None,
     retry_sleep: RetrySleep = asyncio.sleep,
+    run_id: str | None = None,
 ) -> str:
     input_payload = input_payload or {}
-    run_id = new_id()
+    # A caller may pre-generate the id so it can provision run-scoped resources
+    # (§10.1's git workspace clone) under the same id before the run starts;
+    # otherwise we mint one here.
+    run_id = run_id or new_id()
     concurrency = graph.doc.spec.concurrency
     concurrency_group = _resolve_group(concurrency.group, input_payload) if concurrency else None
 

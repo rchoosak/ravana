@@ -104,10 +104,10 @@ Goal: swap the mock backend for real providers and real tool execution, on a gra
 - [ ] **Author-provided toolkit descriptions**: descriptions surfaced to the model are currently per-handler defaults; letting the workflow author write a `description` per toolkit in the manifest (a `toolkit` schema/DB field) is a follow-up.
 
 ### Git isolation (§10.1 — the "don't touch source" requirement)
-- [ ] `git clone --local` into `runs/<run_id>/workspace` on branch `ravana/run-<run_id>` (default)
+- [x] `git clone --local` into `runs/<run_id>/workspace` on branch `ravana/run-<run_id>` (`runtime/git_workspace.py`): `provision_run_workspace` clones the project (the dir holding `.ravana/`) into an isolated per-run workspace — a fully independent repo (own `.git`/refs/HEAD), so a `git reset --hard`/`rm -rf` inside the sandbox can't reach the developer's checkout; `--local` hardlinks objects so it's cheap. Idempotent (a resumed run/retry keeps its existing workspace, never re-clones over work), path-containment-checked (a bad `run_id` can't escape the runs dir), and clear-errors on a non-git base / missing git. Wired into `ravana run start`: the CLI pre-mints the `run_id`, provisions **before** `start_run` (which now accepts that id) so the clone is ready whenever `code_interpreter` runs — gated to `--backend llm` + a graph with a `code_interpreter` toolkit + a git project (else a no-op; `code_interpreter` falls back to a plain workspace dir). 10 tests (`test_git_workspace.py` 6: isolated-clone-on-run-branch, destructive-work-can't-reach-base, idempotent, non-git→error, path-escape→error, `is_git_repo`; `test_cli_llm_backend.py` 4: gated off for mock / no-code_interpreter / non-git project, clones for llm+code_interpreter).
 - [ ] `git worktree add` as an opt-in alternative
 - [ ] `git init` shadow-repo fallback when the target isn't a git repo
-- [ ] On `COMPLETE`: `git_connector` opens a PR (or writes a patch file if no remote) — never auto-merges
+- [ ] On `COMPLETE`: `git_connector` opens a PR (or writes a patch file if no remote) — never auto-merges — **NEXT sub-slice** (the handoff back to the real project; this slice provisions the workspace, that slice hands it back)
 
 ### CLI / UX
 - [ ] `ravana studio` (localhost dev-server UI reading `state.db` directly — can slip to Phase 1 if it doesn't fit the timebox)
