@@ -66,6 +66,18 @@ class RavanaToolExecutor:
             tools.append(Tool(name=tid, description=handler.description, input_schema=handler.input_schema))
         return tools
 
+    async def prepare_run(self, run_id: str) -> None:
+        """Prepare each distinct handler's run-scoped resources."""
+        seen: set[int] = set()
+        for handler in self._handlers.values():
+            identity = id(handler)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            prepare = getattr(handler, "prepare_run", None)
+            if prepare is not None:
+                await prepare(run_id)
+
     async def aclose(self) -> None:
         """Close each distinct handler owned by this execution scope."""
         first_error: RuntimeError | None = None

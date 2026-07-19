@@ -1,6 +1,5 @@
-"""Per-run git workspace provisioning (§10.1). Uses real temp git repos — the
-clone is `--local` of a tiny repo, so it's fast — to prove the run workspace is
-a fully independent clone that can't reach the base repo's checkout.
+"""Per-run git workspace provisioning (§10.1). Uses real temp git repos to
+prove the `--no-hardlinks` run workspace is independent from the source.
 """
 
 from __future__ import annotations
@@ -77,6 +76,64 @@ def test_idempotent_returns_existing_without_reclone(tmp_path):
     assert (ws / "in_progress.txt").read_text() == "do not clobber"  # re-clone would have wiped it
 
 
+def test_existing_workspace_on_wrong_branch_is_rejected(tmp_path):
+    base = _make_repo(tmp_path / "project")
+    runs = tmp_path / "runs"
+    ws = provision_run_workspace(base_repo=base, runs_dir=runs, run_id="r")
+    source_branch = _git(base, "branch", "--show-current").stdout.strip()
+    _git(ws, "checkout", "-q", source_branch)
+
+    with pytest.raises(GitError, match="expected branch"):
+        provision_run_workspace(base_repo=base, runs_dir=runs, run_id="r")
+
+
+def test_existing_workspace_from_wrong_source_is_rejected(tmp_path):
+    expected_source = _make_repo(tmp_path / "expected")
+    other_source = _make_repo(tmp_path / "other")
+    runs = tmp_path / "runs"
+    provision_run_workspace(
+        base_repo=other_source,
+        runs_dir=runs,
+        run_id="r",
+    )
+
+    with pytest.raises(GitError, match="does not belong to source repo"):
+        provision_run_workspace(
+            base_repo=expected_source,
+            runs_dir=runs,
+            run_id="r",
+        )
+
+
+def test_requested_base_ref_is_used(tmp_path):
+    base = _make_repo(tmp_path / "project")
+    first_commit = _git(base, "rev-parse", "HEAD").stdout.strip()
+    (base / "README.md").write_text("second\n")
+    _git(base, "commit", "-qam", "second")
+
+    ws = provision_run_workspace(
+        base_repo=base,
+        runs_dir=tmp_path / "runs",
+        run_id="r",
+        base_ref=first_commit,
+    )
+    assert _git(ws, "rev-parse", "HEAD").stdout.strip() == first_commit
+    assert (ws / "README.md").read_text() == "base\n"
+
+
+def test_invalid_base_ref_is_rejected_without_publishing_workspace(tmp_path):
+    base = _make_repo(tmp_path / "project")
+    runs = tmp_path / "runs"
+    with pytest.raises(GitError, match="does not resolve"):
+        provision_run_workspace(
+            base_repo=base,
+            runs_dir=runs,
+            run_id="r",
+            base_ref="refs/heads/does-not-exist",
+        )
+    assert not (runs / "r" / "workspace").exists()
+
+
 def test_clone_objects_are_independent_of_the_source(tmp_path):
     # P0: the sandbox mounts the workspace `.git` writable, so a hardlinked
     # clone would let agent code corrupt the SOURCE repo's objects. --no-hardlinks
@@ -107,11 +164,13 @@ def test_partial_workspace_is_rejected_not_silently_reused(tmp_path):
     # A half-written workspace (interrupted provision) must NOT be accepted as a
     # finished one — the run would execute against a broken repo.
     base = _make_repo(tmp_path / "project")
-    runs = tmp_path / "runs"
+    # Production puts runs below the source worktree. A plain workspace must
+    # not inherit the source's ancestor .git and pass validation.
+    runs = base / ".ravana" / "runs"
     partial = runs / "r" / "workspace"
     partial.mkdir(parents=True)
     (partial / "junk").write_text("half")  # exists, but not a git repo
-    with pytest.raises(GitError, match="not a valid git repo"):
+    with pytest.raises(GitError, match="not an independent git repo"):
         provision_run_workspace(base_repo=base, runs_dir=runs, run_id="r")
 
 

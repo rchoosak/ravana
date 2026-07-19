@@ -98,6 +98,13 @@ class ProseJudge(Protocol):
     ) -> ProseJudgement: ...
 
 
+@runtime_checkable
+class RunPreparer(Protocol):
+    """Optional capability for preparing run-scoped execution resources."""
+
+    async def prepare_run(self, run_id: str) -> None: ...
+
+
 @dataclass
 class AgentTurnResult:
     """What one agent turn produces — becomes the state_delta (§3.4) plus

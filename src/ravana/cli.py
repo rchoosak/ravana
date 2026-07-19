@@ -25,7 +25,7 @@ from ravana.engine.dod import ProseVerdict
 from ravana.engine.loop import TERMINAL_STATUSES, resume_hitl, start_run
 from ravana.runtime.base import AgentRuntime, ProseJudge
 from ravana.runtime.gateway import LLMGateway
-from ravana.runtime.git_workspace import git_toplevel, provision_run_workspace
+from ravana.runtime.git_workspace import DEFAULT_BASE_REF
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
 from ravana.runtime.providers.base import ProviderAdapter
@@ -35,7 +35,6 @@ from ravana.runtime.tool_executor import RavanaToolExecutor
 from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.db import init_db
 from ravana.schema.loader import load_workflow_yaml
-from ravana.schema.util import new_id
 
 RAVANA_DIR = ".ravana"
 
@@ -97,7 +96,12 @@ def _adapters_for_graph(graph: CompiledGraph) -> dict[str, ProviderAdapter]:
     return {provider: _make_adapter(provider) for provider in _providers_in_graph(graph)}
 
 
-def _build_llm_gateway(con: sqlite3.Connection, graph: CompiledGraph) -> LLMGateway:
+def _build_llm_gateway(
+    con: sqlite3.Connection,
+    graph: CompiledGraph,
+    *,
+    git_base_ref: str = DEFAULT_BASE_REF,
+) -> LLMGateway:
     # §8c: ONE resolver serves both credential kinds. Toolkit auth_refs
     # resolve through the registry's lazy providers (a secret is only read if
     # its toolkit is actually called), and the gateway resolves each agent's
@@ -110,19 +114,33 @@ def _build_llm_gateway(con: sqlite3.Connection, graph: CompiledGraph) -> LLMGate
     # the lookup so building the gateway out of that context (a unit test) still
     # works — code_interpreter just isn't runnable without a runs dir.
     try:
-        runs_dir: Path | None = find_ravana_dir() / "runs"
+        ravana_dir = find_ravana_dir()
+        runs_dir: Path | None = ravana_dir / "runs"
+        workspace_project: Path | None = ravana_dir.parent
     except click.ClickException:
         runs_dir = None
-    handlers = build_registry(graph, resolver, runs_dir=runs_dir)
+        workspace_project = None
+    handlers = build_registry(
+        graph,
+        resolver,
+        runs_dir=runs_dir,
+        workspace_project=workspace_project,
+        workspace_base_ref=git_base_ref,
+    )
     executor = RavanaToolExecutor(con, handlers)
     return LLMGateway(graph, _adapters_for_graph(graph), tool_executor=executor, secret_resolver=resolver)
 
 
 def _build_runtime(
-    con: sqlite3.Connection, graph: CompiledGraph, backend: str, mock_fixture: str | None
+    con: sqlite3.Connection,
+    graph: CompiledGraph,
+    backend: str,
+    mock_fixture: str | None,
+    *,
+    git_base_ref: str = DEFAULT_BASE_REF,
 ) -> AgentRuntime:
     if backend == "llm":
-        return _build_llm_gateway(con, graph)
+        return _build_llm_gateway(con, graph, git_base_ref=git_base_ref)
     if not mock_fixture:
         raise click.ClickException("--backend mock requires --mock-fixture")
     return MockAgentRuntime.from_yaml(mock_fixture)
@@ -135,28 +153,6 @@ def _prose_verdict_for(runtime: AgentRuntime) -> ProseVerdict | None:
     here with no CLI change. A runtime without the capability (the mock backend)
     leaves prose criteria advisory (unevaluated, non-gating), as in Phase 0a."""
     return runtime.judge_prose if isinstance(runtime, ProseJudge) else None
-
-
-def _provision_git_workspace(graph: CompiledGraph, backend: str, run_id: str) -> None:
-    """§10.1: before a run that can execute code, clone the project into an
-    isolated per-run workspace on branch `ravana/run-<id>`. Gated to the cases
-    where it matters — the LLM backend with a `code_interpreter` toolkit — and a
-    no-op when the project isn't a git repo (code_interpreter then falls back to
-    a plain workspace dir). This runs BEFORE start_run with the same `run_id`, so
-    the clone and the run share one id."""
-    if backend != "llm":
-        return
-    if not any(t.type == "code_interpreter" for t in graph.toolkits_by_id.values()):
-        return
-    ravana = find_ravana_dir()
-    # Clone the git TOPLEVEL, not `.ravana`'s parent directly — when `.ravana/`
-    # lives in a monorepo subdirectory, the parent is inside a work tree but
-    # `git clone <subdir>` fails; the toplevel is the actual repo. None means
-    # the project isn't a git repo, so code_interpreter uses a plain dir.
-    top = git_toplevel(ravana.parent)
-    if top is None:
-        return
-    provision_run_workspace(base_repo=top, runs_dir=ravana / "runs", run_id=run_id)
 
 
 async def _start_with_cleanup(
@@ -255,7 +251,15 @@ def run() -> None:
 @click.option("--org", default="local", help="org_id (Phase 0a: no real multi-tenancy)")
 @click.option("--backend", type=click.Choice(["mock", "llm"]), default="mock", help="mock = scripted --mock-fixture; llm = real LLM Gateway (§1.1) with wired toolkits")
 @click.option("--mock-fixture", type=click.Path(exists=True, dir_okay=False), help="required for --backend mock: a scripted response fixture")
-def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: str | None) -> None:
+@click.option("--base-ref", default=DEFAULT_BASE_REF, show_default=True, help="git commit/ref used as the run branch base")
+def run_start(
+    file: str,
+    input_json: str,
+    org: str,
+    backend: str,
+    mock_fixture: str | None,
+    base_ref: str,
+) -> None:
     """Persist FILE's workflow and start a Run against it."""
     con = _connect()
     doc = load_workflow_yaml(file)
@@ -263,12 +267,13 @@ def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: 
     workflow_id = get_or_create_workflow(con, graph, org_id=org, created_by="cli-user")
     input_payload = json.loads(input_json)
 
-    # §10.1: provision the isolated git workspace under the SAME id the run uses,
-    # BEFORE building the runtime — a provisioning failure then leaks no runtime
-    # to close (the runtime's own cleanup only starts inside _start_with_cleanup).
-    run_id = new_id()
-    _provision_git_workspace(graph, backend, run_id)
-    runtime = _build_runtime(con, graph, backend, mock_fixture)
+    runtime = _build_runtime(
+        con,
+        graph,
+        backend,
+        mock_fixture,
+        git_base_ref=base_ref,
+    )
 
     run_id = asyncio.run(
         _start_with_cleanup(
@@ -278,7 +283,6 @@ def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: 
             org_id=org,
             workflow_id=workflow_id,
             input_payload=input_payload,
-            run_id=run_id,
         )
     )
     _print_run_status(con, run_id)

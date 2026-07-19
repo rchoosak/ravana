@@ -33,6 +33,12 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from ravana.runtime.git_workspace import (
+    DEFAULT_BASE_REF,
+    GitError,
+    git_toplevel,
+    provision_run_workspace,
+)
 from ravana.runtime.toolkits.base import (
     ToolFailureKind,
     ToolRetrySafeCancellation,
@@ -96,6 +102,8 @@ class CodeInterpreterHandler:
         config: dict[str, Any],
         *,
         runs_dir: Path | None,
+        project_dir: Path | None = None,
+        base_ref: str = DEFAULT_BASE_REF,
         runner: SandboxRunner | None = None,
     ):
         runtime = config.get("runtime")
@@ -124,6 +132,9 @@ class CodeInterpreterHandler:
             ),
         )
         self._runs_dir = runs_dir
+        self._project_dir = project_dir or _project_from_runs_dir(runs_dir)
+        self._base_ref = base_ref
+        self._prepared_workspaces: dict[str, tuple[Path, Path]] = {}
         self._runner = runner or DockerSandboxRunner(docker=sandbox_executable)
         self._workspace_workers = WorkspaceWorkerSupervisor()
         self._lifecycle = AsyncResourceLifecycle(
@@ -139,6 +150,24 @@ class CodeInterpreterHandler:
         # Running code writes to the run's workspace filesystem — a side effect,
         # so a retried logical invocation dedupes rather than re-executing.
         return True
+
+    async def prepare_run(self, run_id: str) -> None:
+        """Provision the Local-tier workspace before the run is persisted."""
+        try:
+            self._lifecycle.enter()
+        except RuntimeError as exc:
+            raise ToolkitError(
+                "code_interpreter handler is closed",
+                kind=ToolFailureKind.FATAL,
+            ) from exc
+        try:
+            # Phase 0's Local tier is deliberately single-process. Keeping the
+            # bounded git operation in this task means cancellation/cleanup
+            # cannot leave an unowned worker thread cloning in the background.
+            context = self._workspace_context(run_id)
+            self._prepared_workspaces[run_id] = context
+        finally:
+            self._lifecycle.exit()
 
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str) -> str:
         try:
@@ -164,20 +193,28 @@ class CodeInterpreterHandler:
         idempotency_key: str,
         run_id: str,
     ) -> str:
-        workspace = self._workspace_for(run_id)
+        workspace, execution_dir = self._prepared_workspaces.get(run_id) or self._workspace_context(run_id)
         filename = _safe_filename(arguments.get("filename"), self._default_filename)
         args = [str(a) for a in arguments.get("args", [])]
+        relative_cwd = execution_dir.relative_to(workspace)
+        container_cwd = (
+            "/workspace"
+            if relative_cwd == Path(".")
+            else f"/workspace/{relative_cwd.as_posix()}"
+        )
         spec = SandboxSpec(
             image=self._image,
             argv=[*self._interp, filename, *args],
             workspace=workspace,
             limits=self._limits,
+            working_directory=container_cwd,
         )
         async with _workspace_execution_lock(
             workspace, timeout_seconds=self._limits.timeout_seconds
         ):
             await _write_script(
                 workspace,
+                execution_dir,
                 filename,
                 str(arguments["code"]),
                 limits=self._limits,
@@ -223,7 +260,7 @@ class CodeInterpreterHandler:
             raise first_error
         self._resources_closed = True
 
-    def _workspace_for(self, run_id: str) -> Path:
+    def _workspace_context(self, run_id: str) -> tuple[Path, Path]:
         if self._runs_dir is None:
             raise ToolkitError(
                 "code_interpreter has no runs directory configured — the Local tier must wire runs_dir",
@@ -245,15 +282,38 @@ class CodeInterpreterHandler:
                     "code_interpreter: refusing a run directory symlink",
                     kind=ToolFailureKind.FATAL,
                 )
-            run_dir.mkdir(exist_ok=True)
             if workspace.is_symlink():
                 raise ToolkitError(
                     "code_interpreter: refusing a workspace symlink",
                     kind=ToolFailureKind.FATAL,
                 )
-            workspace.mkdir(exist_ok=True)
+
+            project_subpath = Path()
+            project_toplevel = (
+                git_toplevel(self._project_dir)
+                if self._project_dir is not None
+                else None
+            )
+            if project_toplevel is not None and self._project_dir is not None:
+                project_subpath = self._project_dir.resolve().relative_to(
+                    project_toplevel.resolve()
+                )
+                workspace = provision_run_workspace(
+                    base_repo=project_toplevel,
+                    runs_dir=runs_dir,
+                    run_id=run_id,
+                    base_ref=self._base_ref,
+                )
+            else:
+                run_dir.mkdir(exist_ok=True)
+                workspace.mkdir(exist_ok=True)
         except ToolkitError:
             raise
+        except GitError as exc:
+            raise ToolkitError(
+                f"code_interpreter: unable to provision git workspace ({exc})",
+                kind=ToolFailureKind.FATAL,
+            ) from exc
         except OSError as exc:
             raise ToolkitError(
                 f"code_interpreter: unable to prepare the run workspace ({type(exc).__name__})",
@@ -267,11 +327,33 @@ class CodeInterpreterHandler:
                 "code_interpreter: refusing an aliased workspace",
                 kind=ToolFailureKind.FATAL,
             )
-        return workspace
+
+        execution_dir = workspace / project_subpath
+        if (
+            not execution_dir.is_dir()
+            or execution_dir.resolve() != execution_dir
+            or not execution_dir.is_relative_to(workspace)
+        ):
+            raise ToolkitError(
+                "code_interpreter: project path is missing or aliased inside the run workspace",
+                kind=ToolFailureKind.FATAL,
+            )
+        return workspace, execution_dir
+
+
+def _project_from_runs_dir(runs_dir: Path | None) -> Path | None:
+    if (
+        runs_dir is not None
+        and runs_dir.name == "runs"
+        and runs_dir.parent.name == ".ravana"
+    ):
+        return runs_dir.parent.parent
+    return None
 
 
 async def _write_script(
     workspace: Path,
+    script_dir: Path,
     filename: str,
     code: str,
     *,
@@ -326,7 +408,7 @@ async def _write_script(
                 "script staging worker exceeded its deadline"
             )
         temp_path = await stage_workspace_script_async(
-            workspace,
+            script_dir,
             code,
             timeout_seconds=remaining,
             supervisor=supervisor,
@@ -343,7 +425,7 @@ async def _write_script(
             raise WorkspaceStagingError(
                 "script staging worker returned an invalid file"
             )
-        os.replace(temp_path, workspace / filename)
+        os.replace(temp_path, script_dir / filename)
         temp_path = None
     except asyncio.CancelledError as exc:
         raise ToolRetrySafeCancellation(

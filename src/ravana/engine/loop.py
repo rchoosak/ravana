@@ -36,6 +36,7 @@ from ravana.runtime.base import (
     AgentTurnResult,
     LLMUsage,
     ProseJudgementError,
+    RunPreparer,
     TransientAgentError,
 )
 from ravana.runtime.idempotency import compute_idempotency_key
@@ -210,6 +211,8 @@ async def start_run(
     # (§10.1's git workspace clone) under the same id before the run starts;
     # otherwise we mint one here.
     run_id = run_id or new_id()
+    if isinstance(runtime, RunPreparer):
+        await runtime.prepare_run(run_id)
     concurrency = graph.doc.spec.concurrency
     concurrency_group = _resolve_group(concurrency.group, input_payload) if concurrency else None
 

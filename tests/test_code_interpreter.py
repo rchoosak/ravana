@@ -11,6 +11,7 @@ import multiprocessing
 import os
 import shlex
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -90,6 +91,7 @@ def test_docker_argv_has_isolation_flags(tmp_path):
     # exactly ONE bind mount, scoped strictly to the run's workspace (§10.1)
     mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
     assert mounts == [f"{tmp_path.resolve()}:/workspace:rw"]
+    assert argv[argv.index("-w") + 1] == "/workspace"
     # The launcher emits an unguessable start marker before exec'ing the
     # in-container command, so Docker failures can be distinguished from an
     # agent process that itself exits with Docker's reserved code 125.
@@ -107,6 +109,17 @@ def test_docker_argv_has_isolation_flags(tmp_path):
         "--attach",
         "a" * 64,
     ]
+
+
+def test_docker_argv_rejects_working_directory_outside_workspace(tmp_path):
+    spec = SandboxSpec(
+        image="python:3.11-slim",
+        argv=["python", "main.py"],
+        workspace=tmp_path,
+        working_directory="/etc",
+    )
+    with pytest.raises(ValueError, match="must stay under /workspace"):
+        build_docker_argv(spec, name="ravana-ci-abc", startup_marker="started")
 
 
 # --- handler ----------------------------------------------------------------
@@ -212,6 +225,52 @@ def test_writes_code_into_the_run_workspace_and_runs_it(tmp_path):
     assert runner.spec.argv == ["python", "main.py"]
     assert runner.spec.image == "python:3.11-slim"
     assert "exit_code: 0" in out and "42" in out
+
+
+def test_monorepo_project_runs_from_its_subdirectory(tmp_path):
+    repo = tmp_path / "repo"
+    project = repo / "packages" / "app"
+    project.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "t@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True,
+    )
+    (project / "app.txt").write_text("app")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "init"],
+        check=True,
+    )
+    runs = project / ".ravana" / "runs"
+    runner = FakeRunner()
+    handler = CodeInterpreterHandler(
+        {"runtime": "python3.11"},
+        runs_dir=runs,
+        runner=runner,
+    )
+
+    async def prepare_call_and_close() -> None:
+        try:
+            await handler.prepare_run("r")
+            await handler.call(
+                arguments={"code": "print('app')"},
+                idempotency_key="k",
+                run_id="r",
+            )
+        finally:
+            await handler.aclose()
+
+    asyncio.run(prepare_call_and_close())
+    workspace = runs / "r" / "workspace"
+    assert runner.spec is not None
+    assert runner.spec.workspace == workspace
+    assert runner.spec.working_directory == "/workspace/packages/app"
+    assert (workspace / "packages" / "app" / "main.py").exists()
 
 
 def test_node_runtime_uses_node_image_and_default_file(tmp_path):

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ravana.compiler.graph import CompiledGraph
+from ravana.runtime.git_workspace import DEFAULT_BASE_REF
 from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.api_connector import ApiConnectorHandler
 from ravana.runtime.toolkits.base import ToolkitError, ToolkitHandler
@@ -31,12 +32,15 @@ def build_registry(
     *,
     clients: dict[str, Any] | None = None,
     runs_dir: Path | None = None,
+    workspace_project: Path | None = None,
+    workspace_base_ref: str = DEFAULT_BASE_REF,
     sandbox_runner: SandboxRunner | None = None,
 ) -> dict[str, ToolkitHandler]:
     """Returns {toolkit_id: handler}. `clients` optionally injects a per-toolkit
     transport (tests pass fakes keyed by toolkit id); `runs_dir` is the
     `.ravana/runs` directory code_interpreter scopes each run's workspace under
-    (§10.1); `sandbox_runner` overrides the Docker runner (tests pass a fake)."""
+    (§10.1); `workspace_project` and `workspace_base_ref` configure its git
+    clone; `sandbox_runner` overrides the Docker runner (tests pass a fake)."""
     clients = clients or {}
     handlers: dict[str, ToolkitHandler] = {}
     for toolkit_id, toolkit in graph.toolkits_by_id.items():
@@ -54,7 +58,11 @@ def build_registry(
             # §8/§10.1: agent code runs in a per-run, network-isolated sandbox
             # whose only writable mount is runs/<run_id>/workspace.
             handlers[toolkit_id] = CodeInterpreterHandler(
-                config=toolkit.config, runs_dir=runs_dir, runner=sandbox_runner
+                config=toolkit.config,
+                runs_dir=runs_dir,
+                project_dir=workspace_project,
+                base_ref=workspace_base_ref,
+                runner=sandbox_runner,
             )
         elif toolkit.type in _DEFERRED:
             handlers[toolkit_id] = _DeferredHandler(toolkit_id, toolkit.type)

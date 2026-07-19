@@ -141,6 +141,28 @@ def test_cli_start_scope_closes_runtime_on_success(monkeypatch, sdlc_graph, con)
     assert runtime.closed
 
 
+def test_cli_start_scope_closes_runtime_when_preparation_fails(
+    sdlc_graph, con
+):
+    class FailingPreparationRuntime(_ClosableRuntime):
+        async def prepare_run(self, run_id: str) -> None:
+            raise RuntimeError("workspace preparation failed")
+
+    runtime = FailingPreparationRuntime()
+    with pytest.raises(RuntimeError, match="workspace preparation failed"):
+        asyncio.run(
+            _start_with_cleanup(
+                con,
+                sdlc_graph,
+                runtime,
+                org_id="test",
+                workflow_id="workflow-1",
+                input_payload={},
+            )
+        )
+    assert runtime.closed
+
+
 def test_cli_resume_scope_closes_runtime_on_failure(monkeypatch, sdlc_graph, con):
     async def failing_resume(*args, **kwargs):
         raise RuntimeError("resume failed")
@@ -181,18 +203,39 @@ def _no_toolkit_graph():
     )
 
 
-def test_provision_git_workspace_skips_mock_backend(sdlc_graph, monkeypatch):
-    # Must not even look for .ravana on the mock backend (returns before it).
-    monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: pytest.fail("find_ravana_dir should not be called"))
-    cli_module._provision_git_workspace(sdlc_graph, "mock", "r")  # no exception
+def test_engine_invokes_runtime_run_preparation(con):
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+
+    class PreparingRuntime(_ClosableRuntime):
+        prepared_run_id: str | None = None
+
+        async def prepare_run(self, run_id: str) -> None:
+            self.prepared_run_id = run_id
+
+        async def run_turn(self, **kwargs) -> AgentTurnResult:
+            return AgentTurnResult(structured_payload={})
+
+    graph = _no_toolkit_graph()
+    workflow_id = get_or_create_workflow(
+        con, graph, org_id="test", created_by="test"
+    )
+    runtime = PreparingRuntime()
+    run_id = asyncio.run(
+        start_run(
+            con,
+            graph,
+            runtime,
+            org_id="test",
+            workflow_id=workflow_id,
+        )
+    )
+    assert runtime.prepared_run_id == run_id
 
 
-def test_provision_git_workspace_skips_without_code_interpreter(monkeypatch):
-    monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: pytest.fail("find_ravana_dir should not be called"))
-    cli_module._provision_git_workspace(_no_toolkit_graph(), "llm", "r")  # gated off, no-op
-
-
-def test_provision_git_workspace_clones_for_llm_code_interpreter(tmp_path, sdlc_graph, monkeypatch):
+def test_llm_runtime_prepares_requested_git_base(
+    tmp_path, sdlc_graph, con, monkeypatch
+):
     import shutil
     import subprocess
 
@@ -202,21 +245,47 @@ def test_provision_git_workspace_clones_for_llm_code_interpreter(tmp_path, sdlc_
     subprocess.run(["git", "-C", str(project), "init", "-q"], check=True)
     subprocess.run(["git", "-C", str(project), "config", "user.email", "t@example.com"], check=True)
     subprocess.run(["git", "-C", str(project), "config", "user.name", "T"], check=True)
-    (project / "f.txt").write_text("x")
+    (project / "f.txt").write_text("first")
     subprocess.run(["git", "-C", str(project), "add", "-A"], check=True)
-    subprocess.run(["git", "-C", str(project), "commit", "-q", "-m", "init"], check=True)
+    subprocess.run(["git", "-C", str(project), "commit", "-q", "-m", "first"], check=True)
+    first_commit = subprocess.check_output(
+        ["git", "-C", str(project), "rev-parse", "HEAD"], text=True
+    ).strip()
+    (project / "f.txt").write_text("second")
+    subprocess.run(["git", "-C", str(project), "commit", "-qam", "second"], check=True)
     ravana = project / ".ravana"
     (ravana / "runs").mkdir(parents=True)
     monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: ravana)
 
-    cli_module._provision_git_workspace(sdlc_graph, "llm", "run-x")
+    gateway = _build_llm_gateway(con, sdlc_graph, git_base_ref=first_commit)
+
+    async def prepare_and_close() -> None:
+        try:
+            await gateway.prepare_run("run-x")
+        finally:
+            await gateway.aclose()
+
+    asyncio.run(prepare_and_close())
     ws = ravana / "runs" / "run-x" / "workspace"
-    assert (ws / ".git").exists() and (ws / "f.txt").exists()
+    assert (ws / ".git").exists()
+    assert (ws / "f.txt").read_text() == "first"
 
 
-def test_provision_git_workspace_noop_when_project_not_git(tmp_path, sdlc_graph, monkeypatch):
+def test_llm_runtime_prepares_plain_workspace_for_non_git_project(
+    tmp_path, sdlc_graph, con, monkeypatch
+):
     ravana = tmp_path / ".ravana"
     (ravana / "runs").mkdir(parents=True)
     monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: ravana)
-    cli_module._provision_git_workspace(sdlc_graph, "llm", "run-x")  # parent isn't a git repo
-    assert not (ravana / "runs" / "run-x").exists()  # nothing provisioned
+    gateway = _build_llm_gateway(con, sdlc_graph)
+
+    async def prepare_and_close() -> None:
+        try:
+            await gateway.prepare_run("run-x")
+        finally:
+            await gateway.aclose()
+
+    asyncio.run(prepare_and_close())
+    workspace = ravana / "runs" / "run-x" / "workspace"
+    assert workspace.is_dir()
+    assert not (workspace / ".git").exists()

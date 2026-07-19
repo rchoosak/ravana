@@ -28,7 +28,7 @@ import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 
@@ -51,6 +51,7 @@ class SandboxSpec:
     argv: list[str]  # the command run INSIDE the container (e.g. ["python", "main.py"])
     workspace: Path  # host dir bind-mounted read-write at /workspace — the ONLY mount
     limits: SandboxLimits = SandboxLimits()
+    working_directory: str = "/workspace"
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,13 @@ def build_docker_argv(
     workspace = spec.workspace.resolve()
     workspace_stat = workspace.stat()
     limits = spec.limits
+    working_directory = PurePosixPath(spec.working_directory)
+    if (
+        not working_directory.is_absolute()
+        or working_directory.parts[:2] != ("/", "workspace")
+        or ".." in working_directory.parts
+    ):
+        raise ValueError("sandbox working directory must stay under /workspace")
     argv = [
         "docker",
         "create",
@@ -156,7 +164,7 @@ def build_docker_argv(
         "-v",
         f"{workspace}:/workspace:rw",
         "-w",
-        "/workspace",
+        str(working_directory),
         spec.image,
         "/bin/sh",
         "-c",
