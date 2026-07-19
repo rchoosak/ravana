@@ -991,7 +991,7 @@ The earlier draft of this section said the workspace *is* the project directory,
 
 ```
 my-project/                  <- YOUR actual working directory — agents never write here
-  .git/                       shared object store; the per-run clone below reuses it via --local hardlinks
+  .git/                       source object store; the per-run clone below COPIES it (--no-hardlinks), not hardlinks
   .ravana/
     config.yaml               points at one or more local workflow files
     workflows/                 workflow YAML (§4), same schema as every other tier
@@ -1005,7 +1005,7 @@ my-project/                  <- YOUR actual working directory — agents never w
 ```
 
 **Isolation mechanism, in order of preference:**
-1. **`git clone --local .ravana/runs/<run_id>/workspace` on a fresh branch off the requested base** (default). A local clone is a fully independent repository — separate `.git`, separate refs, separate index/HEAD — so there is categorically no way for anything the agent does (including a bad `git reset`/`rm -rf`, not just a bad file edit) to reach your actual checkout. `--local` mode hardlinks objects on the same filesystem, so this costs about as much time and disk as a `git worktree` would, without the shared-object-store caveat.
+1. **`git clone --no-hardlinks <repo toplevel> .ravana/runs/<run_id>/workspace` on a fresh branch off the requested base** (default). A local clone is a fully independent repository — separate `.git`, separate refs, separate index/HEAD — so there is categorically no way for anything the agent does (including a bad `git reset`/`rm -rf`, not just a bad file edit) to reach your actual checkout. **`--no-hardlinks` is load-bearing, not an optimization to skip**: the sandbox bind-mounts the workspace *including its `.git`* read-write (point 4), so plain `--local` hardlinking — which shares `.git/objects` inodes with the source — would let agent code writing through a workspace object inode corrupt the developer's own repo (its `git fsck` then fails). Copying the objects costs more disk/time than a hardlink but is the price of the isolation guarantee. Provisioning clones into a staging dir and `rename`s it into place atomically, so an interrupted attempt never leaves a half-clone a retry would mistake for a finished workspace; and the base is resolved to the repo **toplevel** (`git rev-parse --show-toplevel`), so a `.ravana/` in a monorepo subdirectory still clones the whole repo.
 2. **`git worktree add` as an explicit opt-in** for anyone who wants a lighter-weight setup and accepts the tradeoff (shared `.git` object database with the main checkout — working tree and index are still fully isolated, which covers the overwhelming majority of "don't touch my files" concerns, just not a categorically separate repo).
 3. **If the target isn't a git repo at all**, Ravana runs a local `git init` scoped entirely inside `.ravana/` as a shadow history, so the same clone/branch/diff mechanism still applies rather than special-casing a plain directory copy.
 4. `code_interpreter`'s local Docker container (§8's build-vs-buy tier for this mode) mounts **only `runs/<run_id>/workspace`**, never the parent project directory — the isolation is enforced at the bind-mount level, not just by convention, so it holds even if something inside the container misbehaves.

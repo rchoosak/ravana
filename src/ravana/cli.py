@@ -25,7 +25,7 @@ from ravana.engine.dod import ProseVerdict
 from ravana.engine.loop import TERMINAL_STATUSES, resume_hitl, start_run
 from ravana.runtime.base import AgentRuntime, ProseJudge
 from ravana.runtime.gateway import LLMGateway
-from ravana.runtime.git_workspace import is_git_repo, provision_run_workspace
+from ravana.runtime.git_workspace import git_toplevel, provision_run_workspace
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
 from ravana.runtime.providers.base import ProviderAdapter
@@ -148,10 +148,15 @@ def _provision_git_workspace(graph: CompiledGraph, backend: str, run_id: str) ->
         return
     if not any(t.type == "code_interpreter" for t in graph.toolkits_by_id.values()):
         return
-    project = find_ravana_dir().parent
-    if not is_git_repo(project):
+    ravana = find_ravana_dir()
+    # Clone the git TOPLEVEL, not `.ravana`'s parent directly — when `.ravana/`
+    # lives in a monorepo subdirectory, the parent is inside a work tree but
+    # `git clone <subdir>` fails; the toplevel is the actual repo. None means
+    # the project isn't a git repo, so code_interpreter uses a plain dir.
+    top = git_toplevel(ravana.parent)
+    if top is None:
         return
-    provision_run_workspace(base_repo=project, runs_dir=find_ravana_dir() / "runs", run_id=run_id)
+    provision_run_workspace(base_repo=top, runs_dir=ravana / "runs", run_id=run_id)
 
 
 async def _start_with_cleanup(
@@ -257,12 +262,13 @@ def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: 
     graph = compile_workflow(doc)
     workflow_id = get_or_create_workflow(con, graph, org_id=org, created_by="cli-user")
     input_payload = json.loads(input_json)
-    runtime = _build_runtime(con, graph, backend, mock_fixture)
 
     # §10.1: provision the isolated git workspace under the SAME id the run uses,
-    # before the run starts (so the clone is ready whenever code_interpreter runs).
+    # BEFORE building the runtime — a provisioning failure then leaks no runtime
+    # to close (the runtime's own cleanup only starts inside _start_with_cleanup).
     run_id = new_id()
     _provision_git_workspace(graph, backend, run_id)
+    runtime = _build_runtime(con, graph, backend, mock_fixture)
 
     run_id = asyncio.run(
         _start_with_cleanup(

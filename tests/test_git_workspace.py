@@ -5,12 +5,19 @@ a fully independent clone that can't reach the base repo's checkout.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 
 import pytest
 
-from ravana.runtime.git_workspace import GitError, is_git_repo, provision_run_workspace, run_branch_name
+from ravana.runtime.git_workspace import (
+    GitError,
+    git_toplevel,
+    is_git_repo,
+    provision_run_workspace,
+    run_branch_name,
+)
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
 
@@ -68,6 +75,54 @@ def test_idempotent_returns_existing_without_reclone(tmp_path):
     ws2 = provision_run_workspace(base_repo=base, runs_dir=runs, run_id="r")
     assert ws2 == ws
     assert (ws / "in_progress.txt").read_text() == "do not clobber"  # re-clone would have wiped it
+
+
+def test_clone_objects_are_independent_of_the_source(tmp_path):
+    # P0: the sandbox mounts the workspace `.git` writable, so a hardlinked
+    # clone would let agent code corrupt the SOURCE repo's objects. --no-hardlinks
+    # copies them: corrupting a clone object must leave the source's fsck clean.
+    base = _make_repo(tmp_path / "project")
+    ws = provision_run_workspace(base_repo=base, runs_dir=tmp_path / "runs", run_id="r")
+    clone_objects = [p for p in (ws / ".git" / "objects").rglob("*") if p.is_file()]
+    assert clone_objects, "expected packed/loose objects in the clone"
+    victim = clone_objects[0]
+    os.chmod(victim, 0o644)
+    victim.write_bytes(b"CORRUPTED BY AGENT")
+    fsck = subprocess.run(["git", "-C", str(base), "fsck"], capture_output=True, text=True)
+    assert fsck.returncode == 0, f"source repo was corrupted via the clone: {fsck.stderr}"
+
+
+def test_provisions_from_monorepo_toplevel_when_ravana_in_a_subdir(tmp_path):
+    # §10.1 nested-project: given a path INSIDE a work tree (a monorepo subdir),
+    # provisioning clones the repo TOPLEVEL, not the subdir (which git can't clone).
+    base = _make_repo(tmp_path / "monorepo")
+    subdir = base / "packages" / "app"
+    subdir.mkdir(parents=True)
+    ws = provision_run_workspace(base_repo=subdir, runs_dir=tmp_path / "runs", run_id="r")
+    assert (ws / ".git").exists()
+    assert (ws / "README.md").read_text() == "base\n"  # toplevel content
+
+
+def test_partial_workspace_is_rejected_not_silently_reused(tmp_path):
+    # A half-written workspace (interrupted provision) must NOT be accepted as a
+    # finished one — the run would execute against a broken repo.
+    base = _make_repo(tmp_path / "project")
+    runs = tmp_path / "runs"
+    partial = runs / "r" / "workspace"
+    partial.mkdir(parents=True)
+    (partial / "junk").write_text("half")  # exists, but not a git repo
+    with pytest.raises(GitError, match="not a valid git repo"):
+        provision_run_workspace(base_repo=base, runs_dir=runs, run_id="r")
+
+
+def test_git_toplevel(tmp_path):
+    base = _make_repo(tmp_path / "repo")
+    sub = base / "a" / "b"
+    sub.mkdir(parents=True)
+    assert git_toplevel(sub).resolve() == base.resolve()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert git_toplevel(plain) is None
 
 
 def test_non_git_base_raises(tmp_path):
