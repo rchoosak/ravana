@@ -37,9 +37,9 @@ from typing import Any
 from ravana.runtime.git_workspace import (
     DEFAULT_BASE_REF,
     GitError,
-    git_toplevel_async,
-    provision_run_workspace_async,
-    provision_shadow_workspace_async,
+    git_toplevel,
+    provision_run_workspace,
+    provision_shadow_workspace,
 )
 from ravana.runtime.toolkits.base import (
     ToolFailureKind,
@@ -306,7 +306,7 @@ class CodeInterpreterHandler:
 
             project_subpath = Path()
             project_toplevel = (
-                await git_toplevel_async(self._project_dir)
+                await git_toplevel(self._project_dir)
                 if self._project_dir is not None
                 else None
             )
@@ -314,7 +314,7 @@ class CodeInterpreterHandler:
                 project_subpath = self._project_dir.resolve().relative_to(
                     project_toplevel.resolve()
                 )
-                workspace = await provision_run_workspace_async(
+                workspace = await provision_run_workspace(
                     base_repo=project_toplevel,
                     runs_dir=runs_dir,
                     run_id=run_id,
@@ -330,7 +330,7 @@ class CodeInterpreterHandler:
                         "code_interpreter: --base-ref requires a git project",
                         kind=ToolFailureKind.FATAL,
                     )
-                workspace = await provision_shadow_workspace_async(
+                workspace = await provision_shadow_workspace(
                     project_dir=self._project_dir,
                     runs_dir=runs_dir,
                     run_id=run_id,

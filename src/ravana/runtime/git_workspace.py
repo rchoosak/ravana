@@ -16,6 +16,11 @@ copies the objects, so the clone is a genuinely independent repository (its own
 still can't reach the source. Provisioning is atomic (clone into a staging dir,
 then `rename` into place) so an interrupted attempt never leaves a half-clone
 that a retry would mistake for a finished workspace.
+
+Every entry point here is async: provisioning runs inside the engine's event
+loop, and these are the functions the product actually calls. There is
+deliberately no sync twin — a second copy of these validations is a second
+place for a security check to drift.
 """
 
 from __future__ import annotations
@@ -64,27 +69,23 @@ def run_branch_name(run_id: str) -> str:
     return f"{RUN_BRANCH_PREFIX}{run_id}"
 
 
-def git_toplevel(path: Path, *, git: str = "git") -> Path | None:
+async def git_toplevel(path: Path, *, git: str = "git") -> Path | None:
     """The root of the git working tree containing `path`, or None if `path`
     isn't inside one. Cloning must use the toplevel, not `path` itself — when
     `.ravana/` sits in a subdirectory of a monorepo, `path` is inside a work
     tree but `git clone <subdir>` fails; the toplevel is the real repo."""
     if not path.is_dir():
         return None
-    result = _git(["-C", str(path), "rev-parse", "--show-toplevel"], git=git, check=False)
-    if result.returncode != 0:
-        return None
+    result = await _git(
+        ["-C", str(path), "rev-parse", "--show-toplevel"],
+        git=git,
+        check=False,
+    )
     top = result.stdout.strip()
-    return Path(top) if top else None
+    return Path(top) if result.returncode == 0 and top else None
 
 
-def is_git_repo(path: Path, *, git: str = "git") -> bool:
-    """True if `path` is inside a git working tree (the precondition for using
-    it — or its toplevel — as a run's base repo)."""
-    return git_toplevel(path, git=git) is not None
-
-
-def provision_run_workspace(
+async def provision_run_workspace(
     *,
     base_repo: Path,
     runs_dir: Path,
@@ -102,20 +103,19 @@ def provision_run_workspace(
     workspace (which the atomic publish makes near-impossible, but verify rather
     than trust) fails loudly rather than running against a broken repo.
     """
-    runs_dir, run_dir, workspace = _workspace_paths(runs_dir, run_id)
-
-    top = git_toplevel(base_repo, git=git)
+    _, run_dir, workspace = _workspace_paths(runs_dir, run_id)
+    top = await git_toplevel(base_repo, git=git)
     if top is None:
         raise GitError(f"base repo is not a git working tree: {base_repo.resolve()}")
     top = top.resolve()
 
     if workspace.exists():
         requested_base_commit = (
-            _resolve_commit(top, base_ref, git=git)
+            await _resolve_commit(top, base_ref, git=git)
             if base_ref is not None
             else None
         )
-        _validate_existing_workspace(
+        await _validate_existing_workspace(
             workspace,
             run_dir=run_dir,
             source_toplevel=top,
@@ -132,7 +132,7 @@ def provision_run_workspace(
         )
     if base_ref is None:
         raise GitError("a base ref is required when provisioning a new git workspace")
-    base_commit = _resolve_commit(top, base_ref, git=git)
+    base_commit = await _resolve_commit(top, base_ref, git=git)
 
     run_dir.mkdir(parents=True, exist_ok=True)
     staging = run_dir / f".workspace-staging-{uuid.uuid4().hex}"
@@ -141,9 +141,20 @@ def provision_run_workspace(
         # `--no-hardlinks`: copy objects so the clone shares NO inodes with the
         # source (see module docstring) — the writable sandbox mount makes
         # hardlinks a source-corruption vector.
-        _git(["clone", "--no-hardlinks", str(top), str(staging)], git=git, check=True)
-        _git(
-            ["-C", str(staging), "checkout", "-b", run_branch_name(run_id), base_commit],
+        await _git(
+            ["clone", "--no-hardlinks", str(top), str(staging)],
+            git=git,
+            check=True,
+        )
+        await _git(
+            [
+                "-C",
+                str(staging),
+                "checkout",
+                "-b",
+                run_branch_name(run_id),
+                base_commit,
+            ],
             git=git,
             check=True,
         )
@@ -169,21 +180,26 @@ def provision_run_workspace(
     return workspace
 
 
-def provision_shadow_workspace(
+async def provision_shadow_workspace(
     *,
     project_dir: Path,
     runs_dir: Path,
     run_id: str,
     git: str = "git",
 ) -> Path:
-    """Snapshot a non-git project into an isolated shadow repository."""
-    runs_dir, run_dir, workspace = _workspace_paths(runs_dir, run_id)
+    """Snapshot a non-git project into an isolated shadow repository.
+
+    Same atomic-publish and idempotency contract as `provision_run_workspace`;
+    the base is a copy of the project rather than a clone, committed onto the
+    run branch so the agent still gets git semantics.
+    """
+    _, run_dir, workspace = _workspace_paths(runs_dir, run_id)
     project_dir = project_dir.resolve()
     if not project_dir.is_dir():
         raise GitError(f"shadow workspace source is not a directory: {project_dir}")
 
     if workspace.exists():
-        _validate_existing_workspace(
+        await _validate_existing_workspace(
             workspace,
             run_dir=run_dir,
             source_toplevel=project_dir,
@@ -202,18 +218,29 @@ def provision_shadow_workspace(
     staging = run_dir / f".workspace-staging-{uuid.uuid4().hex}"
     published = False
     try:
-        _copy_project_snapshot(project_dir, staging)
-        _initialize_shadow_repo(
-            staging,
-            run_id=run_id,
-            git=git,
-        )
-        base_commit = _git(
-            ["-C", str(staging), "rev-parse", "--verify", "HEAD^{commit}"],
-            git=git,
+        # A killable child process: a large `copytree` in-process would block the
+        # event loop and ignore cancellation.
+        await _run_subprocess(
+            [
+                sys.executable,
+                "-m",
+                "ravana.runtime.shadow_copy",
+                str(project_dir),
+                str(staging),
+            ],
+            operation="non-git project snapshot",
+            timeout_seconds=_GIT_TIMEOUT_SECONDS,
             check=True,
+        )
+        await _initialize_shadow_repo(staging, run_id=run_id, git=git)
+        base_commit = (
+            await _git(
+                ["-C", str(staging), "rev-parse", "--verify", "HEAD^{commit}"],
+                git=git,
+                check=True,
+            )
         ).stdout.strip()
-        os.rename(staging, workspace)
+        os.rename(staging, workspace)  # atomic publish (same filesystem)
         published = True
         _write_provenance(
             run_dir,
@@ -235,10 +262,10 @@ def provision_shadow_workspace(
     return workspace
 
 
-def _resolve_commit(repo: Path, base_ref: str, *, git: str) -> str:
+async def _resolve_commit(repo: Path, base_ref: str, *, git: str) -> str:
     if not base_ref:
         raise GitError("base ref must not be empty")
-    result = _git(
+    result = await _git(
         ["-C", str(repo), "rev-parse", "--verify", f"{base_ref}^{{commit}}"],
         git=git,
         check=False,
@@ -249,9 +276,7 @@ def _resolve_commit(repo: Path, base_ref: str, *, git: str) -> str:
     return commit
 
 
-def _workspace_paths(
-    runs_dir: Path, run_id: str
-) -> tuple[Path, Path, Path]:
+def _workspace_paths(runs_dir: Path, run_id: str) -> tuple[Path, Path, Path]:
     runs_dir = runs_dir.resolve()
     if (
         not run_id
@@ -279,9 +304,7 @@ def _provenance_path(run_dir: Path) -> Path:
     return run_dir / _PROVENANCE_FILENAME
 
 
-def _write_provenance(
-    run_dir: Path, provenance: WorkspaceProvenance
-) -> None:
+def _write_provenance(run_dir: Path, provenance: WorkspaceProvenance) -> None:
     path = _provenance_path(run_dir)
     temp_path = run_dir / f".{_PROVENANCE_FILENAME}.{uuid.uuid4().hex}.tmp"
     payload = json.dumps(
@@ -326,9 +349,7 @@ def _read_provenance(run_dir: Path) -> WorkspaceProvenance:
     try:
         path_stat = path.lstat()
         if not stat.S_ISREG(path_stat.st_mode):
-            raise GitError(
-                f"workspace has no trusted no-hardlinks provenance: {path}"
-            )
+            raise GitError(f"workspace has no trusted no-hardlinks provenance: {path}")
         if path_stat.st_size > _MAX_PROVENANCE_BYTES:
             raise GitError(f"workspace provenance exceeds its size limit: {path}")
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -345,9 +366,8 @@ def _read_provenance(run_dir: Path) -> WorkspaceProvenance:
     branch = payload.get("branch")
     base_commit = payload.get("base_commit")
     fields = (version, isolation_mode, source_toplevel, branch, base_commit)
-    if (
-        type(fields[0]) is not int
-        or any(type(value) is not str or not value for value in fields[1:])
+    if type(fields[0]) is not int or any(
+        type(value) is not str or not value for value in fields[1:]
     ):
         raise GitError(f"workspace provenance is invalid: {path}")
     return WorkspaceProvenance(
@@ -359,7 +379,7 @@ def _read_provenance(run_dir: Path) -> WorkspaceProvenance:
     )
 
 
-def _validate_existing_workspace(
+async def _validate_existing_workspace(
     workspace: Path,
     *,
     run_dir: Path,
@@ -369,13 +389,13 @@ def _validate_existing_workspace(
     requested_base_commit: str | None,
     git: str,
 ) -> None:
-    workspace_toplevel = git_toplevel(workspace, git=git)
+    workspace_toplevel = await git_toplevel(workspace, git=git)
     if workspace_toplevel is None or workspace_toplevel.resolve() != workspace:
         raise GitError(
             f"existing run workspace is not an independent git repo (partial/corrupt): {workspace}"
         )
 
-    branch = _git(
+    branch = await _git(
         ["-C", str(workspace), "symbolic-ref", "--quiet", "--short", "HEAD"],
         git=git,
         check=False,
@@ -386,7 +406,7 @@ def _validate_existing_workspace(
         )
 
     if expected_mode == _GIT_CLONE_MODE:
-        origin = _git(
+        origin = await _git(
             ["-C", str(workspace), "config", "--get", "remote.origin.url"],
             git=git,
             check=False,
@@ -421,8 +441,7 @@ def _validate_provenance(
     if (
         provenance.version != _PROVENANCE_VERSION
         or provenance.isolation_mode != expected_mode
-        or Path(provenance.source_toplevel).expanduser().resolve()
-        != source_toplevel
+        or Path(provenance.source_toplevel).expanduser().resolve() != source_toplevel
         or provenance.branch != expected_branch
     ):
         raise GitError(
@@ -437,308 +456,7 @@ def _validate_provenance(
         )
 
 
-def _copy_project_snapshot(project_dir: Path, staging: Path) -> None:
-    def ignore_root(path: str, names: list[str]) -> set[str]:
-        return {".ravana"} if Path(path).resolve() == project_dir else set()
-
-    try:
-        shutil.copytree(
-            project_dir,
-            staging,
-            symlinks=True,
-            ignore=ignore_root,
-        )
-    except OSError as exc:
-        raise GitError(
-            f"non-git project snapshot failed ({type(exc).__name__})"
-        ) from exc
-
-
-def _initialize_shadow_repo(
-    staging: Path, *, run_id: str, git: str
-) -> None:
-    _git(["-C", str(staging), "init", "-q"], git=git, check=True)
-    _git(
-        ["-C", str(staging), "config", "user.name", "Ravana"],
-        git=git,
-        check=True,
-    )
-    _git(
-        ["-C", str(staging), "config", "user.email", "ravana@local"],
-        git=git,
-        check=True,
-    )
-    _git(["-C", str(staging), "add", "-A"], git=git, check=True)
-    _git(
-        [
-            "-C",
-            str(staging),
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "Ravana shadow base",
-        ],
-        git=git,
-        check=True,
-    )
-    _git(
-        [
-            "-C",
-            str(staging),
-            "checkout",
-            "-q",
-            "-b",
-            run_branch_name(run_id),
-        ],
-        git=git,
-        check=True,
-    )
-
-
-async def git_toplevel_async(
-    path: Path, *, git: str = "git"
-) -> Path | None:
-    """Async counterpart used by the embedded run-preparation boundary."""
-    if not path.is_dir():
-        return None
-    result = await _git_async(
-        ["-C", str(path), "rev-parse", "--show-toplevel"],
-        git=git,
-        check=False,
-    )
-    top = result.stdout.strip()
-    return Path(top) if result.returncode == 0 and top else None
-
-
-async def provision_run_workspace_async(
-    *,
-    base_repo: Path,
-    runs_dir: Path,
-    run_id: str,
-    base_ref: str | None = DEFAULT_BASE_REF,
-    git: str = "git",
-) -> Path:
-    """Cancellable async provisioning for engine and embedded callers."""
-    _, run_dir, workspace = _workspace_paths(runs_dir, run_id)
-    top = await git_toplevel_async(base_repo, git=git)
-    if top is None:
-        raise GitError(f"base repo is not a git working tree: {base_repo.resolve()}")
-    top = top.resolve()
-
-    if workspace.exists():
-        requested_base_commit = (
-            await _resolve_commit_async(top, base_ref, git=git)
-            if base_ref is not None
-            else None
-        )
-        await _validate_existing_workspace_async(
-            workspace,
-            run_dir=run_dir,
-            source_toplevel=top,
-            expected_branch=run_branch_name(run_id),
-            expected_mode=_GIT_CLONE_MODE,
-            requested_base_commit=requested_base_commit,
-            git=git,
-        )
-        return workspace
-
-    if _provenance_path(run_dir).exists():
-        raise GitError(
-            f"workspace provenance exists without a workspace (partial/corrupt): {run_dir}"
-        )
-    if base_ref is None:
-        raise GitError("a base ref is required when provisioning a new git workspace")
-    base_commit = await _resolve_commit_async(top, base_ref, git=git)
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    staging = run_dir / f".workspace-staging-{uuid.uuid4().hex}"
-    published = False
-    try:
-        await _git_async(
-            ["clone", "--no-hardlinks", str(top), str(staging)],
-            git=git,
-            check=True,
-        )
-        await _git_async(
-            [
-                "-C",
-                str(staging),
-                "checkout",
-                "-b",
-                run_branch_name(run_id),
-                base_commit,
-            ],
-            git=git,
-            check=True,
-        )
-        os.rename(staging, workspace)
-        published = True
-        _write_provenance(
-            run_dir,
-            WorkspaceProvenance(
-                version=_PROVENANCE_VERSION,
-                isolation_mode=_GIT_CLONE_MODE,
-                source_toplevel=str(top),
-                branch=run_branch_name(run_id),
-                base_commit=base_commit,
-            ),
-        )
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        if published:
-            shutil.rmtree(workspace, ignore_errors=True)
-            with contextlib.suppress(OSError):
-                _provenance_path(run_dir).unlink()
-        raise
-    return workspace
-
-
-async def provision_shadow_workspace_async(
-    *,
-    project_dir: Path,
-    runs_dir: Path,
-    run_id: str,
-    git: str = "git",
-) -> Path:
-    """Cancellable async snapshot for a project that has no Git repository."""
-    _, run_dir, workspace = _workspace_paths(runs_dir, run_id)
-    project_dir = project_dir.resolve()
-    if not project_dir.is_dir():
-        raise GitError(f"shadow workspace source is not a directory: {project_dir}")
-
-    if workspace.exists():
-        await _validate_existing_workspace_async(
-            workspace,
-            run_dir=run_dir,
-            source_toplevel=project_dir,
-            expected_branch=run_branch_name(run_id),
-            expected_mode=_SHADOW_COPY_MODE,
-            requested_base_commit=None,
-            git=git,
-        )
-        return workspace
-    if _provenance_path(run_dir).exists():
-        raise GitError(
-            f"workspace provenance exists without a workspace (partial/corrupt): {run_dir}"
-        )
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    staging = run_dir / f".workspace-staging-{uuid.uuid4().hex}"
-    published = False
-    try:
-        await _run_subprocess_async(
-            [
-                sys.executable,
-                "-m",
-                "ravana.runtime.shadow_copy",
-                str(project_dir),
-                str(staging),
-            ],
-            operation="non-git project snapshot",
-            timeout_seconds=_GIT_TIMEOUT_SECONDS,
-            check=True,
-        )
-        await _initialize_shadow_repo_async(staging, run_id=run_id, git=git)
-        base_commit = (
-            await _git_async(
-                ["-C", str(staging), "rev-parse", "--verify", "HEAD^{commit}"],
-                git=git,
-                check=True,
-            )
-        ).stdout.strip()
-        os.rename(staging, workspace)
-        published = True
-        _write_provenance(
-            run_dir,
-            WorkspaceProvenance(
-                version=_PROVENANCE_VERSION,
-                isolation_mode=_SHADOW_COPY_MODE,
-                source_toplevel=str(project_dir),
-                branch=run_branch_name(run_id),
-                base_commit=base_commit,
-            ),
-        )
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        if published:
-            shutil.rmtree(workspace, ignore_errors=True)
-            with contextlib.suppress(OSError):
-                _provenance_path(run_dir).unlink()
-        raise
-    return workspace
-
-
-async def _resolve_commit_async(
-    repo: Path, base_ref: str, *, git: str
-) -> str:
-    if not base_ref:
-        raise GitError("base ref must not be empty")
-    result = await _git_async(
-        ["-C", str(repo), "rev-parse", "--verify", f"{base_ref}^{{commit}}"],
-        git=git,
-        check=False,
-    )
-    commit = result.stdout.strip()
-    if result.returncode != 0 or not commit:
-        raise GitError(f"base ref does not resolve to a commit: {base_ref!r}")
-    return commit
-
-
-async def _validate_existing_workspace_async(
-    workspace: Path,
-    *,
-    run_dir: Path,
-    source_toplevel: Path,
-    expected_branch: str,
-    expected_mode: str,
-    requested_base_commit: str | None,
-    git: str,
-) -> None:
-    workspace_toplevel = await git_toplevel_async(workspace, git=git)
-    if workspace_toplevel is None or workspace_toplevel.resolve() != workspace:
-        raise GitError(
-            f"existing run workspace is not an independent git repo (partial/corrupt): {workspace}"
-        )
-
-    branch = await _git_async(
-        ["-C", str(workspace), "symbolic-ref", "--quiet", "--short", "HEAD"],
-        git=git,
-        check=False,
-    )
-    if branch.returncode != 0 or branch.stdout.strip() != expected_branch:
-        raise GitError(
-            f"existing run workspace is not on expected branch {expected_branch!r}: {workspace}"
-        )
-
-    if expected_mode == _GIT_CLONE_MODE:
-        origin = await _git_async(
-            ["-C", str(workspace), "config", "--get", "remote.origin.url"],
-            git=git,
-            check=False,
-        )
-        origin_path = origin.stdout.strip()
-        if (
-            origin.returncode != 0
-            or not origin_path
-            or Path(origin_path).expanduser().resolve() != source_toplevel
-        ):
-            raise GitError(
-                f"existing run workspace does not belong to source repo {source_toplevel}: {workspace}"
-            )
-
-    _validate_provenance(
-        _read_provenance(run_dir),
-        source_toplevel=source_toplevel,
-        expected_branch=expected_branch,
-        expected_mode=expected_mode,
-        requested_base_commit=requested_base_commit,
-    )
-
-
-async def _initialize_shadow_repo_async(
-    staging: Path, *, run_id: str, git: str
-) -> None:
+async def _initialize_shadow_repo(staging: Path, *, run_id: str, git: str) -> None:
     commands = [
         ["-C", str(staging), "init", "-q"],
         ["-C", str(staging), "config", "user.name", "Ravana"],
@@ -753,24 +471,17 @@ async def _initialize_shadow_repo_async(
             "-m",
             "Ravana shadow base",
         ],
-        [
-            "-C",
-            str(staging),
-            "checkout",
-            "-q",
-            "-b",
-            run_branch_name(run_id),
-        ],
+        ["-C", str(staging), "checkout", "-q", "-b", run_branch_name(run_id)],
     ]
     for command in commands:
-        await _git_async(command, git=git, check=True)
+        await _git(command, git=git, check=True)
 
 
-async def _git_async(
+async def _git(
     args: list[str], *, git: str, check: bool
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return await _run_subprocess_async(
+        return await _run_subprocess(
             [git, *args],
             operation=f"git {args[0]}",
             timeout_seconds=_GIT_TIMEOUT_SECONDS,
@@ -782,13 +493,16 @@ async def _git_async(
         ) from exc
 
 
-async def _run_subprocess_async(
+async def _run_subprocess(
     argv: list[str],
     *,
     operation: str,
     timeout_seconds: float,
     check: bool,
 ) -> subprocess.CompletedProcess[str]:
+    # `start_new_session=True` puts the child in its own process group so a
+    # timeout can kill it AND any helper / hook subprocess it spawned — killing
+    # only the direct child would orphan its descendants.
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -799,90 +513,43 @@ async def _run_subprocess_async(
     except FileNotFoundError:
         raise
     except OSError as exc:
-        raise GitError(
-            f"{operation} could not start ({type(exc).__name__})"
-        ) from exc
+        raise GitError(f"{operation} could not start ({type(exc).__name__})") from exc
 
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_seconds
         )
     except asyncio.TimeoutError as exc:
-        await _stop_async_process_group(proc)
-        raise GitError(
-            f"{operation} timed out after {timeout_seconds:g}s"
-        ) from exc
+        await _stop_process_group(proc)
+        raise GitError(f"{operation} timed out after {timeout_seconds:g}s") from exc
     except BaseException:
-        await _stop_async_process_group(proc)
+        await _stop_process_group(proc)
         raise
 
     stdout = stdout_bytes.decode("utf-8", "replace")
     stderr = stderr_bytes.decode("utf-8", "replace")
     returncode = proc.returncode or 0
     if check and returncode != 0:
-        raise GitError(
-            f"{operation} failed (exit {returncode}): {stderr.strip()}"
-        )
+        # git's stderr names paths/refs, not credentials; it's the actionable part.
+        raise GitError(f"{operation} failed (exit {returncode}): {stderr.strip()}")
     return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
 
 
-async def _stop_async_process_group(
-    proc: asyncio.subprocess.Process,
-) -> None:
+async def _stop_process_group(proc: asyncio.subprocess.Process) -> None:
+    # Best-effort: killing the group (the child + any helper/hook) must never
+    # mask the timeout or cancellation that triggered it.
     with contextlib.suppress(ProcessLookupError):
+        # start_new_session=True makes the child's pid its process-group id.
         os.killpg(proc.pid, signal.SIGKILL)
 
     async def reap() -> None:
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(
-                proc.communicate(), timeout=_GIT_CLEANUP_SECONDS
-            )
+            await asyncio.wait_for(proc.communicate(), timeout=_GIT_CLEANUP_SECONDS)
 
+    # Shielded so cancellation during cleanup can't leave a zombie behind.
     cleanup = asyncio.create_task(reap())
     while not cleanup.done():
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
             continue
-
-
-def _git(args: list[str], *, git: str, check: bool) -> subprocess.CompletedProcess[str]:
-    # Run in its own process group so a timeout can kill git AND any helper /
-    # hook subprocess it spawned — `subprocess.run(timeout=)` only kills the
-    # direct child, orphaning descendants.
-    try:
-        proc = subprocess.Popen(
-            [git, *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-    except FileNotFoundError as exc:
-        raise GitError(f"'{git}' not found on PATH — the Local tier needs git for workspace isolation (§10.1)") from exc
-    try:
-        stdout, stderr = proc.communicate(timeout=_GIT_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as exc:
-        _kill_process_group(proc)
-        with contextlib.suppress(Exception):
-            proc.communicate(timeout=5)  # reap
-        raise GitError(f"git {args[0]} timed out after {_GIT_TIMEOUT_SECONDS}s") from exc
-    except BaseException:
-        _kill_process_group(proc)
-        with contextlib.suppress(Exception):
-            proc.communicate(timeout=5)
-        raise
-    if check and proc.returncode != 0:
-        # git's stderr names paths/refs, not credentials; it's the actionable part.
-        raise GitError(f"git {args[0]} failed (exit {proc.returncode}): {(stderr or '').strip()}")
-    return subprocess.CompletedProcess(args, proc.returncode or 0, stdout, stderr)
-
-
-def _kill_process_group(proc: subprocess.Popen[str]) -> None:
-    # Best-effort: killing the group (git + any helper/hook) must never mask
-    # the timeout that triggered it.
-    with contextlib.suppress(Exception):
-        # start_new_session=True makes the child's pid its process-group id.
-        # Using the saved id still works if the direct child has just exited
-        # while one of its descendants keeps a pipe open.
-        os.killpg(proc.pid, signal.SIGKILL)
