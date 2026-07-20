@@ -143,6 +143,67 @@ async def test_uncommitted_patch_applies_and_restores_the_agents_work(tmp_path):
     assert (reviewer / "README.md").read_text() == "edited by agent\n"
 
 
+async def test_uncommitted_binary_file_round_trips(tmp_path):
+    # A plain `git diff` degrades a binary to "Binary files ... differ", which
+    # `git apply` then refuses outright — the file would be unrecoverable from
+    # the handoff. Agents produce binaries (build output, images, reports).
+    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489")
+    base, runs, ws = await _workspace(tmp_path)
+    (ws / "report.pdf").write_bytes(png + b"\x00binary trailing bytes")
+
+    result = await hand_off_run(runs_dir=runs, run_id="r")
+
+    reviewer = _make_repo(tmp_path / "reviewer")
+    _git(reviewer, "apply", str(result.patch_dir / "uncommitted.diff"))
+
+    assert (reviewer / "report.pdf").read_bytes() == png + b"\x00binary trailing bytes"
+
+
+async def test_committed_binary_file_round_trips(tmp_path):
+    # The format-patch path already emits a GIT binary patch; lock that in so a
+    # later flag change can't silently regress it to "Binary files differ".
+    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489")
+    base, runs, ws = await _workspace(tmp_path)
+    (ws / "logo.png").write_bytes(png)
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-q", "-m", "add logo")
+
+    result = await hand_off_run(runs_dir=runs, run_id="r")
+
+    reviewer = _make_repo(tmp_path / "reviewer")
+    _git(reviewer, "am", str(result.patch_dir / "0001-add-logo.patch"))
+
+    assert (reviewer / "logo.png").read_bytes() == png
+
+
+async def test_existing_handoff_is_reported_even_if_the_workspace_is_gone(tmp_path):
+    # The patch is the delivered artifact and lives in the run dir, not the
+    # workspace. Once it exists, a cleaned-up workspace must not turn an
+    # idempotent re-report into a failure.
+    base, runs, ws = await _workspace(tmp_path)
+    _agent_commit(ws, "feature.py", "print('hi')\n", "add feature")
+    first = await hand_off_run(runs_dir=runs, run_id="r")
+    shutil.rmtree(ws)
+
+    second = await hand_off_run(runs_dir=runs, run_id="r")
+
+    assert second.previously_handed_off is True
+    assert second.patch_dir == first.patch_dir
+    assert second.commit_count == 1
+
+
+async def test_existing_handoff_is_reported_even_off_the_run_branch(tmp_path):
+    base, runs, ws = await _workspace(tmp_path)
+    _agent_commit(ws, "feature.py", "print('hi')\n", "add feature")
+    await hand_off_run(runs_dir=runs, run_id="r")
+    _git(ws, "checkout", "-q", "-b", "some-other-branch")
+
+    result = await hand_off_run(runs_dir=runs, run_id="r")
+
+    assert result.previously_handed_off is True
+    assert result.commit_count == 1
+
+
 async def test_gitignored_files_stay_out_of_the_patch(tmp_path):
     # `add -N` honours .gitignore, so build output and dependencies don't get
     # swept into a patch a human has to read.

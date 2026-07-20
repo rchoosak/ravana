@@ -21,9 +21,11 @@ Two facts make the patch honest rather than approximate:
   so uncommitted work — **including brand-new untracked files, which are the
   most common thing a code-writing agent produces** — is captured as a separate
   `uncommitted.diff`. `git diff HEAD` alone would silently emit nothing for an
-  untracked file, so those paths are marked intent-to-add first (see
-  `_write_patches`). Inventing a commit to tidy this up would put words in the
-  agent's mouth; dropping it would lose the work outright.
+  untracked file, so those paths are marked intent-to-add first, and the diff
+  is taken with `--binary` so a build artifact or image survives as something
+  `git apply` can actually restore (see `_write_patches`). Inventing a commit to
+  tidy this up would put words in the agent's mouth; dropping it would lose the
+  work outright.
 """
 
 from __future__ import annotations
@@ -93,18 +95,17 @@ async def hand_off_run(
     produce a second copy or clobber a patch the developer is already reading.
     """
     _, run_dir, workspace = workspace_paths(runs_dir, run_id)
-    if not workspace.is_dir():
-        raise GitError(f"run workspace does not exist, nothing to hand off: {workspace}")
-
+    # Provenance and the patch set both live in the run dir, NOT in the
+    # workspace, so re-reporting an existing handoff is answered entirely from
+    # durable state. It deliberately runs before any workspace inspection: once
+    # the patch exists it is the delivered artifact, and a workspace that was
+    # cleaned up or moved off its branch afterwards cannot invalidate it.
     provenance = read_provenance(run_dir)
-    await _assert_on_run_branch(workspace, expected_branch=provenance.branch, git=git)
-
     artifacts_dir = run_dir / "artifacts"
     patch_dir = artifacts_dir / HANDOFF_DIRNAME
     if patch_dir.exists():
-        # Already handed off — report it, never rewrite it. The counts come off
-        # the patch set itself: the workspace may have moved on since, and this
-        # result describes what the developer will actually find on disk.
+        # Counts come off the patch set itself: this result describes what the
+        # developer will actually find on disk, not what the workspace holds now.
         return HandoffResult(
             mode="patch",
             branch=provenance.branch,
@@ -114,6 +115,12 @@ async def hand_off_run(
             patch_dir=patch_dir,
             previously_handed_off=True,
         )
+
+    # Producing a NEW patch does need a sound workspace: the diff has to be
+    # against the history provenance recorded, or it misrepresents the run.
+    if not workspace.is_dir():
+        raise GitError(f"run workspace does not exist, nothing to hand off: {workspace}")
+    await _assert_on_run_branch(workspace, expected_branch=provenance.branch, git=git)
 
     commit_count = await _count_commits(
         workspace, base=provenance.base_commit, git=git
@@ -235,8 +242,13 @@ async def _write_patches(
             await run_git(
                 ["-C", str(workspace), "add", "-N", "--", "."], git=git, check=True
             )
+            # `--binary`: without it a binary file degrades to the single line
+            # "Binary files ... differ" and `git apply` then refuses it outright
+            # ("without full index line"), so the file is unrecoverable. The
+            # committed path needs no flag — `format-patch` emits a GIT binary
+            # patch by default — but plain `diff` does not.
             tracked = await run_git(
-                ["-C", str(workspace), "diff", "HEAD"], git=git, check=True
+                ["-C", str(workspace), "diff", "--binary", "HEAD"], git=git, check=True
             )
             (staging / UNCOMMITTED_PATCH_NAME).write_text(
                 tracked.stdout, encoding="utf-8"
