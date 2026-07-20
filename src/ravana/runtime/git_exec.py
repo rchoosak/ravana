@@ -15,8 +15,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shutil
 import signal
 import subprocess
+from pathlib import Path
 
 GIT_TIMEOUT_SECONDS = 120
 _CLEANUP_SECONDS = 5
@@ -82,6 +84,30 @@ async def run_subprocess(
         # git's stderr names paths/refs, not credentials; it's the actionable part.
         raise GitError(f"{operation} failed (exit {returncode}): {stderr.strip()}")
     return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+
+async def remove_tree(path: Path) -> None:
+    """Delete a directory tree without stalling the event loop, and finish even
+    if the caller is being cancelled.
+
+    Both users of this are failure/cancellation cleanup of a *staging clone*,
+    which is the whole repository — measured at ~185ms of dead event loop for a
+    4k-entry tree, and a real checkout is far larger. That stall freezes every
+    concurrent node in the engine, so the delete goes to a thread.
+
+    Awaiting naively inside an `except BaseException:` block would be worse than
+    the stall, though: a cancelled task re-raises at the next await, cleanup
+    would abandon halfway, and a full clone would leak. So the delete runs as a
+    shielded task that is re-awaited until it genuinely finishes — the same
+    guarantee `stop_process_group` needs, for the same reason. Cancellation is
+    not swallowed: the caller re-raises the original exception afterwards.
+    """
+    cleanup = asyncio.create_task(asyncio.to_thread(shutil.rmtree, path, True))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
 
 
 async def stop_process_group(proc: asyncio.subprocess.Process) -> None:

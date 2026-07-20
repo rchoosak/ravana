@@ -28,7 +28,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import shutil
 import stat
 import sys
 import uuid
@@ -39,6 +38,7 @@ from typing import cast
 from ravana.runtime.git_exec import (
     GIT_TIMEOUT_SECONDS,
     GitError,
+    remove_tree,
     run_git,
     run_subprocess,
 )
@@ -181,9 +181,9 @@ async def provision_run_workspace(
             ),
         )
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        await remove_tree(staging)
         if published:
-            shutil.rmtree(workspace, ignore_errors=True)
+            await remove_tree(workspace)
             with contextlib.suppress(OSError):
                 _provenance_path(run_dir).unlink()
         raise
@@ -263,9 +263,9 @@ async def provision_shadow_workspace(
             ),
         )
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        await remove_tree(staging)
         if published:
-            shutil.rmtree(workspace, ignore_errors=True)
+            await remove_tree(workspace)
             with contextlib.suppress(OSError):
                 _provenance_path(run_dir).unlink()
         raise

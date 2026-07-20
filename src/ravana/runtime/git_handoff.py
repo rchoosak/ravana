@@ -31,13 +31,12 @@ Two facts make the patch honest rather than approximate:
 from __future__ import annotations
 
 import os
-import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from ravana.runtime.git_exec import GitError, run_git
+from ravana.runtime.git_exec import GitError, remove_tree, run_git
 from ravana.runtime.git_workspace import read_provenance, workspace_paths
 
 HANDOFF_DIRNAME = "handoff"
@@ -255,5 +254,5 @@ async def _write_patches(
             )
         os.rename(staging, patch_dir)  # atomic publish (same filesystem)
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        await remove_tree(staging)
         raise
