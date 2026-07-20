@@ -286,6 +286,36 @@ async def test_missing_workspace_is_refused(tmp_path):
         await hand_off_run(runs_dir=runs, run_id="r")
 
 
+async def test_symlinked_artifacts_dir_cannot_redirect_the_patch(tmp_path):
+    # `mkdir(exist_ok=True)` succeeds on a symlink to an existing directory and
+    # the later rename resolves through it, so without this guard the patch
+    # lands outside runs/<run_id>/ while the reported path claims otherwise.
+    base, runs, ws = await _workspace(tmp_path)
+    _agent_commit(ws, "feature.py", "print('hi')\n", "add feature")
+    outside = tmp_path / "ESCAPED"
+    outside.mkdir()
+    (runs / "r" / "artifacts").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(GitError, match="aliased handoff path"):
+        await hand_off_run(runs_dir=runs, run_id="r")
+
+    assert list(outside.iterdir()) == []
+
+
+async def test_symlinked_handoff_dir_cannot_redirect_the_patch(tmp_path):
+    base, runs, ws = await _workspace(tmp_path)
+    _agent_commit(ws, "feature.py", "print('hi')\n", "add feature")
+    outside = tmp_path / "ESCAPED"
+    outside.mkdir()
+    (runs / "r" / "artifacts").mkdir()
+    (runs / "r" / "artifacts" / "handoff").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(GitError, match="aliased handoff path"):
+        await hand_off_run(runs_dir=runs, run_id="r")
+
+    assert list(outside.iterdir()) == []
+
+
 async def test_run_id_path_escape_is_refused(tmp_path):
     _make_repo(tmp_path / "project")
     with pytest.raises(GitError, match="invalid run id"):

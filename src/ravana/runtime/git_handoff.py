@@ -53,6 +53,14 @@ class HandoffResult:
     workspace's current state — on a re-report they are read back off disk. A
     delivery receipt that described something other than what was delivered
     would be worse than no receipt.
+
+    Fields are added here only when something reads them. A `head_commit` was
+    drafted and dropped within this slice for that reason: the re-report path
+    reads its counts off disk and cannot know the workspace HEAD at the time the
+    patch was cut, so the field would have had to be either absent or untrue on
+    exactly the path this docstring exists to keep honest. This type is new in
+    this slice and has never been importable outside it, so its shape is still
+    being settled rather than a compatibility surface.
     """
 
     mode: HandoffMode
@@ -100,8 +108,7 @@ async def hand_off_run(
     # the patch exists it is the delivered artifact, and a workspace that was
     # cleaned up or moved off its branch afterwards cannot invalidate it.
     provenance = read_provenance(run_dir)
-    artifacts_dir = run_dir / "artifacts"
-    patch_dir = artifacts_dir / HANDOFF_DIRNAME
+    artifacts_dir, patch_dir = _artifacts_paths(run_dir)
     if patch_dir.exists():
         # Counts come off the patch set itself: this result describes what the
         # developer will actually find on disk, not what the workspace holds now.
@@ -152,6 +159,28 @@ async def hand_off_run(
         has_uncommitted_changes=dirty,
         patch_dir=patch_dir,
     )
+
+
+def _artifacts_paths(run_dir: Path) -> tuple[Path, Path]:
+    """Resolve `artifacts/` and `artifacts/handoff/`, refusing aliased ones.
+
+    `mkdir(exist_ok=True)` succeeds against a symlink pointing at an existing
+    directory, and the later `rename` then resolves through it — so a symlinked
+    `artifacts/` writes the patch outside `runs/<run_id>/` entirely while the
+    returned path still claims it landed inside (verified: the patch escaped).
+    Nothing an agent controls can plant that link today, since the sandbox
+    mounts only `workspace/`; this holds the same line `workspace_paths` already
+    holds for the run dir, so the guarantee doesn't depend on that mount
+    remaining the only writer.
+    """
+    for candidate in (run_dir / "artifacts", run_dir / "artifacts" / HANDOFF_DIRNAME):
+        if candidate.is_symlink() or (
+            candidate.exists() and candidate.resolve() != candidate
+        ):
+            raise GitError(
+                f"refusing an aliased handoff path (symlink out of the run dir): {candidate}"
+            )
+    return run_dir / "artifacts", run_dir / "artifacts" / HANDOFF_DIRNAME
 
 
 async def _assert_on_run_branch(workspace: Path, *, expected_branch: str, git: str) -> None:
