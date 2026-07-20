@@ -4,6 +4,7 @@ prove the `--no-hardlinks` run workspace is independent from the source.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -15,6 +16,8 @@ from ravana.runtime.git_workspace import (
     git_toplevel,
     is_git_repo,
     provision_run_workspace,
+    provision_run_workspace_async,
+    provision_shadow_workspace,
     run_branch_name,
 )
 
@@ -74,6 +77,76 @@ def test_idempotent_returns_existing_without_reclone(tmp_path):
     ws2 = provision_run_workspace(base_repo=base, runs_dir=runs, run_id="r")
     assert ws2 == ws
     assert (ws / "in_progress.txt").read_text() == "do not clobber"  # re-clone would have wiped it
+
+
+def test_legacy_hardlinked_workspace_is_rejected_without_provenance(tmp_path):
+    base = _make_repo(tmp_path / "project")
+    runs = tmp_path / "runs"
+    workspace = runs / "r" / "workspace"
+    workspace.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "clone", "--local", str(base), str(workspace)],
+        check=True,
+        capture_output=True,
+    )
+    _git(workspace, "checkout", "-q", "-b", run_branch_name("r"))
+
+    with pytest.raises(GitError, match="provenance"):
+        provision_run_workspace(base_repo=base, runs_dir=runs, run_id="r")
+
+
+def test_existing_workspace_rejects_a_different_requested_base(tmp_path):
+    base = _make_repo(tmp_path / "project")
+    first_commit = _git(base, "rev-parse", "HEAD").stdout.strip()
+    (base / "README.md").write_text("second\n")
+    _git(base, "commit", "-qam", "second")
+    provision_run_workspace(
+        base_repo=base,
+        runs_dir=tmp_path / "runs",
+        run_id="r",
+        base_ref=first_commit,
+    )
+
+    with pytest.raises(GitError, match="different base commit"):
+        provision_run_workspace(
+            base_repo=base,
+            runs_dir=tmp_path / "runs",
+            run_id="r",
+            base_ref="HEAD",
+        )
+
+
+def test_shadow_workspace_snapshots_non_git_project(tmp_path):
+    project = tmp_path / "plain"
+    project.mkdir()
+    (project / "README.md").write_text("plain project\n")
+    (project / ".ravana" / "runs").mkdir(parents=True)
+
+    workspace = provision_shadow_workspace(
+        project_dir=project,
+        runs_dir=project / ".ravana" / "runs",
+        run_id="r",
+    )
+
+    assert (workspace / "README.md").read_text() == "plain project\n"
+    assert (workspace / ".git").is_dir()
+    assert not (workspace / ".ravana").exists()
+    assert _git(workspace, "branch", "--show-current").stdout.strip() == run_branch_name("r")
+
+
+def test_async_git_provisioning_returns_an_isolated_workspace(tmp_path):
+    base = _make_repo(tmp_path / "project")
+
+    workspace = asyncio.run(
+        provision_run_workspace_async(
+            base_repo=base,
+            runs_dir=tmp_path / "runs",
+            run_id="r",
+        )
+    )
+
+    assert workspace.is_dir()
+    assert (tmp_path / "runs" / "r" / ".workspace-provenance.json").is_file()
 
 
 def test_existing_workspace_on_wrong_branch_is_rejected(tmp_path):
@@ -193,7 +266,7 @@ def test_non_git_base_raises(tmp_path):
 
 def test_workspace_path_escape_is_refused(tmp_path):
     base = _make_repo(tmp_path / "project")
-    with pytest.raises(GitError, match="outside the runs dir"):
+    with pytest.raises(GitError, match="invalid run id"):
         provision_run_workspace(base_repo=base, runs_dir=tmp_path / "runs", run_id="../evil")
 
 

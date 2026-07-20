@@ -274,6 +274,7 @@ def test_llm_runtime_prepares_requested_git_base(
 def test_llm_runtime_prepares_plain_workspace_for_non_git_project(
     tmp_path, sdlc_graph, con, monkeypatch
 ):
+    (tmp_path / "project.txt").write_text("plain project")
     ravana = tmp_path / ".ravana"
     (ravana / "runs").mkdir(parents=True)
     monkeypatch.setattr(cli_module, "find_ravana_dir", lambda: ravana)
@@ -288,4 +289,6 @@ def test_llm_runtime_prepares_plain_workspace_for_non_git_project(
     asyncio.run(prepare_and_close())
     workspace = ravana / "runs" / "run-x" / "workspace"
     assert workspace.is_dir()
-    assert not (workspace / ".git").exists()
+    assert (workspace / ".git").is_dir()
+    assert (workspace / "project.txt").read_text() == "plain project"
+    assert not (workspace / ".ravana").exists()

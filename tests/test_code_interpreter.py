@@ -273,6 +273,54 @@ def test_monorepo_project_runs_from_its_subdirectory(tmp_path):
     assert (workspace / "packages" / "app" / "main.py").exists()
 
 
+def test_monorepo_project_symlink_created_by_agent_is_rejected_on_next_call(tmp_path):
+    repo = tmp_path / "repo"
+    project = repo / "packages" / "app"
+    project.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "t@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True,
+    )
+    (project / "app.txt").write_text("app")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "init"],
+        check=True,
+    )
+    runs = project / ".ravana" / "runs"
+    handler = CodeInterpreterHandler(
+        {"runtime": "python3.11"},
+        runs_dir=runs,
+        runner=FakeRunner(),
+    )
+
+    async def scenario() -> None:
+        try:
+            await handler.prepare_run("r")
+            cloned_project = runs / "r" / "workspace" / "packages" / "app"
+            for child in cloned_project.iterdir():
+                child.unlink()
+            cloned_project.rmdir()
+            cloned_project.symlink_to(project, target_is_directory=True)
+
+            with pytest.raises(ToolkitError, match="project path"):
+                await handler.call(
+                    arguments={"code": "print('must not publish')"},
+                    idempotency_key="symlink-after-prepare",
+                    run_id="r",
+                )
+        finally:
+            await handler.aclose()
+
+    asyncio.run(scenario())
+    assert not (project / "main.py").exists()
+
+
 def test_node_runtime_uses_node_image_and_default_file(tmp_path):
     runner = FakeRunner()
     handler = _handler(tmp_path, runtime="node20", runner=runner)
