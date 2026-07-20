@@ -361,6 +361,45 @@ def test_cancel_during_dod_judgement_is_not_overwritten(con):
 
     run = con.execute("SELECT status, ended_at FROM run WHERE id = ?", (run_id,)).fetchone()
     assert run["status"] == "CANCELLED" and run["ended_at"] == "cancelled"
+
+
+def test_cancel_during_judgement_also_skips_the_workspace_handoff(con):
+    # §10.1 handoff must follow the DURABLE outcome, not the decision the gate
+    # reached. The judge returns "met", so the gate asks for COMPLETED — but a
+    # CANCELLED committed mid-flight wins the CAS, and a cancelled run's work
+    # must not be handed back as though it had finished.
+    class _HandoffMock(MockAgentRuntime):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.handed_off: list[str] = []
+
+        async def hand_off_run(self, run_id):
+            self.handed_off.append(run_id)
+            return "patch written"
+
+    async def cancel_then_pass(evaluated_by, criteria, state):
+        run = con.execute(
+            "SELECT id FROM run WHERE status = 'RUNNING' ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        con.execute(
+            "UPDATE run SET status = 'CANCELLED', ended_at = 'cancelled' WHERE id = ?",
+            (run["id"],),
+        )
+        con.commit()
+        return ProseJudgement(verdicts=[True for _ in criteria], usage=LLMUsage(1, 1))
+
+    graph = compile_workflow(_dod_workflow(["All acceptance criteria are met"]))
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    runtime = _HandoffMock({"only": [{"structured_payload": {"qa_status": "PASS"}}]})
+    run_id = asyncio.run(
+        start_run(
+            con, graph, runtime, org_id="test", workflow_id=workflow_id,
+            dod_prose_verdict=cancel_then_pass,
+        )
+    )
+
+    assert con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()["status"] == "CANCELLED"
+    assert runtime.handed_off == []
     assert _dod_event(con, run_id) is None
 
 

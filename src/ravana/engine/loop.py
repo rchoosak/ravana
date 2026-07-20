@@ -38,6 +38,7 @@ from ravana.runtime.base import (
     ProseJudgementError,
     RunPreparer,
     TransientAgentError,
+    RunHandoff,
 )
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.secrets import ensure_secret_free, redact_secrets
@@ -352,11 +353,42 @@ async def _finalize_status(ctx: _RunCtx) -> None:
         # the run at RUNNING — the failure mode every review round has probed.
         status, event = await _decide_dod(ctx)
         _write_final(ctx, status, event=event)
+        await _hand_off_if_completed(ctx)
     else:
         # Queue drained with nothing pending and no terminal edge ever fired —
         # shouldn't happen under §3.1's fail-fast rule; persist the status as-is
         # so a genuine gap stays visible rather than being reported either way.
         _write_final(ctx, run["status"], event=None)
+
+
+async def _hand_off_if_completed(ctx: _RunCtx) -> None:
+    """§10.1 handoff: surface a COMPLETED run's workspace back to the developer.
+
+    Runs only after the terminal write is durable, and re-reads the row rather
+    than trusting the status we asked for — a CANCELLED committed while the DoD
+    judge was in flight wins the CAS, and that run must not be handed off.
+
+    Deliberately best-effort and non-status-affecting. The run's outcome is
+    already decided and committed; delivery is a separate concern, so a git
+    failure here is logged, never allowed to turn a COMPLETED run into a FAILED
+    one. The inverse (letting the handoff vote on the outcome) would make an
+    unrelated filesystem problem look like the agents' work had failed.
+    """
+    if not isinstance(ctx.runtime, RunHandoff):
+        return  # a runtime that owns no workspace (the mock backend) has nothing to hand back
+    try:
+        if _get_run(ctx.con, ctx.run_id)["status"] != "COMPLETED":
+            return
+        summary = await ctx.runtime.hand_off_run(ctx.run_id)
+    except Exception as exc:  # noqa: BLE001 - delivery must not rewrite the outcome
+        log_event(
+            "ERROR",
+            f"run {ctx.run_id} completed but workspace handoff failed ({type(exc).__name__})",
+            run_id=ctx.run_id,
+        )
+        return
+    if summary is not None:
+        log_event("INFO", f"run {ctx.run_id} handoff: {summary}", run_id=ctx.run_id)
 
 
 DodOutcome = Literal["met", "criteria_unmet", "evaluator_error", "cost_cap_exceeded"]
