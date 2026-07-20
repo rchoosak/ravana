@@ -30,9 +30,17 @@ import fcntl
 import os
 import stat
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ravana.runtime.git_workspace import (
+    DEFAULT_BASE_REF,
+    GitError,
+    git_toplevel,
+    provision_run_workspace,
+    provision_shadow_workspace,
+)
 from ravana.runtime.toolkits.base import (
     ToolFailureKind,
     ToolRetrySafeCancellation,
@@ -87,6 +95,12 @@ _WORKSPACE_LOCK_POLL_SECONDS = 0.02
 _WORKSPACE_WORKER_CLOSE_SECONDS = 1.0
 
 
+@dataclass(frozen=True)
+class _WorkspaceContext:
+    workspace: Path
+    project_subpath: Path
+
+
 class CodeInterpreterHandler:
     input_schema = INPUT_SCHEMA
     executable = True
@@ -96,6 +110,8 @@ class CodeInterpreterHandler:
         config: dict[str, Any],
         *,
         runs_dir: Path | None,
+        project_dir: Path | None = None,
+        base_ref: str = DEFAULT_BASE_REF,
         runner: SandboxRunner | None = None,
     ):
         runtime = config.get("runtime")
@@ -124,6 +140,9 @@ class CodeInterpreterHandler:
             ),
         )
         self._runs_dir = runs_dir
+        self._project_dir = project_dir or _project_from_runs_dir(runs_dir)
+        self._base_ref = base_ref
+        self._prepared_workspaces: dict[str, _WorkspaceContext] = {}
         self._runner = runner or DockerSandboxRunner(docker=sandbox_executable)
         self._workspace_workers = WorkspaceWorkerSupervisor()
         self._lifecycle = AsyncResourceLifecycle(
@@ -139,6 +158,23 @@ class CodeInterpreterHandler:
         # Running code writes to the run's workspace filesystem — a side effect,
         # so a retried logical invocation dedupes rather than re-executing.
         return True
+
+    async def prepare_run(self, run_id: str) -> None:
+        """Provision the Local-tier workspace before the run is persisted."""
+        try:
+            self._lifecycle.enter()
+        except RuntimeError as exc:
+            raise ToolkitError(
+                "code_interpreter handler is closed",
+                kind=ToolFailureKind.FATAL,
+            ) from exc
+        try:
+            context = await self._workspace_context(
+                run_id, validate_requested_base=True
+            )
+            self._prepared_workspaces[run_id] = context
+        finally:
+            self._lifecycle.exit()
 
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str) -> str:
         try:
@@ -164,20 +200,35 @@ class CodeInterpreterHandler:
         idempotency_key: str,
         run_id: str,
     ) -> str:
-        workspace = self._workspace_for(run_id)
+        context = self._prepared_workspaces.get(run_id)
+        if context is None:
+            context = await self._workspace_context(
+                run_id, validate_requested_base=False
+            )
+        workspace = context.workspace
         filename = _safe_filename(arguments.get("filename"), self._default_filename)
         args = [str(a) for a in arguments.get("args", [])]
-        spec = SandboxSpec(
-            image=self._image,
-            argv=[*self._interp, filename, *args],
-            workspace=workspace,
-            limits=self._limits,
-        )
         async with _workspace_execution_lock(
             workspace, timeout_seconds=self._limits.timeout_seconds
         ):
+            execution_dir = _validated_execution_dir(
+                workspace, context.project_subpath
+            )
+            container_cwd = (
+                "/workspace"
+                if context.project_subpath == Path(".")
+                else f"/workspace/{context.project_subpath.as_posix()}"
+            )
+            spec = SandboxSpec(
+                image=self._image,
+                argv=[*self._interp, filename, *args],
+                workspace=workspace,
+                limits=self._limits,
+                working_directory=container_cwd,
+            )
             await _write_script(
                 workspace,
+                execution_dir,
                 filename,
                 str(arguments["code"]),
                 limits=self._limits,
@@ -223,7 +274,9 @@ class CodeInterpreterHandler:
             raise first_error
         self._resources_closed = True
 
-    def _workspace_for(self, run_id: str) -> Path:
+    async def _workspace_context(
+        self, run_id: str, *, validate_requested_base: bool
+    ) -> _WorkspaceContext:
         if self._runs_dir is None:
             raise ToolkitError(
                 "code_interpreter has no runs directory configured — the Local tier must wire runs_dir",
@@ -245,15 +298,53 @@ class CodeInterpreterHandler:
                     "code_interpreter: refusing a run directory symlink",
                     kind=ToolFailureKind.FATAL,
                 )
-            run_dir.mkdir(exist_ok=True)
             if workspace.is_symlink():
                 raise ToolkitError(
                     "code_interpreter: refusing a workspace symlink",
                     kind=ToolFailureKind.FATAL,
                 )
-            workspace.mkdir(exist_ok=True)
+
+            project_subpath = Path()
+            project_toplevel = (
+                await git_toplevel(self._project_dir)
+                if self._project_dir is not None
+                else None
+            )
+            if project_toplevel is not None and self._project_dir is not None:
+                project_subpath = self._project_dir.resolve().relative_to(
+                    project_toplevel.resolve()
+                )
+                workspace = await provision_run_workspace(
+                    base_repo=project_toplevel,
+                    runs_dir=runs_dir,
+                    run_id=run_id,
+                    base_ref=(
+                        self._base_ref
+                        if validate_requested_base or not workspace.exists()
+                        else None
+                    ),
+                )
+            elif self._project_dir is not None:
+                if self._base_ref != DEFAULT_BASE_REF:
+                    raise ToolkitError(
+                        "code_interpreter: --base-ref requires a git project",
+                        kind=ToolFailureKind.FATAL,
+                    )
+                workspace = await provision_shadow_workspace(
+                    project_dir=self._project_dir,
+                    runs_dir=runs_dir,
+                    run_id=run_id,
+                )
+            else:
+                run_dir.mkdir(exist_ok=True)
+                workspace.mkdir(exist_ok=True)
         except ToolkitError:
             raise
+        except GitError as exc:
+            raise ToolkitError(
+                f"code_interpreter: unable to provision git workspace ({exc})",
+                kind=ToolFailureKind.FATAL,
+            ) from exc
         except OSError as exc:
             raise ToolkitError(
                 f"code_interpreter: unable to prepare the run workspace ({type(exc).__name__})",
@@ -267,11 +358,54 @@ class CodeInterpreterHandler:
                 "code_interpreter: refusing an aliased workspace",
                 kind=ToolFailureKind.FATAL,
             )
-        return workspace
+
+        _validated_execution_dir(workspace, project_subpath)
+        return _WorkspaceContext(
+            workspace=workspace,
+            project_subpath=project_subpath,
+        )
+
+
+def _project_from_runs_dir(runs_dir: Path | None) -> Path | None:
+    if (
+        runs_dir is not None
+        and runs_dir.name == "runs"
+        and runs_dir.parent.name == ".ravana"
+    ):
+        return runs_dir.parent.parent
+    return None
+
+
+def _validated_execution_dir(
+    workspace: Path, project_subpath: Path
+) -> Path:
+    """Resolve the mutable project path afresh for every locked invocation."""
+    if (
+        workspace.is_symlink()
+        or workspace.resolve() != workspace
+        or not workspace.is_dir()
+    ):
+        raise ToolkitError(
+            "code_interpreter: refusing an aliased workspace",
+            kind=ToolFailureKind.FATAL,
+        )
+    execution_dir = workspace / project_subpath
+    if (
+        not execution_dir.is_dir()
+        or execution_dir.is_symlink()
+        or execution_dir.resolve() != execution_dir
+        or not execution_dir.is_relative_to(workspace)
+    ):
+        raise ToolkitError(
+            "code_interpreter: project path is missing or aliased inside the run workspace",
+            kind=ToolFailureKind.FATAL,
+        )
+    return execution_dir
 
 
 async def _write_script(
     workspace: Path,
+    script_dir: Path,
     filename: str,
     code: str,
     *,
@@ -319,12 +453,20 @@ async def _write_script(
         )
 
     temp_path: Path | None = None
+    workspace_fd: int | None = None
+    script_dir_fd: int | None = None
     try:
         remaining = deadline - loop.time()
         if remaining <= 0:
             raise WorkspaceStagingError(
                 "script staging worker exceeded its deadline"
             )
+        # Stage in the workspace root, which is the stable bind mount, then
+        # publish through directory descriptors opened with O_NOFOLLOW. The
+        # nested project directory is mutable container state and must never be
+        # trusted as a path again after validation.
+        workspace_fd = _open_directory_fd(workspace)
+        script_dir_fd = _open_directory_fd(script_dir)
         temp_path = await stage_workspace_script_async(
             workspace,
             code,
@@ -343,7 +485,12 @@ async def _write_script(
             raise WorkspaceStagingError(
                 "script staging worker returned an invalid file"
             )
-        os.replace(temp_path, workspace / filename)
+        os.replace(
+            temp_path.name,
+            filename,
+            src_dir_fd=workspace_fd,
+            dst_dir_fd=script_dir_fd,
+        )
         temp_path = None
     except asyncio.CancelledError as exc:
         raise ToolRetrySafeCancellation(
@@ -372,6 +519,26 @@ async def _write_script(
                 raise ToolOutcomeUnknown(
                     f"code_interpreter script cleanup failed: {exc}"
                 ) from exc
+        for directory_fd in (script_dir_fd, workspace_fd):
+            if directory_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(directory_fd)
+
+
+def _open_directory_fd(path: Path) -> int:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(f"not a directory: {path}")
+        return fd
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
 
 
 async def _utf8_size(

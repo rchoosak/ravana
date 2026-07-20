@@ -25,6 +25,7 @@ from ravana.engine.dod import ProseVerdict
 from ravana.engine.loop import TERMINAL_STATUSES, resume_hitl, start_run
 from ravana.runtime.base import AgentRuntime, ProseJudge
 from ravana.runtime.gateway import LLMGateway
+from ravana.runtime.git_workspace import DEFAULT_BASE_REF
 from ravana.runtime.mock import MockAgentRuntime
 from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
 from ravana.runtime.providers.base import ProviderAdapter
@@ -95,7 +96,12 @@ def _adapters_for_graph(graph: CompiledGraph) -> dict[str, ProviderAdapter]:
     return {provider: _make_adapter(provider) for provider in _providers_in_graph(graph)}
 
 
-def _build_llm_gateway(con: sqlite3.Connection, graph: CompiledGraph) -> LLMGateway:
+def _build_llm_gateway(
+    con: sqlite3.Connection,
+    graph: CompiledGraph,
+    *,
+    git_base_ref: str = DEFAULT_BASE_REF,
+) -> LLMGateway:
     # §8c: ONE resolver serves both credential kinds. Toolkit auth_refs
     # resolve through the registry's lazy providers (a secret is only read if
     # its toolkit is actually called), and the gateway resolves each agent's
@@ -108,19 +114,33 @@ def _build_llm_gateway(con: sqlite3.Connection, graph: CompiledGraph) -> LLMGate
     # the lookup so building the gateway out of that context (a unit test) still
     # works — code_interpreter just isn't runnable without a runs dir.
     try:
-        runs_dir: Path | None = find_ravana_dir() / "runs"
+        ravana_dir = find_ravana_dir()
+        runs_dir: Path | None = ravana_dir / "runs"
+        workspace_project: Path | None = ravana_dir.parent
     except click.ClickException:
         runs_dir = None
-    handlers = build_registry(graph, resolver, runs_dir=runs_dir)
+        workspace_project = None
+    handlers = build_registry(
+        graph,
+        resolver,
+        runs_dir=runs_dir,
+        workspace_project=workspace_project,
+        workspace_base_ref=git_base_ref,
+    )
     executor = RavanaToolExecutor(con, handlers)
     return LLMGateway(graph, _adapters_for_graph(graph), tool_executor=executor, secret_resolver=resolver)
 
 
 def _build_runtime(
-    con: sqlite3.Connection, graph: CompiledGraph, backend: str, mock_fixture: str | None
+    con: sqlite3.Connection,
+    graph: CompiledGraph,
+    backend: str,
+    mock_fixture: str | None,
+    *,
+    git_base_ref: str = DEFAULT_BASE_REF,
 ) -> AgentRuntime:
     if backend == "llm":
-        return _build_llm_gateway(con, graph)
+        return _build_llm_gateway(con, graph, git_base_ref=git_base_ref)
     if not mock_fixture:
         raise click.ClickException("--backend mock requires --mock-fixture")
     return MockAgentRuntime.from_yaml(mock_fixture)
@@ -143,6 +163,7 @@ async def _start_with_cleanup(
     org_id: str,
     workflow_id: str,
     input_payload: dict[str, Any],
+    run_id: str | None = None,
 ) -> str:
     try:
         return await start_run(
@@ -154,6 +175,7 @@ async def _start_with_cleanup(
             triggered_by="cli-user",
             input_payload=input_payload,
             dod_prose_verdict=_prose_verdict_for(runtime),
+            run_id=run_id,
         )
     finally:
         await runtime.aclose()
@@ -229,14 +251,29 @@ def run() -> None:
 @click.option("--org", default="local", help="org_id (Phase 0a: no real multi-tenancy)")
 @click.option("--backend", type=click.Choice(["mock", "llm"]), default="mock", help="mock = scripted --mock-fixture; llm = real LLM Gateway (§1.1) with wired toolkits")
 @click.option("--mock-fixture", type=click.Path(exists=True, dir_okay=False), help="required for --backend mock: a scripted response fixture")
-def run_start(file: str, input_json: str, org: str, backend: str, mock_fixture: str | None) -> None:
+@click.option("--base-ref", default=DEFAULT_BASE_REF, show_default=True, help="git commit/ref used as the run branch base")
+def run_start(
+    file: str,
+    input_json: str,
+    org: str,
+    backend: str,
+    mock_fixture: str | None,
+    base_ref: str,
+) -> None:
     """Persist FILE's workflow and start a Run against it."""
     con = _connect()
     doc = load_workflow_yaml(file)
     graph = compile_workflow(doc)
     workflow_id = get_or_create_workflow(con, graph, org_id=org, created_by="cli-user")
     input_payload = json.loads(input_json)
-    runtime = _build_runtime(con, graph, backend, mock_fixture)
+
+    runtime = _build_runtime(
+        con,
+        graph,
+        backend,
+        mock_fixture,
+        git_base_ref=base_ref,
+    )
 
     run_id = asyncio.run(
         _start_with_cleanup(

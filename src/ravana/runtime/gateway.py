@@ -256,6 +256,12 @@ class LLMGateway:
         # re-derived on every call.
         self._strategy_cache: dict[tuple[int, ProviderTarget], _Strategy] = {}
 
+    async def prepare_run(self, run_id: str) -> None:
+        """Prepare run-scoped toolkit resources before engine persistence."""
+        prepare = getattr(self._tools, "prepare_run", None)
+        if prepare is not None:
+            await prepare(run_id)
+
     async def aclose(self) -> None:
         """Close every execution-plane resource owned by this gateway."""
         first_error: RuntimeError | None = None
