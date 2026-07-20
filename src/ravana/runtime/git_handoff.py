@@ -18,9 +18,12 @@ Two facts make the patch honest rather than approximate:
   own `HEAD~n` or its origin's current tip could both have moved; provenance
   records what the run actually started from.
 - A dirty worktree is reported, not swallowed. Agents do not reliably commit,
-  so uncommitted work is captured as a separate `uncommitted.diff` and counted
-  in the result. Inventing a commit to tidy this up would put words in the
-  agent's mouth; dropping it would lose work silently.
+  so uncommitted work — **including brand-new untracked files, which are the
+  most common thing a code-writing agent produces** — is captured as a separate
+  `uncommitted.diff`. `git diff HEAD` alone would silently emit nothing for an
+  untracked file, so those paths are marked intent-to-add first (see
+  `_write_patches`). Inventing a commit to tidy this up would put words in the
+  agent's mouth; dropping it would lose the work outright.
 """
 
 from __future__ import annotations
@@ -43,16 +46,23 @@ HandoffMode = Literal["patch", "no_changes"]
 
 @dataclass(frozen=True)
 class HandoffResult:
-    """What the run left behind, and where the developer can find it."""
+    """What the run left behind, and where the developer can find it.
+
+    The counts always describe **the patch that was delivered**, never the
+    workspace's current state — on a re-report they are read back off disk. A
+    delivery receipt that described something other than what was delivered
+    would be worse than no receipt.
+    """
 
     mode: HandoffMode
     branch: str
     base_commit: str
-    head_commit: str
     commit_count: int
     has_uncommitted_changes: bool
     # None exactly when mode == "no_changes" — nothing was written.
     patch_dir: Path | None
+    # True when this call found an earlier handoff and reported it unchanged.
+    previously_handed_off: bool = False
 
     def summary(self) -> str:
         if self.mode == "no_changes":
@@ -63,8 +73,9 @@ class HandoffResult:
         parts = [f"{self.commit_count} commit(s)"]
         if self.has_uncommitted_changes:
             parts.append("uncommitted changes")
+        verb = "already handed off" if self.previously_handed_off else "handed off"
         return (
-            f"handed off {' + '.join(parts)} from {self.branch} as a patch in "
+            f"{verb} {' + '.join(parts)} from {self.branch} as a patch in "
             f"{self.patch_dir} — apply with `git am` (never auto-merged)"
         )
 
@@ -88,37 +99,31 @@ async def hand_off_run(
     provenance = read_provenance(run_dir)
     await _assert_on_run_branch(workspace, expected_branch=provenance.branch, git=git)
 
-    head_commit = (
-        await run_git(
-            ["-C", str(workspace), "rev-parse", "--verify", "HEAD^{commit}"],
-            git=git,
-            check=True,
-        )
-    ).stdout.strip()
-    commit_count = await _count_commits(
-        workspace, base=provenance.base_commit, git=git
-    )
-    dirty = await _has_uncommitted_changes(workspace, git=git)
-
     artifacts_dir = run_dir / "artifacts"
     patch_dir = artifacts_dir / HANDOFF_DIRNAME
-    if patch_dir.exists():  # already handed off — report, never rewrite
+    if patch_dir.exists():
+        # Already handed off — report it, never rewrite it. The counts come off
+        # the patch set itself: the workspace may have moved on since, and this
+        # result describes what the developer will actually find on disk.
         return HandoffResult(
             mode="patch",
             branch=provenance.branch,
             base_commit=provenance.base_commit,
-            head_commit=head_commit,
-            commit_count=commit_count,
-            has_uncommitted_changes=dirty,
+            commit_count=len(list(patch_dir.glob("*.patch"))),
+            has_uncommitted_changes=(patch_dir / UNCOMMITTED_PATCH_NAME).exists(),
             patch_dir=patch_dir,
+            previously_handed_off=True,
         )
 
+    commit_count = await _count_commits(
+        workspace, base=provenance.base_commit, git=git
+    )
+    dirty = await _has_uncommitted_changes(workspace, git=git)
     if commit_count == 0 and not dirty:
         return HandoffResult(
             mode="no_changes",
             branch=provenance.branch,
             base_commit=provenance.base_commit,
-            head_commit=head_commit,
             commit_count=0,
             has_uncommitted_changes=False,
             patch_dir=None,
@@ -137,7 +142,6 @@ async def hand_off_run(
         mode="patch",
         branch=provenance.branch,
         base_commit=provenance.base_commit,
-        head_commit=head_commit,
         commit_count=commit_count,
         has_uncommitted_changes=dirty,
         patch_dir=patch_dir,
@@ -219,27 +223,24 @@ async def _write_patches(
             check=True,
         )
         if include_uncommitted:
-            # `diff HEAD` = staged + unstaged against the commit; untracked files
-            # need --intent-to-add staging, which would mutate the index. Record
-            # the tracked delta and list the untracked paths beside it instead.
+            # `git diff HEAD` only sees paths git already knows about, so on its
+            # own it captures NOTHING of a brand-new file — the single most
+            # common thing a code-writing agent produces. `add -N` marks
+            # untracked paths intent-to-add so their content lands in the diff.
+            #
+            # It stages no content, honours .gitignore (no node_modules/ in the
+            # patch), and mutates only the index of this run's disposable clone
+            # after the run is already terminal. The developer's repo is not
+            # touched by it — that guarantee is unaffected.
+            await run_git(
+                ["-C", str(workspace), "add", "-N", "--", "."], git=git, check=True
+            )
             tracked = await run_git(
                 ["-C", str(workspace), "diff", "HEAD"], git=git, check=True
             )
-            untracked = await run_git(
-                ["-C", str(workspace), "ls-files", "--others", "--exclude-standard"],
-                git=git,
-                check=True,
+            (staging / UNCOMMITTED_PATCH_NAME).write_text(
+                tracked.stdout, encoding="utf-8"
             )
-            body = tracked.stdout
-            if untracked.stdout.strip():
-                listing = "".join(
-                    f"#   {line}\n" for line in untracked.stdout.strip().splitlines()
-                )
-                body += (
-                    "\n# Untracked files present in the workspace, not included "
-                    "in this diff:\n" + listing
-                )
-            (staging / UNCOMMITTED_PATCH_NAME).write_text(body, encoding="utf-8")
         os.rename(staging, patch_dir)  # atomic publish (same filesystem)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

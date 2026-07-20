@@ -187,11 +187,21 @@ class CodeInterpreterHandler:
         """
         if self._runs_dir is None:
             return None
-        runs_dir = self._runs_dir.resolve()
-        if not (runs_dir / run_id / "workspace").is_dir():
-            return None
-        result = await git_handoff.hand_off_run(runs_dir=runs_dir, run_id=run_id)
-        return result.summary()
+        try:
+            self._lifecycle.enter()
+        except RuntimeError as exc:
+            raise ToolkitError(
+                "code_interpreter handler is closed",
+                kind=ToolFailureKind.FATAL,
+            ) from exc
+        try:
+            runs_dir = self._runs_dir.resolve()
+            if not (runs_dir / run_id / "workspace").is_dir():
+                return None
+            result = await git_handoff.hand_off_run(runs_dir=runs_dir, run_id=run_id)
+            return result.summary()
+        finally:
+            self._lifecycle.exit()
 
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str) -> str:
         try:

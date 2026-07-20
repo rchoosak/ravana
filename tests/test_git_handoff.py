@@ -110,10 +110,12 @@ async def test_produced_patch_actually_applies_to_the_base(tmp_path):
 
 async def test_uncommitted_work_is_captured_not_dropped(tmp_path):
     # Agents do not reliably commit; silently losing their work would be worse
-    # than handing back a messy patch.
+    # than handing back a messy patch. A brand-new uncommitted file is the most
+    # common thing a code-writing agent produces, so its CONTENT — not merely
+    # its name — has to survive the handoff.
     base, runs, ws = await _workspace(tmp_path)
     (ws / "README.md").write_text("edited by agent\n")  # tracked, uncommitted
-    (ws / "brand_new.py").write_text("x = 1\n")  # untracked
+    (ws / "brand_new.py").write_text("def important():\n    return 42\n")  # untracked
 
     result = await hand_off_run(runs_dir=runs, run_id="r")
 
@@ -121,8 +123,42 @@ async def test_uncommitted_work_is_captured_not_dropped(tmp_path):
     assert result.commit_count == 0
     assert result.has_uncommitted_changes is True
     diff = (result.patch_dir / "uncommitted.diff").read_text()
-    assert "edited by agent" in diff  # tracked edit is in the diff itself
-    assert "brand_new.py" in diff  # untracked file is at least named
+    assert "edited by agent" in diff
+    assert "def important():" in diff and "return 42" in diff
+
+
+async def test_uncommitted_patch_applies_and_restores_the_agents_work(tmp_path):
+    # The real test of "captured": a reviewer can reconstruct the work from the
+    # patch alone. Asserting a filename appears somewhere in the file would pass
+    # even with every line of code missing.
+    base, runs, ws = await _workspace(tmp_path)
+    (ws / "README.md").write_text("edited by agent\n")
+    (ws / "brand_new.py").write_text("def important():\n    return 42\n")
+    result = await hand_off_run(runs_dir=runs, run_id="r")
+
+    reviewer = _make_repo(tmp_path / "reviewer")
+    _git(reviewer, "apply", str(result.patch_dir / "uncommitted.diff"))
+
+    assert (reviewer / "brand_new.py").read_text() == "def important():\n    return 42\n"
+    assert (reviewer / "README.md").read_text() == "edited by agent\n"
+
+
+async def test_gitignored_files_stay_out_of_the_patch(tmp_path):
+    # `add -N` honours .gitignore, so build output and dependencies don't get
+    # swept into a patch a human has to read.
+    base, runs, ws = await _workspace(tmp_path)
+    (ws / ".gitignore").write_text("junk/\n")
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-q", "-m", "ignore junk")
+    (ws / "junk").mkdir()
+    (ws / "junk" / "huge.bin").write_text("NOISE THAT MUST NOT SHIP\n")
+    (ws / "real.py").write_text("kept = True\n")
+
+    result = await hand_off_run(runs_dir=runs, run_id="r")
+
+    diff = (result.patch_dir / "uncommitted.diff").read_text()
+    assert "kept = True" in diff
+    assert "NOISE THAT MUST NOT SHIP" not in diff
 
 
 async def test_clean_run_with_no_commits_writes_nothing(tmp_path):
@@ -147,8 +183,28 @@ async def test_handoff_is_idempotent_and_does_not_rewrite(tmp_path):
     second = await hand_off_run(runs_dir=runs, run_id="r")
 
     assert second.patch_dir == first.patch_dir
+    assert second.previously_handed_off is True
     assert (first.patch_dir / "0001-add-feature.patch").read_text() == "REVIEWER ANNOTATED\n"
     assert sorted(p.name for p in first.patch_dir.iterdir()) == ["0001-add-feature.patch"]
+
+
+async def test_re_report_describes_the_patch_not_the_moved_on_workspace(tmp_path):
+    # A delivery receipt has to describe what was delivered. Recomputing the
+    # counts from the live workspace would claim commits the patch on disk does
+    # not contain.
+    base, runs, ws = await _workspace(tmp_path)
+    _agent_commit(ws, "feature.py", "print('hi')\n", "add feature")
+    first = await hand_off_run(runs_dir=runs, run_id="r")
+    assert first.commit_count == 1
+
+    _agent_commit(ws, "later.py", "print('later')\n", "work after handoff")
+    (ws / "scratch.txt").write_text("dirty after handoff")
+
+    second = await hand_off_run(runs_dir=runs, run_id="r")
+
+    assert second.commit_count == 1  # the patch has one commit, not two
+    assert second.has_uncommitted_changes is False  # and no uncommitted.diff in it
+    assert "already handed off 1 commit(s)" in second.summary()
 
 
 async def test_workspace_off_its_run_branch_is_refused(tmp_path):
