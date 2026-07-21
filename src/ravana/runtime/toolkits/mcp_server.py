@@ -186,10 +186,21 @@ def parse_server_allowlist(raw: Any) -> dict[str, McpServerDefinition] | None:
                 f"MCP server definition '{name}' command {command!r} was not found on PATH",
                 kind=ToolFailureKind.FATAL,
             )
-        resolved_command = os.path.realpath(resolved)
+        # `which` gives an absolute path, which is the part that matters: the
+        # child is spawned by that path, so a later `PATH` change cannot
+        # redirect it. Deliberately NOT `realpath`d beyond that.
+        #
+        # Resolving the final symlink breaks the ordinary case. A virtualenv
+        # interpreter IS a symlink to a base interpreter, and following it
+        # discards `sys.prefix` — `.venv/bin/python3` becomes the bare CPython,
+        # which cannot import the server's dependencies, so an admin who
+        # allow-lists their venv gets a server that never starts (reproduced).
+        # It buys little in exchange: the process is spawned later, so pinning
+        # the target at parse time does not close a swap between parse and
+        # spawn either.
         parsed[name] = McpServerDefinition(
             name=name,
-            command=resolved_command,
+            command=resolved,
             cwd=os.path.realpath(cwd),
             args=tuple(args),
             env=tuple(sorted(env.items())),

@@ -444,7 +444,11 @@ def test_server_allowlist_requires_complete_definitions():
         }
     )
     assert parsed is not None
-    assert parsed["probe"].command == str(Path(sys.executable).resolve())
+    # NOT `Path(...).resolve()`: the command must keep the interpreter it was
+    # given. Resolving the final symlink turns a virtualenv interpreter into its
+    # base one, which cannot import the server's dependencies — see
+    # test_parsed_definition_from_a_venv_interpreter_actually_starts.
+    assert parsed["probe"].command == sys.executable
     assert parsed["probe"].working_directory == str(Path(PROBE).parent.resolve())
     assert parsed["probe"].auth_env == "GITHUB_PERSONAL_ACCESS_TOKEN"
     assert parsed["probe"].authenticate_discovery is True
@@ -1181,3 +1185,66 @@ async def test_executor_rejects_a_collision_from_an_ungranted_mcp_handler(con):
             executor.tools_for(["a"], run_id="run-1")
     finally:
         await executor.aclose()
+
+
+# --- parser -> launch seam ---------------------------------------------------
+# Every other launch test builds an McpServerDefinition directly, and every
+# other parser test stops at the parsed value. Nothing joined the two, which is
+# how a command rewrite that made the parsed definition unlaunchable passed a
+# green suite. These tests run what the parser actually stores.
+async def test_parsed_definition_from_a_venv_interpreter_actually_starts():
+    # sys.executable under a virtualenv IS a symlink to a base interpreter.
+    # Resolving it discards sys.prefix, so the server loses its dependencies and
+    # never starts — the ordinary configuration for a Python MCP server.
+    parsed = parse_server_allowlist(
+        {
+            "probe": {
+                "command": sys.executable,
+                "args": [PROBE],
+                "cwd": str(Path(PROBE).parent),
+            }
+        }
+    )
+    definition = parsed["probe"]
+
+    handler = McpServerHandler("probe_mcp", _config(), server=definition)
+    await handler.prepare_run("run-1")
+    try:
+        assert [t.name for t in handler.sub_tools_for("run-1")], "server offered no tools"
+        assert await handler.call(
+            arguments={"a": 2, "b": 3},
+            idempotency_key="k1",
+            run_id="run-1",
+            tool=qualified_tool_name("probe_mcp", "add"),
+        ) == "5"
+    finally:
+        await handler.aclose()
+
+
+def test_parsing_keeps_the_interpreter_it_was_given():
+    # The narrower unit assertion behind the launch test above, so a regression
+    # names the cause instead of only the symptom.
+    parsed = parse_server_allowlist(
+        {"probe": {"command": sys.executable, "args": [], "cwd": str(Path(PROBE).parent)}}
+    )
+    assert parsed["probe"].command == sys.executable
+
+
+def test_parsing_still_resolves_a_bare_name_to_an_absolute_path():
+    # `which` resolution is the part that defeats a later PATH change, and it
+    # must survive the fix above: the child is spawned by absolute path.
+    bin_dir = str(Path(sys.executable).parent)
+    name = Path(sys.executable).name
+    parsed = parse_server_allowlist(
+        {
+            "probe": {
+                "command": name,
+                "args": [],
+                "cwd": str(Path(PROBE).parent),
+                "env": {"PATH": bin_dir},
+            }
+        }
+    )
+    stored = parsed["probe"].command
+    assert Path(stored).is_absolute()
+    assert Path(stored).parent == Path(bin_dir)
