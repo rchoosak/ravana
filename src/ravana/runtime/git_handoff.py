@@ -108,7 +108,7 @@ async def hand_off_run(
     # the patch exists it is the delivered artifact, and a workspace that was
     # cleaned up or moved off its branch afterwards cannot invalidate it.
     provenance = read_provenance(run_dir)
-    artifacts_dir, patch_dir = _artifacts_paths(run_dir)
+    patch_dir = _handoff_dir(run_dir)
     if patch_dir.exists():
         # Counts come off the patch set itself: this result describes what the
         # developer will actually find on disk, not what the workspace holds now.
@@ -145,7 +145,6 @@ async def hand_off_run(
     await _write_patches(
         workspace,
         run_dir=run_dir,
-        artifacts_dir=artifacts_dir,
         patch_dir=patch_dir,
         base_commit=provenance.base_commit,
         include_uncommitted=dirty,
@@ -161,17 +160,16 @@ async def hand_off_run(
     )
 
 
-def _artifacts_paths(run_dir: Path) -> tuple[Path, Path]:
-    """Resolve `artifacts/` and `artifacts/handoff/`, refusing aliased ones.
+def _handoff_dir(run_dir: Path) -> Path:
+    """Locate `artifacts/handoff/`, refusing an aliased `artifacts/` or handoff.
 
-    `mkdir(exist_ok=True)` succeeds against a symlink pointing at an existing
-    directory, and the later `rename` then resolves through it — so a symlinked
-    `artifacts/` writes the patch outside `runs/<run_id>/` entirely while the
-    returned path still claims it landed inside (verified: the patch escaped).
-    Nothing an agent controls can plant that link today, since the sandbox
-    mounts only `workspace/`; this holds the same line `workspace_paths` already
-    holds for the run dir, so the guarantee doesn't depend on that mount
-    remaining the only writer.
+    This guards the **read** side — the idempotent re-report reads counts
+    through these paths, and reporting a symlinked directory as a delivered
+    artifact would point the developer at the wrong place.
+
+    It is a check-then-use on names and so cannot, by itself, protect the
+    publish; `_publish_staging` re-establishes the guarantee against a directory
+    FD instead of trusting this result to still hold.
     """
     for candidate in (run_dir / "artifacts", run_dir / "artifacts" / HANDOFF_DIRNAME):
         if candidate.is_symlink() or (
@@ -180,7 +178,7 @@ def _artifacts_paths(run_dir: Path) -> tuple[Path, Path]:
             raise GitError(
                 f"refusing an aliased handoff path (symlink out of the run dir): {candidate}"
             )
-    return run_dir / "artifacts", run_dir / "artifacts" / HANDOFF_DIRNAME
+    return run_dir / "artifacts" / HANDOFF_DIRNAME
 
 
 async def _assert_on_run_branch(workspace: Path, *, expected_branch: str, git: str) -> None:
@@ -230,7 +228,6 @@ async def _write_patches(
     workspace: Path,
     *,
     run_dir: Path,
-    artifacts_dir: Path,
     patch_dir: Path,
     base_commit: str,
     include_uncommitted: bool,
@@ -241,7 +238,6 @@ async def _write_patches(
     Same reason provisioning stages its clone: a partially-written handoff that
     a later read mistook for a complete one would understate what the run did.
     """
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
     staging = run_dir / f".handoff-staging-{uuid.uuid4().hex}"
     staging.mkdir()
     try:
@@ -281,7 +277,52 @@ async def _write_patches(
             (staging / UNCOMMITTED_PATCH_NAME).write_text(
                 tracked.stdout, encoding="utf-8"
             )
-        os.rename(staging, patch_dir)  # atomic publish (same filesystem)
+        _publish_staging(run_dir, staging_name=staging.name)
     except BaseException:
         await remove_tree(staging)
         raise
+
+
+def _publish_staging(run_dir: Path, *, staging_name: str) -> None:
+    """Move the staged patch set to `artifacts/handoff` via directory FDs.
+
+    The earlier `_artifacts_paths` check is a check-then-use on *names*, so it
+    cannot by itself survive `artifacts/` being swapped for a symlink between
+    the check and this publish. Here the directory is opened `O_NOFOLLOW` — a
+    symlink fails the open outright — and the rename is performed `renameat`
+    style against that file descriptor. The FD names an inode, not a path, so
+    swapping the `artifacts` name afterwards cannot redirect the write: there is
+    no second name resolution left to win.
+
+    Winning that race needs write access to the run dir, which no agent has (the
+    sandbox mounts only `workspace/`) and which already implies being outside
+    the sandbox. This closes the window regardless, so the property does not
+    rest on that argument staying true.
+    """
+    run_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            os.mkdir("artifacts", 0o700, dir_fd=run_fd)
+        except FileExistsError:
+            pass
+        try:
+            artifacts_fd = os.open(
+                "artifacts",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=run_fd,
+            )
+        except OSError as exc:
+            raise GitError(
+                f"refusing an aliased handoff path (artifacts is not a real directory): {run_dir / 'artifacts'}"
+            ) from exc
+        try:
+            os.rename(
+                staging_name,
+                HANDOFF_DIRNAME,
+                src_dir_fd=run_fd,
+                dst_dir_fd=artifacts_fd,
+            )
+        finally:
+            os.close(artifacts_fd)
+    finally:
+        os.close(run_fd)

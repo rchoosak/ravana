@@ -14,6 +14,7 @@ import subprocess
 
 import pytest
 
+from ravana.runtime import git_handoff
 from ravana.runtime.git_exec import GitError
 from ravana.runtime.git_handoff import hand_off_run
 from ravana.runtime.git_workspace import provision_run_workspace, run_branch_name
@@ -314,6 +315,35 @@ async def test_symlinked_handoff_dir_cannot_redirect_the_patch(tmp_path):
         await hand_off_run(runs_dir=runs, run_id="r")
 
     assert list(outside.iterdir()) == []
+
+
+async def test_artifacts_swapped_to_a_symlink_mid_flight_cannot_redirect(tmp_path, monkeypatch):
+    # TOCTOU: the name-based check passes, then `artifacts/` is swapped for a
+    # symlink before the patch is published. The publish resolves its directory
+    # once, via an O_NOFOLLOW FD, so there is no second name lookup left to win.
+    # Simulated by swapping during format-patch — squarely inside the window.
+    base, runs, ws = await _workspace(tmp_path)
+    _agent_commit(ws, "feature.py", "print('hi')\n", "add feature")
+    outside = tmp_path / "ESCAPED"
+    outside.mkdir()
+    real_run_git = git_handoff.run_git
+
+    async def racing_run_git(args, **kwargs):
+        result = await real_run_git(args, **kwargs)
+        if "format-patch" in args:
+            artifacts = runs / "r" / "artifacts"
+            if artifacts.is_dir() and not artifacts.is_symlink():
+                shutil.rmtree(artifacts)
+            if not artifacts.exists():
+                artifacts.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(git_handoff, "run_git", racing_run_git)
+
+    with pytest.raises(GitError, match="aliased handoff path"):
+        await hand_off_run(runs_dir=runs, run_id="r")
+
+    assert list(outside.iterdir()) == []  # nothing escaped the run dir
 
 
 async def test_run_id_path_escape_is_refused(tmp_path):
