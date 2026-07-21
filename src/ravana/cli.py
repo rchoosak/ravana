@@ -33,6 +33,7 @@ from ravana.runtime.providers.base import ProviderAdapter
 from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
 from ravana.runtime.secrets import EnvSecretResolver
 from ravana.runtime.tool_executor import RavanaToolExecutor
+from ravana.runtime.toolkits.mcp_server import McpServerDefinition, parse_server_allowlist
 from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.db import init_db
 from ravana.schema.loader import load_workflow_yaml
@@ -130,22 +131,23 @@ def _build_llm_gateway(
         workspace_project=workspace_project,
         workspace_base_ref=git_base_ref,
         mcp_allowlist=mcp_allowlist,
+        mcp_snapshot_con=con,
     )
     executor = RavanaToolExecutor(con, handlers)
     return LLMGateway(graph, _adapters_for_graph(graph), tool_executor=executor, secret_resolver=resolver)
 
 
-def _mcp_allowlist(ravana_dir: Path) -> set[str] | None:
+def _mcp_allowlist(ravana_dir: Path) -> dict[str, McpServerDefinition] | None:
     """§8's admin-curated MCP endpoint allow-list, from `.ravana/config.yaml`.
 
     Deliberately read from the INSTALL config, not from the workflow file: the
     point of the allow-list is that it is curated by whoever administers the
-    install, while a workflow's `config.command` is editable by anyone who can
-    author a workflow. Returns None when absent, which `check_endpoint_allowed`
+    install, while a workflow's `config.server` is only a reference and cannot
+    alter startup. Returns None when absent, which `check_endpoint_allowed`
     treats as "refuse every MCP server" rather than "allow any".
 
-    A malformed entry is dropped rather than coerced — a non-string in a
-    security allow-list should never widen it.
+    Each entry is a complete admin-owned server definition. A malformed config
+    fails closed rather than dropping fields or widening the executable scope.
     """
     config_path = ravana_dir / "config.yaml"
     try:
@@ -156,10 +158,12 @@ def _mcp_allowlist(ravana_dir: Path) -> set[str] | None:
         return None
     mcp = raw.get("mcp")
     servers = mcp.get("allowed_servers") if isinstance(mcp, dict) else None
-    if not isinstance(servers, list):
+    if not isinstance(servers, dict):
         return None
-    allowed = {s for s in servers if isinstance(s, str) and s}
-    return allowed or None
+    try:
+        return parse_server_allowlist(servers)
+    except Exception:
+        return None
 
 
 def _build_runtime(
@@ -245,6 +249,9 @@ def init(path: str) -> None:
     (ravana_dir / "workflows").mkdir(parents=True)
     (ravana_dir / "runs").mkdir(parents=True)
     init_db(ravana_dir / "state.db")
+    (ravana_dir / "config.yaml").write_text(
+        "mcp:\n  allowed_servers: {}\n", encoding="utf-8"
+    )
     gitignore = ravana_dir / ".gitignore"
     gitignore.write_text("state.db\nruns/\n")
     click.echo(f"Initialized {ravana_dir}")

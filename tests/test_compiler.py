@@ -131,6 +131,15 @@ def test_init_db_adds_execution_contract_columns_to_existing_sqlite(tmp_path):
             run_id TEXT NOT NULL,
             node_id TEXT NOT NULL
         );
+        CREATE TABLE mcp_tool_snapshot (
+            run_id TEXT NOT NULL,
+            toolkit_id TEXT NOT NULL,
+            server_fingerprint TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            input_schema TEXT NOT NULL,
+            PRIMARY KEY (run_id, toolkit_id, tool_name)
+        );
         """
     )
     legacy.close()
@@ -142,7 +151,11 @@ def test_init_db_adds_execution_contract_columns_to_existing_sqlite(tmp_path):
     execution_columns = {
         row[1] for row in migrated.execute("PRAGMA table_info(node_execution)")
     }
+    snapshot_columns = {
+        row[1] for row in migrated.execute("PRAGMA table_info(mcp_tool_snapshot)")
+    }
     migrated.close()
 
     assert {"toolkit_ids", "output_schema"} <= workflow_node_columns
     assert "logical_visit_id" in execution_columns
+    assert "created_at" in snapshot_columns

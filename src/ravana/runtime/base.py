@@ -106,6 +106,13 @@ class RunPreparer(Protocol):
 
 
 @runtime_checkable
+class RunReleaser(Protocol):
+    """Optional capability for releasing one run from a shared runtime."""
+
+    async def release_run(self, run_id: str) -> None: ...
+
+
+@runtime_checkable
 class RunHandoff(Protocol):
     """Optional capability for handing a completed run's work back (§10.1).
 

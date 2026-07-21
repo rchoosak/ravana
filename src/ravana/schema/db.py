@@ -242,6 +242,23 @@ CREATE TABLE IF NOT EXISTS tool_invocation (
     error           TEXT,
     created_at      TEXT NOT NULL
 );
+
+-- MCP tool-list pinning (§1.7/§8): this is runtime metadata rather than
+-- workflow state. It intentionally has no FK because run preparation happens
+-- before the run row is persisted; release_run removes terminal rows and a
+-- timestamped grace period lets startup GC distinguish abandoned snapshots
+-- from a concurrent preparation that has not inserted its run row yet.
+CREATE TABLE IF NOT EXISTS mcp_tool_snapshot (
+    run_id              TEXT NOT NULL,
+    toolkit_id          TEXT NOT NULL,
+    server_fingerprint  TEXT NOT NULL,
+    tool_name           TEXT NOT NULL,
+    description         TEXT NOT NULL,
+    input_schema        TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (run_id, toolkit_id, tool_name)
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_tool_snapshot_run ON mcp_tool_snapshot (run_id);
 """
 
 _ADDITIVE_MIGRATIONS: dict[str, dict[str, str]] = {
@@ -251,6 +268,9 @@ _ADDITIVE_MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "node_execution": {
         "logical_visit_id": "TEXT NOT NULL DEFAULT ''",
+    },
+    "mcp_tool_snapshot": {
+        "created_at": "TEXT NOT NULL DEFAULT ''",
     },
 }
 

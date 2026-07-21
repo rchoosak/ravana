@@ -199,7 +199,7 @@ It's the right addition because it's exactly the mechanism Ravana's "engineer-de
 
 Yes, and it's a strong fit — arguably a better default than hand-rolling every Connector, not just an additional option. MCP is an open, standardized protocol for exposing tools (and resources, and prompts — worth noting the overlap with §1.6's Skills) from an external server to an LLM client.
 
-- **No new schema needed.** An MCP server is just another `toolkit.type` value — `mcp_server` — alongside the existing `web_search | code_interpreter | db | api_connector` (§2.2). `config` holds the transport (a `stdio` command, or an `http`/SSE `url`) and an optional `allowed_tools` allow-list; `auth_ref` stays the toolkit's own top-level column exactly as for any other Toolkit type — not nested inside `config`, so the compiler/DB mapping doesn't have to special-case where credentials live per toolkit type. One `mcp_server`-type Toolkit exposes however many individual tools that server offers (or a narrowed subset) to the agent it's attached to — same attachment mechanism as any other Toolkit, no special case.
+- **No new workflow schema needed.** An MCP server is just another `toolkit.type` value — `mcp_server` — alongside the existing `web_search | code_interpreter | db | api_connector` (§2.2). `config` holds a server reference for `stdio` or a hosted `http`/SSE endpoint reference, plus an optional `allowed_tools` narrowing; the install/org registry owns the complete stdio command/args/env definition, the server-specific `auth_env` name, whether discovery requires authentication, and which tools are explicitly read-only. The runtime may persist an internal per-Run tool snapshot so a HITL resume in a fresh process reuses the same pinned list. `auth_ref` stays the toolkit's own top-level column exactly as for any other Toolkit type — not nested inside `config`, so the compiler/DB mapping doesn't have to special-case where credentials live per toolkit type. One `mcp_server`-type Toolkit exposes however many individual tools that server offers (or a narrowed subset) to the agent it's attached to — same attachment mechanism as any other Toolkit, no special case.
 - **What it buys**: the whole existing ecosystem of community/vendor MCP servers (GitHub, Slack, Postgres, Google Drive, Jira, ...) becomes usable with zero bespoke connector code. The Connector SDK (§1.2) is only needed for integrations nobody's already published as an MCP server — MCP becomes the default path, custom connectors the fallback, not the other way around.
 - **Transport matches the install tier from §10**: `stdio` (a local subprocess) fits the Local/Embedded tier naturally — the MCP server runs alongside the agent on the developer's own machine, same trust boundary as everything else in §10.1; `http`/SSE fits the hosted tiers, where a shared MCP server is centrally reachable by every Run.
 - **Security needs one addition to §8, not a new model.** MCP servers carry the same prompt-injection risk already flagged there for tool output — tool descriptions and resource content are untrusted input the model reads — plus an MCP-specific one: a remote server's exposed tool list can change after an engineer already approved it ("tool poisoning"/rug-pull), so **`org_id`-scoped MCP servers must come from an admin-curated allow-list of server endpoints, not an arbitrary URL any workflow author can paste into a Toolkit's `config`.** The same RBAC boundary that already gates who can edit/publish a Workflow (§8) should gate who can register a new MCP server for the org.
@@ -678,13 +678,14 @@ spec:
 
     # MCP server (§1.7) instead of a hand-rolled api_connector — zero custom
     # connector code, and the same server also works outside Ravana (Claude
-    # Desktop, Claude Code, ...). Must come from the org's approved endpoint
-    # allow-list (§8), not an arbitrary URL/command a workflow author picks.
+    # Desktop, Claude Code, ...). The workflow selects an approved server
+    # definition by name; the install-owned allow-list fixes its command/args/env
+    # and maps the resolved auth_ref to the server's expected environment name.
     - id: github_mcp
       type: mcp_server
       config:
         transport: stdio
-        command: ["npx", "-y", "@modelcontextprotocol/server-github"]
+        server: github_mcp_server
         allowed_tools: [list_issues, get_file_contents]
       auth_ref: secrets://github_pat
 

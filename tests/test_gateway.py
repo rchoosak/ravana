@@ -41,7 +41,7 @@ class _SurfacingExec:
     mirroring RavanaToolExecutor.tools_for so the gateway can offer them. Fakes
     add their own execute()."""
 
-    def tools_for(self, toolkit_ids):
+    def tools_for(self, toolkit_ids, *, run_id=None):
         return [Tool(name=t, description=f"fake {t}", input_schema={"type": "object"}) for t in toolkit_ids]
 
 
@@ -318,7 +318,7 @@ def test_no_tool_executor_offers_only_submit_result(graph):
 
 def test_toolkit_id_colliding_with_submit_result_is_rejected(graph):
     class Collide(_SurfacingExec):
-        def tools_for(self, toolkit_ids):
+        def tools_for(self, toolkit_ids, *, run_id=None):
             return [Tool(name=SUBMIT_RESULT, description="x", input_schema={"type": "object"})]
 
         async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):

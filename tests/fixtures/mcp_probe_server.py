@@ -28,6 +28,12 @@ def echo_env(name: str) -> str:
 
 
 @mcp.tool()
+def auth_is_set() -> bool:
+    """Report whether the dispatch credential reached the child process."""
+    return bool(os.environ.get("MCP_AUTH_TOKEN"))
+
+
+@mcp.tool()
 def explode() -> str:
     """Always fail, to exercise the tool-error path."""
     raise ValueError("tool blew up")

@@ -8,6 +8,10 @@
 | Legal | Approval gate (same pattern as Marketing) | A different loop pair (Attorney↔Compliance); the `redlining_playbook` Skill named as an example back in §1.6, now actually written |
 | IT/Ops | **Escalation** — human takes over, doesn't answer back into the graph | Broadcast used for parallelism, not spec-fanout; HITL triggered by severity/iteration count, not ambiguity |
 
+The MCP examples below use the Phase 0b `stdio` transport and reference
+administrator-owned server definitions from `.ravana/config.yaml`. Hosted
+HTTP/SSE MCP endpoints are reserved for the hosted tier.
+
 A note on the approval-gate pattern used in Marketing and Legal below, since it isn't the same shape as the PM clarification example in §4: the node's agent runs *twice* by design. First pass: `output_schema` doesn't require the verdict field, so the agent just prepares a human-readable summary and leaves the verdict unset — routing finds no match, `hitl_config.trigger_condition` (`verdict == null`) fires, and the run pauses. The human's response is then a new message in that node's thread, and per [§3.1's Resume step](ARCHITECTURE.md), the *same node* gets a fresh `node_execution` attempt — second pass, the agent now has the human's decision in context and transcribes it into the required verdict field. This is the same "agent re-runs with the human's answer" mechanic the PM example uses, just with the trigger condition being "no verdict yet" instead of "clarity is low."
 
 ---
@@ -58,8 +62,8 @@ spec:
     - id: social_mcp
       type: mcp_server
       config:
-        transport: http
-        url: https://mcp.buffer.com/sse
+        transport: stdio
+        server: social_mcp_server
         allowed_tools: [schedule_post, list_channels]
       auth_ref: secrets://buffer_token   # top-level, not inside config — matches toolkit.auth_ref in ARCHITECTURE.md §2.2
 
@@ -246,8 +250,8 @@ spec:
     - id: docusign_mcp
       type: mcp_server
       config:
-        transport: http
-        url: https://mcp.docusign.example/sse
+        transport: stdio
+        server: docusign_mcp_server
         allowed_tools: [send_for_signature]
       auth_ref: secrets://docusign_token
 
@@ -427,8 +431,8 @@ spec:
     - id: pagerduty_mcp
       type: mcp_server
       config:
-        transport: http
-        url: https://mcp.pagerduty.example/sse
+        transport: stdio
+        server: pagerduty_mcp_server
         allowed_tools: [get_alert, page_oncall]
       auth_ref: secrets://pagerduty_token
 
