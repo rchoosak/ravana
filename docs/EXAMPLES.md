@@ -12,6 +12,24 @@ The MCP examples below use the Phase 0b `stdio` transport and reference
 administrator-owned server definitions from `.ravana/config.yaml`. Hosted
 HTTP/SSE MCP endpoints are reserved for the hosted tier.
 
+```yaml
+# .ravana/config.yaml
+mcp:
+  allowed_servers:
+    social_mcp_server:
+      command: /absolute/path/to/node
+      args: [/absolute/path/to/server.js]
+      cwd: /absolute/admin-owned/server-directory
+      env:
+        PATH: /usr/local/bin:/usr/bin:/bin
+      auth_env: MCP_AUTH_TOKEN
+      authenticate_discovery: false
+      read_only_tools: [list_channels]
+```
+
+Workflow YAML may select `social_mcp_server` and narrow its `allowed_tools`; it
+cannot override these administrator-owned launch fields.
+
 A note on the approval-gate pattern used in Marketing and Legal below, since it isn't the same shape as the PM clarification example in §4: the node's agent runs *twice* by design. First pass: `output_schema` doesn't require the verdict field, so the agent just prepares a human-readable summary and leaves the verdict unset — routing finds no match, `hitl_config.trigger_condition` (`verdict == null`) fires, and the run pauses. The human's response is then a new message in that node's thread, and per [§3.1's Resume step](ARCHITECTURE.md), the *same node* gets a fresh `node_execution` attempt — second pass, the agent now has the human's decision in context and transcribes it into the required verdict field. This is the same "agent re-runs with the human's answer" mechanic the PM example uses, just with the trigger condition being "no verdict yet" instead of "clarity is low."
 
 ---

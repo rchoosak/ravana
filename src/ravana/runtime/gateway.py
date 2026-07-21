@@ -536,6 +536,20 @@ class LLMGateway:
         api_key,
     ):
         guards = self._graph.doc.spec.graph.guards
+        prepare_tools = getattr(self._tools, "prepare_tools", None)
+        if prepare_tools is not None:
+            try:
+                await prepare_tools(run_id, list(contract.toolkits))
+            except ToolkitError as exc:
+                if exc.kind is ToolFailureKind.TRANSIENT:
+                    raise TransientAgentError(
+                        f"tool preparation failed transiently: {exc}"
+                    ) from exc
+                if exc.kind is ToolFailureKind.FATAL:
+                    raise RuntimeError(
+                        f"tool preparation failed fatally: {exc}"
+                    ) from exc
+                raise RuntimeError(f"tool preparation failed: {exc}") from exc
         # §3.4.4: the node's resolved tool grants are offered as callable tools
         # (name = toolkit id), plus the synthetic submit_result the turn
         # terminates on. A toolkit named submit_result would shadow that

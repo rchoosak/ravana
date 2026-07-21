@@ -39,13 +39,25 @@ from ravana.runtime.toolkits.base import (
 from ravana.schema.util import now_iso
 
 
-def _sub_tools_for(handler: ToolkitHandler, run_id: str | None) -> list[Tool] | None:
+def _sub_tools_for(
+    handler: ToolkitHandler,
+    run_id: str | None,
+    *,
+    require_prepared: bool = True,
+) -> list[Tool] | None:
     """Read a handler's optional run-scoped multi-tool capability."""
     sub_tools_for = getattr(handler, "sub_tools_for", None)
     if sub_tools_for is None:
         return None
     if run_id is None:
         raise ToolkitError("run_id is required to access run-scoped toolkit tools")
+    is_prepared_for = getattr(handler, "is_prepared_for", None)
+    if (
+        not require_prepared
+        and is_prepared_for is not None
+        and not is_prepared_for(run_id)
+    ):
+        return []
     return sub_tools_for(run_id)
 
 
@@ -100,7 +112,9 @@ class RavanaToolExecutor:
         global_sub_tool_counts: dict[str, int] = {}
         if run_id is not None:
             for candidate in self._handlers.values():
-                for spec in _sub_tools_for(candidate, run_id) or []:
+                for spec in _sub_tools_for(
+                    candidate, run_id, require_prepared=False
+                ) or []:
                     global_sub_tool_counts[spec.name] = (
                         global_sub_tool_counts.get(spec.name, 0) + 1
                     )
@@ -129,7 +143,12 @@ class RavanaToolExecutor:
         matches = [
             candidate
             for candidate in self._handlers.values()
-            if any(spec.name == tool for spec in (_sub_tools_for(candidate, run_id) or []))
+            if any(
+                spec.name == tool
+                for spec in (
+                    _sub_tools_for(candidate, run_id, require_prepared=False) or []
+                )
+            )
         ]
         if direct is not None and matches:
             raise ToolkitError(f"callable tool name collision for '{tool}'")
@@ -142,8 +161,27 @@ class RavanaToolExecutor:
         raise ToolkitError(f"agent called unknown tool '{tool}' (no toolkit registered under that id)")
 
     async def prepare_run(self, run_id: str) -> None:
-        """Prepare each distinct handler's run-scoped resources."""
+        """Prepare eager run resources; node-scoped tools are prepared later."""
         for handler in self._distinct_handlers():
+            if getattr(handler, "prepare_on_demand", False):
+                continue
+            prepare = getattr(handler, "prepare_run", None)
+            if prepare is not None:
+                await prepare(run_id)
+
+    async def prepare_tools(self, run_id: str, toolkit_ids: list[str]) -> None:
+        """Prepare only on-demand handlers granted to the active node."""
+        seen: set[int] = set()
+        for toolkit_id in toolkit_ids:
+            handler = self._handlers.get(toolkit_id)
+            if handler is None:
+                raise ToolkitError(
+                    f"agent references toolkit '{toolkit_id}' with no registered handler"
+                )
+            identity = id(handler)
+            if identity in seen or not getattr(handler, "prepare_on_demand", False):
+                continue
+            seen.add(identity)
             prepare = getattr(handler, "prepare_run", None)
             if prepare is not None:
                 await prepare(run_id)

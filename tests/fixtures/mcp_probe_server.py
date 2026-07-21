@@ -34,6 +34,12 @@ def auth_is_set() -> bool:
 
 
 @mcp.tool()
+def current_directory() -> str:
+    """Report the server process working directory."""
+    return os.getcwd()
+
+
+@mcp.tool()
 def explode() -> str:
     """Always fail, to exercise the tool-error path."""
     raise ValueError("tool blew up")
@@ -42,4 +48,6 @@ def explode() -> str:
 if __name__ == "__main__":
     if os.environ.get("RAVANA_PROBE_REFUSE_START") == "1":
         sys.exit(3)
+    if os.environ.get("RAVANA_PROBE_ECHO_AUTH_STDERR") == "1":
+        print(os.environ.get("MCP_AUTH_TOKEN", ""), file=sys.stderr, flush=True)
     mcp.run()

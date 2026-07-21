@@ -22,8 +22,8 @@ from ravana.runtime.toolkits.mcp_server import (
     McpServerDefinition,
     McpServerHandler,
     check_endpoint_allowed,
-    cleanup_mcp_tool_snapshots,
 )
+from ravana.runtime.toolkits.mcp_snapshot import McpToolSnapshotStore
 from ravana.runtime.toolkits.sandbox import SandboxRunner
 
 # Toolkit types still deferred to a later slice, with the reason each needs it.
@@ -55,8 +55,13 @@ def build_registry(
     any. `mcp_snapshot_con` persists per-run tool pins across HITL resume when
     the runtime is reconstructed by a new process."""
     clients = clients or {}
-    if mcp_snapshot_con is not None:
-        cleanup_mcp_tool_snapshots(mcp_snapshot_con)
+    snapshot_store = (
+        McpToolSnapshotStore(mcp_snapshot_con)
+        if mcp_snapshot_con is not None
+        else None
+    )
+    if snapshot_store is not None:
+        snapshot_store.cleanup()
     handlers: dict[str, ToolkitHandler] = {}
     for toolkit_id, toolkit in graph.toolkits_by_id.items():
         if toolkit.type == "api_connector":
@@ -97,7 +102,7 @@ def build_registry(
                     toolkit.config,
                     server=server,
                     get_auth_token=_auth_provider(resolver, toolkit.auth_ref),
-                    snapshot_con=mcp_snapshot_con,
+                    snapshot_store=snapshot_store,
                 )
             except ToolkitError as exc:
                 handlers[toolkit_id] = _DeferredHandler(

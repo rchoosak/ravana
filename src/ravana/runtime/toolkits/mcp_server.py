@@ -27,12 +27,11 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
-import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ravana.runtime.providers.base import Tool
@@ -48,7 +47,7 @@ from ravana.runtime.secrets import (
     ensure_secret_free,
     redact_secrets,
 )
-from ravana.schema.util import now_iso
+from ravana.runtime.toolkits.mcp_snapshot import McpToolSnapshotStore
 
 # A qualified tool name is "<toolkit_id>SEP<sub_tool>". Two underscores keep it
 # readable and match what provider tool-name charsets accept ([A-Za-z0-9_-]).
@@ -59,7 +58,7 @@ _CALL_TIMEOUT_SECONDS = 120.0
 _SHUTDOWN_TIMEOUT_SECONDS = 10.0
 _DEFAULT_AUTH_ENV = "MCP_AUTH_TOKEN"
 _IDEMPOTENCY_META_KEY = "ravana/idempotency_key"
-_ORPHAN_SNAPSHOT_GRACE_SECONDS = 3600
+_PROVIDER_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # `mcp.client.stdio.stdio_client` merges these host variables into the child
 # environment even when `StdioServerParameters.env` is supplied. Empty values
 # neutralize that SDK default while still allowing the admin definition below
@@ -83,15 +82,28 @@ class McpServerDefinition:
 
     name: str
     command: str
+    cwd: str
     args: tuple[str, ...] = ()
     env: tuple[tuple[str, str], ...] = ()
     auth_env: str = _DEFAULT_AUTH_ENV
     authenticate_discovery: bool = False
     read_only_tools: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if not os.path.isabs(self.cwd) or not os.path.isdir(self.cwd):
+            raise ToolkitError(
+                f"MCP server definition '{self.name}' cwd must be an existing absolute directory",
+                kind=ToolFailureKind.FATAL,
+            )
+
     @property
     def environment(self) -> dict[str, str]:
         return dict(self.env)
+
+    @property
+    def working_directory(self) -> str:
+        """A fixed admin-owned cwd; never inherit the invoking project cwd."""
+        return self.cwd
 
     @property
     def fingerprint(self) -> str:
@@ -99,6 +111,7 @@ class McpServerDefinition:
         payload = {
             "name": self.name,
             "command": self.command,
+            "cwd": self.working_directory,
             "args": self.args,
             "env": self.env,
             "auth_env": self.auth_env,
@@ -122,6 +135,7 @@ def parse_server_allowlist(raw: Any) -> dict[str, McpServerDefinition] | None:
         if not isinstance(name, str) or not name or not isinstance(definition, dict):
             raise ToolkitError("mcp.allowed_servers must map names to server definitions", kind=ToolFailureKind.FATAL)
         command = definition.get("command")
+        cwd = definition.get("cwd")
         args = definition.get("args", [])
         env = definition.get("env", {})
         auth_env = definition.get("auth_env", _DEFAULT_AUTH_ENV)
@@ -138,6 +152,15 @@ def parse_server_allowlist(raw: Any) -> dict[str, McpServerDefinition] | None:
         if not isinstance(auth_env, str) or not auth_env or "=" in auth_env or "\x00" in auth_env:
             raise ToolkitError(
                 f"MCP server definition '{name}' auth_env must be a valid environment name",
+                kind=ToolFailureKind.FATAL,
+            )
+        if (
+            not isinstance(cwd, str)
+            or not os.path.isabs(cwd)
+            or not os.path.isdir(cwd)
+        ):
+            raise ToolkitError(
+                f"MCP server definition '{name}' cwd must be an existing absolute directory",
                 kind=ToolFailureKind.FATAL,
             )
         if not isinstance(authenticate_discovery, bool):
@@ -163,9 +186,11 @@ def parse_server_allowlist(raw: Any) -> dict[str, McpServerDefinition] | None:
                 f"MCP server definition '{name}' command {command!r} was not found on PATH",
                 kind=ToolFailureKind.FATAL,
             )
+        resolved_command = os.path.realpath(resolved)
         parsed[name] = McpServerDefinition(
             name=name,
-            command=os.path.realpath(resolved),
+            command=resolved_command,
+            cwd=os.path.realpath(cwd),
             args=tuple(args),
             env=tuple(sorted(env.items())),
             auth_env=auth_env,
@@ -191,6 +216,7 @@ class McpServerHandler:
     # Unused: this handler routes per sub-tool, each with the schema the server
     # published. Kept because ToolkitHandler declares it.
     input_schema: dict[str, Any] = {"type": "object", "additionalProperties": True}
+    prepare_on_demand = True
 
     def __init__(
         self,
@@ -199,7 +225,7 @@ class McpServerHandler:
         *,
         server: McpServerDefinition,
         get_auth_token: Any = None,
-        snapshot_con: sqlite3.Connection | None = None,
+        snapshot_store: McpToolSnapshotStore | None = None,
     ):
         transport = config.get("transport", "stdio")
         if transport != "stdio":
@@ -213,7 +239,7 @@ class McpServerHandler:
         self._server = server
         self._allowed_tools = _allowed_tools(config.get("allowed_tools"), toolkit_id)
         self._get_auth_token = get_auth_token
-        self._snapshot_con = snapshot_con
+        self._snapshot_store = snapshot_store
 
         self._pinned_by_run: dict[str, dict[str, Tool]] = {}
         # Only executable once `prepare_run` has pinned a tool list: before
@@ -237,6 +263,9 @@ class McpServerHandler:
             for name, spec in sorted(self._pinned_by_run.get(run_id, {}).items())
         ]
 
+    def is_prepared_for(self, run_id: str) -> bool:
+        return run_id in self._pinned_by_run
+
     def input_schema_for_tool(self, run_id: str, tool: str) -> dict[str, Any]:
         sub_tool = self._resolve_sub_tool(run_id, tool)
         return self._pinned_by_run[run_id][sub_tool].input_schema
@@ -253,13 +282,50 @@ class McpServerHandler:
         prefix = f"{self._toolkit_id}{TOOL_NAME_SEPARATOR}"
         if tool.startswith(prefix):
             tool = tool[len(prefix):]
-        return tool not in self._server.read_only_tools
+        return self._is_side_effecting_sub_tool(tool)
+
+    def _is_side_effecting_sub_tool(self, sub_tool: str) -> bool:
+        """Classify an already-resolved MCP name without stripping it again."""
+        return sub_tool not in self._server.read_only_tools
+
+    def _failure_for_phase(
+        self,
+        sub_tool: str,
+        phase: _CallPhase,
+        *,
+        before_dispatch: str,
+        read_only_after_dispatch: str,
+        side_effect_after_dispatch: str,
+        retry_safe_cancellation: bool = False,
+    ) -> BaseException:
+        """Apply the one retry-safety policy shared by every failure path."""
+        if not phase.dispatched:
+            if retry_safe_cancellation:
+                return ToolRetrySafeCancellation(before_dispatch)
+            return ToolkitError(before_dispatch, kind=ToolFailureKind.TRANSIENT)
+        if self._is_side_effecting_sub_tool(sub_tool):
+            return ToolOutcomeUnknown(side_effect_after_dispatch)
+        return ToolkitError(
+            read_only_after_dispatch,
+            kind=ToolFailureKind.TRANSIENT,
+        )
 
     async def prepare_run(self, run_id: str) -> None:
         """Discover and pin tools for one run without retaining a session."""
         if run_id in self._pinned_by_run:
             return
-        pinned = self._restore_snapshot(run_id)
+        pinned = (
+            self._snapshot_store.restore(
+                run_id,
+                self._toolkit_id,
+                self._snapshot_fingerprint(),
+            )
+            if self._snapshot_store is not None
+            else None
+        )
+        if pinned is not None:
+            for sub_tool in pinned:
+                self._validate_provider_tool_name(sub_tool)
         if pinned is None:
             try:
                 pinned = await asyncio.wait_for(
@@ -271,7 +337,13 @@ class McpServerHandler:
                     f"{_STARTUP_TIMEOUT_SECONDS:g}s",
                     kind=ToolFailureKind.TRANSIENT,
                 ) from exc
-            self._persist_snapshot(run_id, pinned)
+            if self._snapshot_store is not None:
+                self._snapshot_store.persist(
+                    run_id,
+                    self._toolkit_id,
+                    self._snapshot_fingerprint(),
+                    pinned,
+                )
         self._pinned_by_run[run_id] = pinned
         self.executable = True
         self.description = (
@@ -296,36 +368,39 @@ class McpServerHandler:
                 timeout=_CALL_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError as exc:
-            if phase.dispatched:
-                if self.is_side_effecting_for_tool(sub_tool, arguments):
-                    raise ToolOutcomeUnknown(
-                        f"mcp_server '{self._toolkit_id}' tool {sub_tool!r} timed out after "
-                        f"{_CALL_TIMEOUT_SECONDS:g}s",
-                    ) from exc
-                raise ToolkitError(
-                    f"mcp_server '{self._toolkit_id}' read-only tool {sub_tool!r} timed out after "
-                    f"{_CALL_TIMEOUT_SECONDS:g}s",
-                    kind=ToolFailureKind.TRANSIENT,
-                ) from exc
-            raise ToolkitError(
-                f"mcp_server '{self._toolkit_id}' failed before tool dispatch after "
-                f"{_CALL_TIMEOUT_SECONDS:g}s",
-                kind=ToolFailureKind.TRANSIENT,
+            raise self._failure_for_phase(
+                sub_tool,
+                phase,
+                before_dispatch=(
+                    f"mcp_server '{self._toolkit_id}' failed before tool dispatch after "
+                    f"{_CALL_TIMEOUT_SECONDS:g}s"
+                ),
+                read_only_after_dispatch=(
+                    f"mcp_server '{self._toolkit_id}' read-only tool {sub_tool!r} "
+                    f"timed out after {_CALL_TIMEOUT_SECONDS:g}s"
+                ),
+                side_effect_after_dispatch=(
+                    f"mcp_server '{self._toolkit_id}' tool {sub_tool!r} timed out after "
+                    f"{_CALL_TIMEOUT_SECONDS:g}s"
+                ),
             ) from exc
         except asyncio.CancelledError as exc:
-            if phase.dispatched:
-                if self.is_side_effecting_for_tool(sub_tool, arguments):
-                    raise ToolOutcomeUnknown(
-                        f"mcp_server '{self._toolkit_id}' tool {sub_tool!r} was cancelled "
-                        "after dispatch; outcome is unknown",
-                    ) from exc
-                raise ToolkitError(
-                    f"mcp_server '{self._toolkit_id}' read-only tool {sub_tool!r} was cancelled "
-                    "after dispatch",
-                    kind=ToolFailureKind.TRANSIENT,
-                ) from exc
-            raise ToolRetrySafeCancellation(
-                f"mcp_server '{self._toolkit_id}' tool {sub_tool!r} was cancelled before dispatch"
+            raise self._failure_for_phase(
+                sub_tool,
+                phase,
+                before_dispatch=(
+                    f"mcp_server '{self._toolkit_id}' tool {sub_tool!r} was cancelled "
+                    "before dispatch"
+                ),
+                read_only_after_dispatch=(
+                    f"mcp_server '{self._toolkit_id}' read-only tool {sub_tool!r} "
+                    "was cancelled after dispatch"
+                ),
+                side_effect_after_dispatch=(
+                    f"mcp_server '{self._toolkit_id}' tool {sub_tool!r} was cancelled "
+                    "after dispatch; outcome is unknown"
+                ),
+                retry_safe_cancellation=True,
             ) from exc
 
     def _resolve_sub_tool(self, run_id: str, tool: str | None) -> str:
@@ -353,11 +428,8 @@ class McpServerHandler:
         """Drop only one run's pinned snapshot from a shared runtime."""
         self._pinned_by_run.pop(run_id, None)
         self.executable = bool(self._pinned_by_run)
-        if self._snapshot_con is not None:
-            row = self._snapshot_con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
-            if row is None or row["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
-                self._snapshot_con.execute("DELETE FROM mcp_tool_snapshot WHERE run_id = ?", (run_id,))
-                self._snapshot_con.commit()
+        if self._snapshot_store is not None:
+            self._snapshot_store.release(run_id)
 
     def _snapshot_fingerprint(self) -> str:
         payload = {
@@ -366,71 +438,6 @@ class McpServerHandler:
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
-
-    def _restore_snapshot(self, run_id: str) -> dict[str, Tool] | None:
-        if self._snapshot_con is None:
-            return None
-        rows = self._snapshot_con.execute(
-            """SELECT server_fingerprint, tool_name, description, input_schema
-               FROM mcp_tool_snapshot
-               WHERE run_id = ? AND toolkit_id = ?
-               ORDER BY tool_name""",
-            (run_id, self._toolkit_id),
-        ).fetchall()
-        if not rows:
-            return None
-        expected = self._snapshot_fingerprint()
-        if any(row["server_fingerprint"] != expected for row in rows):
-            raise ToolkitError(
-                f"mcp_server '{self._toolkit_id}': admin definition or tool grant changed "
-                f"after run '{run_id}' was prepared",
-                kind=ToolFailureKind.FATAL,
-            )
-        pinned: dict[str, Tool] = {}
-        try:
-            for row in rows:
-                schema = json.loads(row["input_schema"])
-                if not isinstance(schema, dict):
-                    raise ValueError("input schema is not an object")
-                pinned[row["tool_name"]] = Tool(
-                    name=row["tool_name"],
-                    description=row["description"],
-                    input_schema=schema,
-                )
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ToolkitError(
-                f"mcp_server '{self._toolkit_id}': stored tool snapshot is invalid",
-                kind=ToolFailureKind.FATAL,
-            ) from exc
-        return pinned
-
-    def _persist_snapshot(self, run_id: str, pinned: dict[str, Tool]) -> None:
-        if self._snapshot_con is None:
-            return
-        fingerprint = self._snapshot_fingerprint()
-        self._snapshot_con.execute(
-            "DELETE FROM mcp_tool_snapshot WHERE run_id = ? AND toolkit_id = ?",
-            (run_id, self._toolkit_id),
-        )
-        self._snapshot_con.executemany(
-            """INSERT INTO mcp_tool_snapshot
-               (run_id, toolkit_id, server_fingerprint, tool_name, description, input_schema,
-                created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (
-                    run_id,
-                    self._toolkit_id,
-                    fingerprint,
-                    name,
-                    spec.description,
-                    json.dumps(spec.input_schema, sort_keys=True, separators=(",", ":")),
-                    now_iso(),
-                )
-                for name, spec in pinned.items()
-            ],
-        )
-        self._snapshot_con.commit()
 
     async def _discover_tools(self) -> dict[str, Tool]:
         """Open a short-lived session solely to pin its advertised tools."""
@@ -485,21 +492,21 @@ class McpServerHandler:
             raise
         except Exception as exc:  # noqa: BLE001 - normalize process/tool failures
             safe_error = redact_secrets(str(exc), values=secret_values)
-            if phase.dispatched and self.is_side_effecting_for_tool(tool, arguments):
-                raise ToolOutcomeUnknown(
+            raise self._failure_for_phase(
+                tool,
+                phase,
+                before_dispatch=(
+                    f"mcp_server '{self._toolkit_id}' failed before tool dispatch "
+                    f"({type(exc).__name__}): {safe_error}"
+                ),
+                read_only_after_dispatch=(
+                    f"mcp_server '{self._toolkit_id}' read-only tool {tool!r} failed "
+                    f"after dispatch ({type(exc).__name__}): {safe_error}"
+                ),
+                side_effect_after_dispatch=(
                     f"mcp_server '{self._toolkit_id}' tool {tool!r} failed "
                     f"({type(exc).__name__}); outcome is unknown: {safe_error}"
-                ) from None
-            if phase.dispatched:
-                raise ToolkitError(
-                    f"mcp_server '{self._toolkit_id}' read-only tool {tool!r} failed "
-                    f"after dispatch ({type(exc).__name__}): {safe_error}",
-                    kind=ToolFailureKind.TRANSIENT,
-                ) from None
-            raise ToolkitError(
-                f"mcp_server '{self._toolkit_id}' failed before tool dispatch "
-                f"({type(exc).__name__}): {safe_error}",
-                kind=ToolFailureKind.TRANSIENT,
+                ),
             ) from None
 
     @asynccontextmanager
@@ -514,8 +521,15 @@ class McpServerHandler:
                 command=self._server.command,
                 args=list(self._server.args),
                 env=env,
+                cwd=self._server.working_directory,
             )
-            read, write = await stack.enter_async_context(stdio_client(params))
+            # The SDK otherwise forwards child stderr directly to the host
+            # terminal. The child holds plaintext credentials, so even one
+            # accidental environment dump would bypass Ravana's secret gate.
+            stderr_sink = stack.enter_context(open(os.devnull, "w", encoding="utf-8"))
+            read, write = await stack.enter_async_context(
+                stdio_client(params, errlog=stderr_sink)
+            )
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
             yield session
@@ -582,6 +596,7 @@ class McpServerHandler:
                 offered_names.add(spec.name)
                 if self._allowed_tools is not None and spec.name not in self._allowed_tools:
                     continue
+                self._validate_provider_tool_name(spec.name)
                 schema = spec.inputSchema if isinstance(spec.inputSchema, dict) else {}
                 description = spec.description or f"{spec.name} (via {self._toolkit_id})"
                 try:
@@ -644,32 +659,15 @@ class McpServerHandler:
             )
         return pinned
 
-
-def cleanup_mcp_tool_snapshots(con: sqlite3.Connection) -> int:
-    """Remove snapshots that cannot be resumed by a live run.
-
-    Preparation precedes run insertion, so the snapshot table cannot use a
-    foreign key without making normal preparation impossible. This cleanup is
-    the crash-recovery counterpart: a fresh runtime removes terminal rows and
-    orphan rows older than the preparation grace period.
-    """
-    orphan_cutoff = (
-        datetime.now(timezone.utc)
-        - timedelta(seconds=_ORPHAN_SNAPSHOT_GRACE_SECONDS)
-    ).isoformat()
-    cursor = con.execute(
-        """DELETE FROM mcp_tool_snapshot
-           WHERE (NOT EXISTS (
-                      SELECT 1 FROM run WHERE run.id = mcp_tool_snapshot.run_id
-                  )
-                  AND (created_at = '' OR created_at < ?))
-              OR run_id IN (
-                     SELECT id FROM run WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
-                 )""",
-        (orphan_cutoff,),
-    )
-    con.commit()
-    return cursor.rowcount
+    def _validate_provider_tool_name(self, sub_tool: str) -> None:
+        provider_name = qualified_tool_name(self._toolkit_id, sub_tool)
+        if _PROVIDER_TOOL_NAME_RE.fullmatch(provider_name) is None:
+            raise ToolkitError(
+                f"mcp_server '{self._toolkit_id}': tool {sub_tool!r} does not "
+                "produce a provider-compatible name (use only A-Z, a-z, 0-9, "
+                "underscore, or hyphen; qualified length must be at most 64)",
+                kind=ToolFailureKind.FATAL,
+            )
 
 
 async def _close_stack(stack: AsyncExitStack) -> None:
@@ -738,9 +736,9 @@ def check_endpoint_allowed(
             "`mcp.allowed_servers` in .ravana/config.yaml.",
             kind=ToolFailureKind.FATAL,
         )
-    if any(key in config for key in ("command", "args", "env")):
+    if any(key in config for key in ("command", "args", "env", "cwd")):
         raise ToolkitError(
-            f"mcp_server '{toolkit_id}': command, args, and env must be supplied "
+            f"mcp_server '{toolkit_id}': command, args, env, and cwd must be supplied "
             "by the admin server definition, not the workflow",
             kind=ToolFailureKind.FATAL,
         )

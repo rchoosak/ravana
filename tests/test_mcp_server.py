@@ -9,6 +9,8 @@ offered or invoked).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ import yaml
 
 from tests.test_tool_execution import _seed_run
 
+from ravana.runtime.providers.base import Tool
 from ravana.runtime.toolkits.base import ToolRetrySafeCancellation, ToolkitError
 from ravana.runtime.secrets import ResolvedSecret
 from ravana.runtime.toolkits.base import ToolOutcomeUnknown
@@ -40,10 +43,12 @@ def _server(
     auth_env="MCP_AUTH_TOKEN",
     authenticate_discovery=False,
     read_only_tools=(),
+    cwd=None,
 ):
     return McpServerDefinition(
         name="probe",
         command=sys.executable,
+        cwd=cwd or str(Path(PROBE).parent),
         args=(PROBE,),
         env=tuple(sorted((env or {}).items())),
         auth_env=auth_env,
@@ -73,6 +78,7 @@ async def test_server_tools_are_discovered_and_qualified():
         assert names == [
             "probe_mcp__add",
             "probe_mcp__auth_is_set",
+            "probe_mcp__current_directory",
             "probe_mcp__echo_env",
             "probe_mcp__explode",
         ]
@@ -94,6 +100,24 @@ async def test_calling_a_pinned_tool_returns_its_result():
             tool=qualified_tool_name("probe_mcp", "add"),
         )
         assert out == "5"
+    finally:
+        await handler.aclose()
+
+
+async def test_admin_working_directory_controls_server_cwd(tmp_path):
+    handler = McpServerHandler(
+        "probe_mcp",
+        _config(allowed_tools=["current_directory"]),
+        server=_server(cwd=str(tmp_path)),
+    )
+    await handler.prepare_run("run-1")
+    try:
+        assert await handler.call(
+            arguments={},
+            idempotency_key="cwd",
+            run_id="run-1",
+            tool="probe_mcp__current_directory",
+        ) == str(tmp_path)
     finally:
         await handler.aclose()
 
@@ -226,6 +250,30 @@ async def test_auth_token_reaches_the_server_via_env_only():
         await handler.aclose()
 
 
+async def test_dispatch_credential_never_reaches_host_stderr(capfd):
+    token = "stderr-sentinel-secret"
+    handler = McpServerHandler(
+        "probe_mcp",
+        _config(allowed_tools=["auth_is_set"]),
+        server=_server({"RAVANA_PROBE_ECHO_AUTH_STDERR": "1"}),
+        get_auth_token=lambda: ResolvedSecret(token),
+    )
+    await handler.prepare_run("run-1")
+    capfd.readouterr()
+    try:
+        assert await handler.call(
+            arguments={},
+            idempotency_key="stderr",
+            run_id="run-1",
+            tool="probe_mcp__auth_is_set",
+        ) == "true"
+        captured = capfd.readouterr()
+        assert token not in captured.out
+        assert token not in captured.err
+    finally:
+        await handler.aclose()
+
+
 async def test_authenticated_discovery_is_explicit_and_dispatch_re_resolves():
     calls = 0
 
@@ -326,6 +374,7 @@ def test_cli_loads_complete_admin_server_definitions(tmp_path):
                         "probe": {
                             "command": sys.executable,
                             "args": [PROBE],
+                            "cwd": str(tmp_path),
                             "env": {"RAVANA_PROBE_MODE": "test"},
                         }
                     }
@@ -338,6 +387,7 @@ def test_cli_loads_complete_admin_server_definitions(tmp_path):
     allowlist = _mcp_allowlist(tmp_path)
     assert allowlist is not None
     assert allowlist["probe"].args == (PROBE,)
+    assert allowlist["probe"].working_directory == str(tmp_path)
     assert allowlist["probe"].environment == {"RAVANA_PROBE_MODE": "test"}
 
 
@@ -371,6 +421,12 @@ def test_workflow_cannot_override_admin_server_launch_definition():
             {"server": "probe", "args": ["-c", "malicious"]},
             {"probe": _server()},
         )
+    with pytest.raises(ToolkitError, match="must be supplied by the admin"):
+        check_endpoint_allowed(
+            "probe_mcp",
+            {"server": "probe", "cwd": "/tmp"},
+            {"probe": _server()},
+        )
 
 
 def test_server_allowlist_requires_complete_definitions():
@@ -379,6 +435,7 @@ def test_server_allowlist_requires_complete_definitions():
             "probe": {
                 "command": sys.executable,
                 "args": [PROBE],
+                "cwd": str(Path(PROBE).parent),
                 "env": {},
                 "auth_env": "GITHUB_PERSONAL_ACCESS_TOKEN",
                 "authenticate_discovery": True,
@@ -388,6 +445,7 @@ def test_server_allowlist_requires_complete_definitions():
     )
     assert parsed is not None
     assert parsed["probe"].command == str(Path(sys.executable).resolve())
+    assert parsed["probe"].working_directory == str(Path(PROBE).parent.resolve())
     assert parsed["probe"].auth_env == "GITHUB_PERSONAL_ACCESS_TOKEN"
     assert parsed["probe"].authenticate_discovery is True
     assert parsed["probe"].read_only_tools == ("list_issues",)
@@ -395,7 +453,29 @@ def test_server_allowlist_requires_complete_definitions():
 
 def test_named_server_commands_require_an_admin_owned_path():
     with pytest.raises(ToolkitError, match="env.PATH"):
-        parse_server_allowlist({"probe": {"command": "python", "args": []}})
+        parse_server_allowlist(
+            {
+                "probe": {
+                    "command": "python",
+                    "args": [],
+                    "cwd": str(Path(PROBE).parent),
+                }
+            }
+        )
+
+
+def test_server_definition_requires_an_explicit_working_directory():
+    with pytest.raises(ToolkitError, match="cwd must be an existing absolute directory"):
+        parse_server_allowlist({"probe": {"command": sys.executable}})
+    with pytest.raises(ToolkitError, match="cwd must be an existing absolute directory"):
+        McpServerDefinition(name="probe", command=sys.executable, cwd="relative")
+
+
+def test_server_definition_rejects_a_relative_working_directory():
+    with pytest.raises(ToolkitError, match="existing absolute directory"):
+        parse_server_allowlist(
+            {"probe": {"command": sys.executable, "cwd": "relative"}}
+        )
 
 
 def test_unsupported_transport_is_refused():
@@ -467,6 +547,7 @@ async def test_executor_surfaces_and_routes_mcp_sub_tools(con):
     handlers = _registry(_mcp_graph("probe"), {"probe": _server()})
     executor = RavanaToolExecutor(con, handlers)
     await executor.prepare_run("run-1")
+    await executor.prepare_tools("run-1", ["probe_mcp"])
     try:
         with pytest.raises(ToolkitError, match="run_id is required"):
             executor.tools_for(["probe_mcp"])
@@ -474,6 +555,7 @@ async def test_executor_surfaces_and_routes_mcp_sub_tools(con):
         assert names == [
             "probe_mcp__add",
             "probe_mcp__auth_is_set",
+            "probe_mcp__current_directory",
             "probe_mcp__echo_env",
             "probe_mcp__explode",
         ]
@@ -488,6 +570,32 @@ async def test_executor_surfaces_and_routes_mcp_sub_tools(con):
         await executor.aclose()
 
 
+async def test_executor_prepares_only_mcp_toolkits_requested_by_the_active_node(
+    monkeypatch, con
+):
+    from ravana.runtime.tool_executor import RavanaToolExecutor
+
+    prepared: list[tuple[str, str]] = []
+    used = McpServerHandler("used", _config(), server=_server())
+    unused = McpServerHandler("unused", _config(), server=_server())
+
+    async def prepare_used(run_id):
+        prepared.append(("used", run_id))
+
+    async def prepare_unused(run_id):
+        prepared.append(("unused", run_id))
+
+    monkeypatch.setattr(used, "prepare_run", prepare_used)
+    monkeypatch.setattr(unused, "prepare_run", prepare_unused)
+    executor = RavanaToolExecutor(con, {"used": used, "unused": unused})
+
+    await executor.prepare_run("run-1")
+    assert prepared == []
+
+    await executor.prepare_tools("run-1", ["used"])
+    assert prepared == [("used", "run-1")]
+
+
 async def test_executor_applies_admin_read_only_to_qualified_tool(con):
     from ravana.runtime.tool_executor import RavanaToolExecutor
 
@@ -496,6 +604,7 @@ async def test_executor_applies_admin_read_only_to_qualified_tool(con):
     )
     executor = RavanaToolExecutor(con, handlers)
     await executor.prepare_run("run-read-only")
+    await executor.prepare_tools("run-read-only", ["probe_mcp"])
     try:
         _seed_run(con, run_id="run-read-only")
         for key in ("read-1", "read-2"):
@@ -526,6 +635,7 @@ async def test_executor_keeps_credential_echo_as_indeterminate(con):
     )
     executor = RavanaToolExecutor(con, {"probe_mcp": handler})
     await executor.prepare_run("run-secret")
+    await executor.prepare_tools("run-secret", ["probe_mcp"])
     try:
         _seed_run(con, run_id="run-secret")
         with pytest.raises(ToolOutcomeUnknown):
@@ -580,6 +690,7 @@ async def test_mcp_tool_snapshot_is_restored_by_a_fresh_runtime(monkeypatch, con
     graph = _mcp_graph("probe")
     first = RavanaToolExecutor(con, _registry(graph, {"probe": _server()}, con))
     await first.prepare_run("run-snapshot")
+    await first.prepare_tools("run-snapshot", ["probe_mcp"])
     _seed_run(con, run_id="run-snapshot")
     con.execute("UPDATE run SET status = 'WAITING_HUMAN' WHERE id = ?", ("run-snapshot",))
     con.commit()
@@ -596,6 +707,7 @@ async def test_mcp_tool_snapshot_is_restored_by_a_fresh_runtime(monkeypatch, con
     second = RavanaToolExecutor(con, second_handlers)
     try:
         await second.prepare_run("run-snapshot")
+        await second.prepare_tools("run-snapshot", ["probe_mcp"])
         assert [tool.name for tool in second.tools_for(["probe_mcp"], run_id="run-snapshot")]
     finally:
         con.execute("UPDATE run SET status = 'COMPLETED' WHERE id = ?", ("run-snapshot",))
@@ -606,6 +718,108 @@ async def test_mcp_tool_snapshot_is_restored_by_a_fresh_runtime(monkeypatch, con
         "SELECT COUNT(*) AS count FROM mcp_tool_snapshot WHERE run_id = ?",
         ("run-snapshot",),
     ).fetchone()["count"] == 0
+
+
+async def test_legacy_snapshot_fingerprint_fails_closed(monkeypatch, con):
+    from ravana.runtime.tool_executor import RavanaToolExecutor
+
+    run_id = "run-legacy-snapshot"
+    toolkit_id = "probe_mcp"
+    server = _server(cwd=str(Path(PROBE).parent))
+    legacy_server_payload = {
+        "name": server.name,
+        "command": server.command,
+        "args": server.args,
+        "env": server.env,
+        "auth_env": server.auth_env,
+        "authenticate_discovery": server.authenticate_discovery,
+        "read_only_tools": server.read_only_tools,
+    }
+    legacy_server_fingerprint = hashlib.sha256(
+        json.dumps(
+            legacy_server_payload, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    legacy_snapshot_fingerprint = hashlib.sha256(
+        json.dumps(
+            {"server": legacy_server_fingerprint, "allowed_tools": None},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    _seed_run(con, run_id=run_id)
+    con.execute("UPDATE run SET status = 'WAITING_HUMAN' WHERE id = ?", (run_id,))
+    con.execute(
+        """INSERT INTO mcp_tool_snapshot
+           (run_id, toolkit_id, server_fingerprint, tool_name, description, input_schema,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            run_id,
+            toolkit_id,
+            legacy_snapshot_fingerprint,
+            "add",
+            "Add two integers",
+            "{}",
+            now_iso(),
+        ),
+    )
+    con.commit()
+
+    handlers = _registry(_mcp_graph("probe"), {"probe": server}, con)
+    handler = handlers[toolkit_id]
+
+    async def should_not_discover():
+        raise AssertionError("a mismatched snapshot must fail before rediscovery")
+
+    monkeypatch.setattr(handler, "_discover_tools", should_not_discover)
+    executor = RavanaToolExecutor(con, handlers)
+    try:
+        with pytest.raises(ToolkitError, match="admin definition or tool grant changed"):
+            await executor.prepare_tools(run_id, [toolkit_id])
+        stored = con.execute(
+            """SELECT DISTINCT server_fingerprint
+               FROM mcp_tool_snapshot WHERE run_id = ? AND toolkit_id = ?""",
+            (run_id, toolkit_id),
+        ).fetchone()["server_fingerprint"]
+        assert stored == legacy_snapshot_fingerprint
+    finally:
+        await executor.aclose()
+
+
+async def test_restored_snapshot_revalidates_provider_tool_names(con):
+    from ravana.runtime.tool_executor import RavanaToolExecutor
+
+    run_id = "run-invalid-snapshot-name"
+    toolkit_id = "probe_mcp"
+    handlers = _registry(_mcp_graph("probe"), {"probe": _server()}, con)
+    handler = handlers[toolkit_id]
+    _seed_run(con, run_id=run_id)
+    con.execute("UPDATE run SET status = 'WAITING_HUMAN' WHERE id = ?", (run_id,))
+    con.execute(
+        """INSERT INTO mcp_tool_snapshot
+           (run_id, toolkit_id, server_fingerprint, tool_name, description, input_schema,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            run_id,
+            toolkit_id,
+            handler._snapshot_fingerprint(),
+            "invalid.tool name",
+            "invalid",
+            "{}",
+            now_iso(),
+        ),
+    )
+    con.commit()
+
+    executor = RavanaToolExecutor(con, handlers)
+    try:
+        with pytest.raises(ToolkitError, match="provider-compatible"):
+            await executor.prepare_tools(run_id, [toolkit_id])
+    finally:
+        await executor.aclose()
 
 
 async def test_mcp_tool_list_pagination_and_workflow_filtering_are_independent():
@@ -656,6 +870,23 @@ async def test_authenticated_discovery_rejects_a_credential_in_a_tool_name():
         )
 
 
+@pytest.mark.parametrize("tool_name", ["invalid tool.name", "x" * 64])
+async def test_discovery_rejects_provider_incompatible_qualified_names(tool_name):
+    handler = McpServerHandler("probe_mcp", _config(), server=_server())
+
+    class IncompatibleNameSession:
+        async def list_tools(self, *, cursor=None):
+            spec = SimpleNamespace(
+                name=tool_name,
+                description="ordinary description",
+                inputSchema={},
+            )
+            return SimpleNamespace(tools=[spec], nextCursor=None)
+
+    with pytest.raises(ToolkitError, match="provider-compatible"):
+        await handler._pin_tools(IncompatibleNameSession())
+
+
 def test_mcp_snapshot_cleanup_keeps_recent_orphans_during_preparation(con):
     con.execute(
         """INSERT INTO mcp_tool_snapshot
@@ -702,6 +933,7 @@ async def test_executor_rejects_bad_arguments_against_the_sub_tool_schema(con):
     handlers = _registry(_mcp_graph("probe"), {"probe": _server()})
     executor = RavanaToolExecutor(con, handlers)
     await executor.prepare_run("run-1")
+    await executor.prepare_tools("run-1", ["probe_mcp"])
     try:
         _seed_run(con, run_id="run-1")
         with pytest.raises(ToolkitError, match="invalid arguments"):
@@ -777,6 +1009,50 @@ async def test_mcp_timeout_is_outcome_unknown_not_retryable(monkeypatch):
             )
     finally:
         await handler.aclose()
+
+
+async def test_prefixed_subtool_timeout_keeps_side_effect_claim_started(
+    monkeypatch, con
+):
+    from ravana.runtime.tool_executor import RavanaToolExecutor
+
+    handler = McpServerHandler(
+        "a",
+        _config(),
+        server=_server(read_only_tools=("x",)),
+    )
+    handler._pinned_by_run["run-1"] = {
+        "a__x": Tool(name="a__x", description="side effect", input_schema={})
+    }
+    handler.executable = True
+
+    async def never_finishes(tool, arguments, idempotency_key, phase):
+        phase.dispatched = True
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(
+        "ravana.runtime.toolkits.mcp_server._CALL_TIMEOUT_SECONDS", 0.001
+    )
+    monkeypatch.setattr(handler, "_call_once", never_finishes)
+    executor = RavanaToolExecutor(con, {"a": handler})
+    _seed_run(con, run_id="run-1")
+
+    try:
+        with pytest.raises(ToolOutcomeUnknown):
+            await executor.execute(
+                run_id="run-1",
+                node_id="n",
+                tool="a__a__x",
+                arguments={},
+                idempotency_key="prefixed-side-effect",
+            )
+        row = con.execute(
+            "SELECT status FROM tool_invocation WHERE idempotency_key = ?",
+            ("prefixed-side-effect",),
+        ).fetchone()
+        assert row["status"] == "STARTED"
+    finally:
+        await executor.aclose()
 
 
 async def test_post_dispatch_cleanup_failure_keeps_the_ledger_indeterminate(
