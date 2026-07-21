@@ -63,15 +63,33 @@ def _openai_tool_result_text(payload: list[dict]) -> str:
 def _assert_enveloped(emitted: str) -> None:
     """The boundary's minimum contract, stated implementation-agnostically.
 
-    Any envelope satisfies this — delimiters, a prefix banner, XML-ish tags. It
-    deliberately does not prescribe one, because the design question (what helps
-    when the payload argues against its own delimiters) is still open.
+    Deliberately does not prescribe a mechanism — delimiters, XML-ish tags and
+    a nonce-fenced block all satisfy it — because the design question (what
+    helps when the payload argues against its own framing) is still open.
+
+    It DOES insist on framing at both ends. An earlier version asserted only
+    `emitted != INJECTION`, i.e. "something changed", which a bare `[web_search]`
+    label satisfied — no terminator, forgeable by the payload, zero protection.
+    Under `strict` that XPASSed into a hard failure announcing a boundary that
+    did not exist, which is worse than no test: it would have walked the
+    implementer into deleting the marker.
+
+    Framing on both sides is the property that actually separates an envelope
+    from a label: without a terminator the model cannot tell where untrusted
+    text stops, which is exactly how injected content escapes its frame.
     """
     assert INJECTION in emitted, "the content itself must still reach the model"
-    assert emitted.strip() != INJECTION.strip(), (
-        "tool output reaches the model as bare content: nothing marks where "
-        "untrusted text begins or ends, so an injected instruction is "
-        "indistinguishable from the harness's own framing (§8)"
+
+    prefix, _, suffix = emitted.partition(INJECTION)
+    assert prefix.strip(), (
+        "tool output reaches the model with nothing marking where untrusted "
+        "text BEGINS, so an injected instruction is indistinguishable from the "
+        "harness's own framing (§8)"
+    )
+    assert suffix.strip(), (
+        "tool output has no terminator marking where untrusted text ENDS — a "
+        "prefix-only banner lets injected content continue past the frame and "
+        "read as harness instructions (§8)"
     )
 
 
@@ -103,3 +121,35 @@ def test_both_adapters_emit_tool_results_on_a_separate_channel():
 
     openai = _to_openai_messages([_tool_result()])
     assert any(m.get("role") == "tool" for m in openai)
+
+
+# --- what must NOT count as a boundary ---------------------------------------
+# `_assert_enveloped` is the contract the strict-xfails above are measured
+# against, so its discrimination has to be tested directly rather than assumed.
+# Its first version accepted the bare-label case below, which under `strict`
+# XPASSed into a hard failure claiming a boundary had landed.
+@pytest.mark.parametrize(
+    "shape,emitted",
+    [
+        ("bare content", INJECTION),
+        ("trailing whitespace only", INJECTION + "   "),
+        ("tool-name label, no terminator", f"[web_search] {INJECTION}"),
+        ("prefix banner, no terminator", f"Untrusted tool output follows.\n{INJECTION}"),
+        ("terminator only, no opener", f"{INJECTION}\n--- end tool output ---"),
+    ],
+)
+def test_these_shapes_are_not_an_envelope(shape, emitted):
+    with pytest.raises(AssertionError):
+        _assert_enveloped(emitted)
+
+
+@pytest.mark.parametrize(
+    "shape,emitted",
+    [
+        ("fenced block", f"<untrusted-tool-output>\n{INJECTION}\n</untrusted-tool-output>"),
+        ("nonce fence", f"===UNTRUSTED-a1b2c3===\n{INJECTION}\n===END-a1b2c3==="),
+        ("banner + terminator", f"BEGIN untrusted output\n{INJECTION}\nEND untrusted output"),
+    ],
+)
+def test_these_shapes_do_count_as_an_envelope(shape, emitted):
+    _assert_enveloped(emitted)  # must not raise — the contract stays mechanism-agnostic
