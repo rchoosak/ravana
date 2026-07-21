@@ -30,6 +30,7 @@ Two facts make the patch honest rather than approximate:
 
 from __future__ import annotations
 
+import errno
 import os
 import uuid
 from dataclasses import dataclass
@@ -299,22 +300,19 @@ def _publish_staging(run_dir: Path, *, staging_name: str) -> None:
     the sandbox. This closes the window regardless, so the property does not
     rest on that argument staying true.
     """
-    run_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    run_fd = _open_dir(run_dir, what="run directory")
     try:
         try:
             os.mkdir("artifacts", 0o700, dir_fd=run_fd)
         except FileExistsError:
             pass
-        try:
-            artifacts_fd = os.open(
-                "artifacts",
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=run_fd,
-            )
         except OSError as exc:
             raise GitError(
-                f"refusing an aliased handoff path (artifacts is not a real directory): {run_dir / 'artifacts'}"
+                f"handoff artifacts directory could not be created ({_oserror_label(exc)}): {run_dir / 'artifacts'}"
             ) from exc
+        artifacts_fd = _open_dir(
+            "artifacts", what="handoff artifacts directory", dir_fd=run_fd
+        )
         try:
             os.rename(
                 staging_name,
@@ -322,7 +320,45 @@ def _publish_staging(run_dir: Path, *, staging_name: str) -> None:
                 src_dir_fd=run_fd,
                 dst_dir_fd=artifacts_fd,
             )
+        except OSError as exc:
+            raise GitError(
+                f"handoff patch could not be published ({_oserror_label(exc)}): {run_dir / 'artifacts' / HANDOFF_DIRNAME}"
+            ) from exc
         finally:
             os.close(artifacts_fd)
     finally:
         os.close(run_fd)
+
+
+# A symlink met under O_NOFOLLOW surfaces as ELOOP on Linux and ENOTDIR on
+# macOS/BSD. Anything else (EACCES, ENOENT, EMFILE, ...) is an ordinary
+# filesystem failure and must not be reported as an aliasing attempt.
+_ALIAS_ERRNOS = frozenset({errno.ELOOP, errno.ENOTDIR})
+
+
+def _open_dir(path: str | Path, *, what: str, dir_fd: int | None = None) -> int:
+    """Open a directory refusing symlinks, as `GitError` rather than `OSError`.
+
+    Every other failure in this module is a `GitError`; leaking a raw `OSError`
+    from the publish path would make callers handle two error families for one
+    operation. The aliasing case keeps its own message because conflating it
+    with a permission or descriptor-exhaustion error would either cry attack at
+    a routine failure or bury a real one.
+    """
+    try:
+        return os.open(
+            path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+        )
+    except OSError as exc:
+        if exc.errno in _ALIAS_ERRNOS:
+            raise GitError(
+                f"refusing an aliased handoff path ({what} is not a real directory): {path}"
+            ) from exc
+        raise GitError(f"{what} could not be opened ({_oserror_label(exc)}): {path}") from exc
+
+
+def _oserror_label(exc: OSError) -> str:
+    """`errno` name plus class — no message text, which can carry paths a caller
+    already knows and, on some platforms, locale-dependent strings."""
+    name = errno.errorcode.get(exc.errno or 0, "unknown")
+    return f"{type(exc).__name__}/{name}"

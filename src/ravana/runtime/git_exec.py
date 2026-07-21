@@ -5,6 +5,10 @@ Both workspace provisioning (`git_workspace`) and the terminal handoff
 process group so a timeout kills git AND any helper/hook it spawned, stay
 cancellable inside the engine's event loop, and surface failures as `GitError`.
 
+POSIX-only: process-group signalling here, `fcntl` in the code_interpreter
+toolkit, and `O_NOFOLLOW`/`dir_fd` operations in the handoff. Declared in
+`pyproject.toml` classifiers.
+
 This lives in one module on purpose. The provisioning slice previously carried
 two copies of this runner (a sync twin and an async one) and the copies drifted
 out of test coverage; a second copy here would reintroduce the same problem.

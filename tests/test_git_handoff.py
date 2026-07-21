@@ -9,6 +9,7 @@ nothing about the isolation these tests exist to protect.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 
@@ -317,11 +318,9 @@ async def test_symlinked_handoff_dir_cannot_redirect_the_patch(tmp_path):
     assert list(outside.iterdir()) == []
 
 
-async def test_artifacts_swapped_to_a_symlink_mid_flight_cannot_redirect(tmp_path, monkeypatch):
-    # TOCTOU: the name-based check passes, then `artifacts/` is swapped for a
-    # symlink before the patch is published. The publish resolves its directory
-    # once, via an O_NOFOLLOW FD, so there is no second name lookup left to win.
-    # Simulated by swapping during format-patch — squarely inside the window.
+async def test_artifacts_swapped_to_a_symlink_before_publish_is_refused(tmp_path, monkeypatch):
+    # The window an attacker aims for: validation has passed, the patch is being
+    # built, and `artifacts/` is swapped for a symlink before the publish runs.
     base, runs, ws = await _workspace(tmp_path)
     _agent_commit(ws, "feature.py", "print('hi')\n", "add feature")
     outside = tmp_path / "ESCAPED"
@@ -344,6 +343,42 @@ async def test_artifacts_swapped_to_a_symlink_mid_flight_cannot_redirect(tmp_pat
         await hand_off_run(runs_dir=runs, run_id="r")
 
     assert list(outside.iterdir()) == []  # nothing escaped the run dir
+
+
+async def test_publish_is_anchored_to_the_opened_inode_not_the_name(tmp_path, monkeypatch):
+    # The test above passes for a mere re-check-by-name-then-rename-by-name
+    # implementation (verified), so it does NOT establish FD anchoring. This one
+    # does: the swap lands AFTER `artifacts/` has been opened, at the last
+    # instant before the rename, which is a window only an inode-anchored
+    # publish can survive.
+    #
+    # The original directory is moved aside rather than deleted so the assertion
+    # can name it: the patch must appear in the inode that was opened, even
+    # though nothing answers to `artifacts` by name any more.
+    base, runs, ws = await _workspace(tmp_path)
+    _agent_commit(ws, "feature.py", "print('hi')\n", "add feature")
+    run_dir = runs / "r"
+    outside = tmp_path / "ESCAPED"
+    outside.mkdir()
+    real_rename = os.rename
+    swapped = {"done": False}
+
+    def racing_rename(src, dst, **kwargs):
+        if not swapped["done"]:
+            swapped["done"] = True
+            # FDs are already open here; only the NAME is repointed.
+            real_rename(run_dir / "artifacts", run_dir / "artifacts_moved_aside")
+            (run_dir / "artifacts").symlink_to(outside, target_is_directory=True)
+        return real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(os, "rename", racing_rename)
+    await hand_off_run(runs_dir=runs, run_id="r")
+    monkeypatch.undo()
+
+    assert swapped["done"], "the race was never triggered — test would prove nothing"
+    # Published into the inode the FD held, which is now called something else.
+    assert (run_dir / "artifacts_moved_aside" / "handoff" / "0001-add-feature.patch").is_file()
+    assert list(outside.iterdir()) == []  # the repointed name captured nothing
 
 
 async def test_run_id_path_escape_is_refused(tmp_path):
