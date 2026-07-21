@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ravana.runtime import git_handoff
 from ravana.runtime.git_workspace import (
     DEFAULT_BASE_REF,
     GitError,
@@ -173,6 +174,32 @@ class CodeInterpreterHandler:
                 run_id, validate_requested_base=True
             )
             self._prepared_workspaces[run_id] = context
+        finally:
+            self._lifecycle.exit()
+
+    async def hand_off_run(self, run_id: str) -> str | None:
+        """Surface this run's workspace branch as a patch (§10.1).
+
+        The bookend to `prepare_run`: this handler provisioned the workspace, so
+        it owns handing it back. A run that never provisioned one (no runs dir,
+        or a workspace that was never created) has nothing to surface and
+        reports None rather than treating it as a failure.
+        """
+        if self._runs_dir is None:
+            return None
+        try:
+            self._lifecycle.enter()
+        except RuntimeError as exc:
+            raise ToolkitError(
+                "code_interpreter handler is closed",
+                kind=ToolFailureKind.FATAL,
+            ) from exc
+        try:
+            runs_dir = self._runs_dir.resolve()
+            if not (runs_dir / run_id / "workspace").is_dir():
+                return None
+            result = await git_handoff.hand_off_run(runs_dir=runs_dir, run_id=run_id)
+            return result.summary()
         finally:
             self._lifecycle.exit()
 

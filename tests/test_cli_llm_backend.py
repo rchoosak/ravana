@@ -233,6 +233,73 @@ def test_engine_invokes_runtime_run_preparation(con):
     assert runtime.prepared_run_id == run_id
 
 
+def _run_to_completion(con, runtime):
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+
+    graph = _no_toolkit_graph()
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    run_id = asyncio.run(
+        start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id)
+    )
+    status = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()[0]
+    return run_id, status
+
+
+class _HandoffRuntime(_ClosableRuntime):
+    """Records the §10.1 handoff the engine asks for at the terminal."""
+
+    def __init__(self, *, fail: bool = False):
+        super().__init__()
+        self.handed_off: list[str] = []
+        self._fail = fail
+
+    async def run_turn(self, **kwargs) -> AgentTurnResult:
+        return AgentTurnResult(structured_payload={})
+
+    async def hand_off_run(self, run_id: str) -> str | None:
+        self.handed_off.append(run_id)
+        if self._fail:
+            raise RuntimeError("git exploded")
+        return "handed off 1 commit(s) as a patch"
+
+
+def test_engine_hands_off_a_completed_run(con):
+    runtime = _HandoffRuntime()
+    run_id, status = _run_to_completion(con, runtime)
+    assert status == "COMPLETED"
+    assert runtime.handed_off == [run_id]
+
+
+def test_handoff_failure_does_not_flip_a_completed_run(con):
+    # §10.1 handoff is delivery, not adjudication: the agents' work already
+    # COMPLETED durably, so a git failure while surfacing it must not rewrite
+    # that outcome into FAILED.
+    runtime = _HandoffRuntime(fail=True)
+    run_id, status = _run_to_completion(con, runtime)
+    assert runtime.handed_off == [run_id]  # it really was attempted
+    assert status == "COMPLETED"
+
+
+def test_no_handoff_when_the_run_did_not_complete(con):
+    from ravana.compiler.persist import get_or_create_workflow
+    from ravana.engine.loop import start_run
+
+    class FailingRuntime(_HandoffRuntime):
+        async def run_turn(self, **kwargs) -> AgentTurnResult:
+            raise RuntimeError("agent turn failed")
+
+    runtime = FailingRuntime()
+    graph = _no_toolkit_graph()
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    run_id = asyncio.run(
+        start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id)
+    )
+    status = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()[0]
+    assert status == "FAILED"
+    assert runtime.handed_off == []  # nothing to hand back from a failed run
+
+
 def test_llm_runtime_prepares_requested_git_base(
     tmp_path, sdlc_graph, con, monkeypatch
 ):

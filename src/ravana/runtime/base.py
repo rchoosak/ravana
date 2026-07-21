@@ -105,6 +105,20 @@ class RunPreparer(Protocol):
     async def prepare_run(self, run_id: str) -> None: ...
 
 
+@runtime_checkable
+class RunHandoff(Protocol):
+    """Optional capability for handing a completed run's work back (§10.1).
+
+    The symmetric bookend to `prepare_run`: that provisions the isolated
+    workspace before the run, this surfaces what the run produced once it
+    COMPLETEs. Returns a human-readable summary of what was handed back, or
+    None when this runtime owns no workspace (the mock backend, or a project
+    with no `.ravana/runs`).
+    """
+
+    async def hand_off_run(self, run_id: str) -> str | None: ...
+
+
 @dataclass
 class AgentTurnResult:
     """What one agent turn produces — becomes the state_delta (§3.4) plus

@@ -78,6 +78,27 @@ class RavanaToolExecutor:
             if prepare is not None:
                 await prepare(run_id)
 
+    async def hand_off_run(self, run_id: str) -> str | None:
+        """Hand back the run's workspace via whichever handler owns it (§10.1).
+
+        Only the workspace-owning handler implements this, so the first summary
+        returned is the run's handoff; the loop keeps going past handlers that
+        have nothing to say rather than assuming a position in the registry.
+        """
+        seen: set[int] = set()
+        for handler in self._handlers.values():
+            identity = id(handler)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            hand_off = getattr(handler, "hand_off_run", None)
+            if hand_off is None:
+                continue
+            summary: str | None = await hand_off(run_id)
+            if summary is not None:
+                return summary
+        return None
+
     async def aclose(self) -> None:
         """Close each distinct handler owned by this execution scope."""
         first_error: RuntimeError | None = None

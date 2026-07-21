@@ -3,6 +3,15 @@ name = "ravana"
 version = "0.1.0"
 description = "Domain-agnostic multi-agent orchestration framework"
 requires-python = ">=3.11"
+# POSIX-only, and has been since before the git slices: `fcntl` is a hard
+# top-level import in the code_interpreter toolkit and the workspace modules use
+# process groups (`os.killpg`) and `O_NOFOLLOW`/`dir_fd` file operations. Stated
+# here rather than guarded per-module, because a guard in one module would imply
+# the rest is portable when the package does not even import on Windows.
+classifiers = [
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3.11",
+]
 dependencies = [
     "pydantic>=2.6",
     "pyyaml>=6.0",

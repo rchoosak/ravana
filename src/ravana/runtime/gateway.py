@@ -262,6 +262,14 @@ class LLMGateway:
         if prepare is not None:
             await prepare(run_id)
 
+    async def hand_off_run(self, run_id: str) -> str | None:
+        """Surface a COMPLETED run's workspace back to the developer (§10.1)."""
+        hand_off = getattr(self._tools, "hand_off_run", None)
+        if hand_off is None:
+            return None
+        summary: str | None = await hand_off(run_id)
+        return summary
+
     async def aclose(self) -> None:
         """Close every execution-plane resource owned by this gateway."""
         first_error: RuntimeError | None = None

@@ -127,6 +127,21 @@ def _handler(tmp_path, *, runtime="python3.11", runner=None, **config):
     return CodeInterpreterHandler({"runtime": runtime, **config}, runs_dir=tmp_path, runner=runner or FakeRunner())
 
 
+def test_hand_off_run_on_a_closed_handler_is_refused(tmp_path):
+    # §10.1 handoff shells out to git under the run dir, so it goes through the
+    # same lifecycle gate as prepare_run/call rather than running against a
+    # handler whose resources are already torn down.
+    handler = _handler(tmp_path)
+    (tmp_path / "r" / "workspace").mkdir(parents=True)
+
+    async def close_then_hand_off():
+        await handler.aclose()
+        return await handler.hand_off_run("r")
+
+    with pytest.raises(ToolkitError, match="closed"):
+        asyncio.run(close_then_hand_off())
+
+
 def _capture_toolkit_outcome(call, *args):
     try:
         return call(*args)
