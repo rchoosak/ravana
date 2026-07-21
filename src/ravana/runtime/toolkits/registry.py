@@ -1,7 +1,7 @@
 """Builds the set of toolkit handlers for a run from the compiled graph's
 toolkit configs (§2.2 `toolkit` rows) + a secret resolver. Only the toolkit
 types implemented in this slice are wired; the heavyweight, external-service
-types (`code_interpreter` Docker sandbox, `mcp_server` stdio, `web_search`)
+types (`web_search`)
 raise a clear ToolkitError pointing at the slice that owns them, rather than
 silently accepting a config they can't honor.
 """
@@ -17,11 +17,11 @@ from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.api_connector import ApiConnectorHandler
 from ravana.runtime.toolkits.base import ToolkitError, ToolkitHandler
 from ravana.runtime.toolkits.code_interpreter import CodeInterpreterHandler
+from ravana.runtime.toolkits.mcp_server import McpServerHandler, check_endpoint_allowed
 from ravana.runtime.toolkits.sandbox import SandboxRunner
 
 # Toolkit types still deferred to a later slice, with the reason each needs it.
 _DEFERRED = {
-    "mcp_server": "stdio MCP subprocess via the mcp SDK — lands in the sandbox slice",
     "web_search": "provider HTTP call (e.g. Tavily) — lands with the connector-providers slice",
 }
 
@@ -35,12 +35,17 @@ def build_registry(
     workspace_project: Path | None = None,
     workspace_base_ref: str = DEFAULT_BASE_REF,
     sandbox_runner: SandboxRunner | None = None,
+    mcp_allowlist: set[str] | None = None,
 ) -> dict[str, ToolkitHandler]:
     """Returns {toolkit_id: handler}. `clients` optionally injects a per-toolkit
     transport (tests pass fakes keyed by toolkit id); `runs_dir` is the
     `.ravana/runs` directory code_interpreter scopes each run's workspace under
     (§10.1); `workspace_project` and `workspace_base_ref` configure its git
-    clone; `sandbox_runner` overrides the Docker runner (tests pass a fake)."""
+    clone; `sandbox_runner` overrides the Docker runner (tests pass a fake);
+    `mcp_allowlist` is the admin-curated set of MCP server commands (§8) —
+    an `mcp_server` toolkit whose command is absent is refused, and an
+    unconfigured allow-list refuses every MCP toolkit rather than allowing
+    any."""
     clients = clients or {}
     handlers: dict[str, ToolkitHandler] = {}
     for toolkit_id, toolkit in graph.toolkits_by_id.items():
@@ -64,6 +69,29 @@ def build_registry(
                 base_ref=workspace_base_ref,
                 runner=sandbox_runner,
             )
+        elif toolkit.type == "mcp_server":
+            # §8: the endpoint must be admin-curated BEFORE anything is
+            # launched. `config.command` comes from a workflow file, so this
+            # gates whoever can edit workflows from running arbitrary local
+            # commands, and it fails closed when no allow-list is configured.
+            #
+            # A refused endpoint becomes a non-executable handler rather than an
+            # exception here: building the registry must not explode over a
+            # toolkit no executed agent declares. It stays fail-closed — never
+            # advertised to a model, never callable — and `tools_for` raises
+            # with this reason if an agent does declare it, which is the same
+            # seam every other unusable toolkit fails at.
+            try:
+                check_endpoint_allowed(toolkit_id, toolkit.config, mcp_allowlist)
+                handlers[toolkit_id] = McpServerHandler(
+                    toolkit_id,
+                    toolkit.config,
+                    get_auth_token=_auth_provider(resolver, toolkit.auth_ref),
+                )
+            except ToolkitError as exc:
+                handlers[toolkit_id] = _DeferredHandler(
+                    toolkit_id, toolkit.type, reason=str(exc)
+                )
         elif toolkit.type in _DEFERRED:
             handlers[toolkit_id] = _DeferredHandler(toolkit_id, toolkit.type)
         else:

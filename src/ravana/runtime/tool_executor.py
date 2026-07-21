@@ -14,9 +14,10 @@ executes it, with the idempotency ledger (§3.6/§8) wrapped around
     A STARTED row is an indeterminate outcome left by a process crash; Ravana
     fails closed instead of risking the same side effect a second time.
 
-In this slice one toolkit == one callable tool (its id); mcp_server, which
-exposes many sub-tools under one toolkit, gets its finer name->tool mapping
-in the sandbox slice.
+Most toolkits are one callable tool named after the toolkit id. An
+`mcp_server` toolkit (§1.7) instead surfaces the set of sub-tools it pinned
+during run preparation, qualified as `<toolkit_id>__<tool>`; `_resolve` maps a
+called name back by membership in that pinned set, never by string-splitting.
 """
 
 from __future__ import annotations
@@ -63,8 +64,34 @@ class RavanaToolExecutor:
                     f"toolkit '{tid}' is not executable in this build, so it cannot be offered to the model: "
                     f"{getattr(handler, 'description', 'deferred')}"
                 )
+            # §1.7: one `mcp_server` toolkit stands for however many tools that
+            # server publishes, so a handler may surface a *set* of qualified
+            # tools instead of one named after the toolkit. The list is whatever
+            # that handler pinned during run preparation — never re-read here.
+            sub_tools = getattr(handler, "sub_tools", None)
+            if sub_tools is not None:
+                tools.extend(sub_tools)
+                continue
             tools.append(Tool(name=tid, description=handler.description, input_schema=handler.input_schema))
         return tools
+
+    def _resolve(self, tool: str) -> tuple[ToolkitHandler, str | None]:
+        """Map a called tool name to (handler, sub-tool or None).
+
+        Resolution is by *membership*, not by splitting on the separator: a
+        toolkit id may itself contain the separator, and a sub-tool is accepted
+        only if the handler actually pinned it.
+        """
+        handler = self._handlers.get(tool)
+        if handler is not None:
+            return handler, None
+        for toolkit_id, candidate in self._handlers.items():
+            sub_tools = getattr(candidate, "sub_tools", None)
+            if sub_tools is None:
+                continue
+            if any(spec.name == tool for spec in sub_tools):
+                return candidate, tool
+        raise ToolkitError(f"agent called unknown tool '{tool}' (no toolkit registered under that id)")
 
     async def prepare_run(self, run_id: str) -> None:
         """Prepare each distinct handler's run-scoped resources."""
@@ -123,15 +150,21 @@ class RavanaToolExecutor:
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str
     ) -> str:
-        handler = self._handlers.get(tool)
-        if handler is None:
-            raise ToolkitError(f"agent called unknown tool '{tool}' (no toolkit registered under that id)")
+        handler, sub_tool = self._resolve(tool)
 
         # §8(a): enforce the handler's declared input schema here, in the
         # runtime — a provider-side tool schema is a hint the model usually
         # follows, not a safety boundary. Rejecting bad args before dispatch
         # keeps a malformed/injected call from reaching the connector at all.
-        schema_error = validate_json(arguments, getattr(handler, "input_schema", None))
+        # For a multi-tool handler the schema is the SUB-tool's, since the
+        # handler's own is a permissive placeholder.
+        schema = getattr(handler, "input_schema", None)
+        if sub_tool is not None:
+            schema = next(
+                (s.input_schema for s in handler.sub_tools if s.name == sub_tool),  # type: ignore[attr-defined]
+                schema,
+            )
+        schema_error = validate_json(arguments, schema)
         if schema_error is not None:
             raise ToolkitError(f"tool '{tool}' called with invalid arguments: {schema_error}")
 
@@ -146,7 +179,12 @@ class RavanaToolExecutor:
                 return prior_result
 
         try:
-            result = await handler.call(arguments=arguments, idempotency_key=idempotency_key, run_id=run_id)
+            call_kwargs: dict[str, Any] = {}
+            if sub_tool is not None:
+                call_kwargs["tool"] = sub_tool
+            result = await handler.call(
+                arguments=arguments, idempotency_key=idempotency_key, run_id=run_id, **call_kwargs
+            )
         except ToolOutcomeUnknown as exc:
             if side_effecting:
                 self._record_indeterminate(

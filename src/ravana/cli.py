@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import yaml
 
 from ravana.compiler.graph import CompiledGraph, compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
@@ -117,18 +118,48 @@ def _build_llm_gateway(
         ravana_dir = find_ravana_dir()
         runs_dir: Path | None = ravana_dir / "runs"
         workspace_project: Path | None = ravana_dir.parent
+        mcp_allowlist = _mcp_allowlist(ravana_dir)
     except click.ClickException:
         runs_dir = None
         workspace_project = None
+        mcp_allowlist = None
     handlers = build_registry(
         graph,
         resolver,
         runs_dir=runs_dir,
         workspace_project=workspace_project,
         workspace_base_ref=git_base_ref,
+        mcp_allowlist=mcp_allowlist,
     )
     executor = RavanaToolExecutor(con, handlers)
     return LLMGateway(graph, _adapters_for_graph(graph), tool_executor=executor, secret_resolver=resolver)
+
+
+def _mcp_allowlist(ravana_dir: Path) -> set[str] | None:
+    """§8's admin-curated MCP endpoint allow-list, from `.ravana/config.yaml`.
+
+    Deliberately read from the INSTALL config, not from the workflow file: the
+    point of the allow-list is that it is curated by whoever administers the
+    install, while a workflow's `config.command` is editable by anyone who can
+    author a workflow. Returns None when absent, which `check_endpoint_allowed`
+    treats as "refuse every MCP server" rather than "allow any".
+
+    A malformed entry is dropped rather than coerced — a non-string in a
+    security allow-list should never widen it.
+    """
+    config_path = ravana_dir / "config.yaml"
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    mcp = raw.get("mcp")
+    servers = mcp.get("allowed_servers") if isinstance(mcp, dict) else None
+    if not isinstance(servers, list):
+        return None
+    allowed = {s for s in servers if isinstance(s, str) and s}
+    return allowed or None
 
 
 def _build_runtime(
