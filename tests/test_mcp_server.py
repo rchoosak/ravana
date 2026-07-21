@@ -1221,6 +1221,80 @@ async def test_parsed_definition_from_a_venv_interpreter_actually_starts():
         await handler.aclose()
 
 
+def test_parsing_keeps_a_symlink_command_rather_than_its_target(tmp_path):
+    """Controlled symlink, so the assertion does not depend on this machine.
+
+    The venv launch test above proves the real-world consequence, but on a
+    runner where `sys.executable` happens not to be a symlink it would pass
+    even with `realpath` restored. Here the symlink is created by the test, so
+    the distinction is always exercised.
+    """
+    link = tmp_path / "python-link"
+    link.symlink_to(sys.executable)
+
+    parsed = parse_server_allowlist(
+        {"probe": {"command": str(link), "args": [], "cwd": str(tmp_path)}}
+    )
+
+    assert parsed["probe"].command == str(link)  # the link, not its target
+    assert Path(parsed["probe"].command).is_symlink()
+
+
+def test_repointing_a_command_symlink_changes_the_definition_fingerprint(tmp_path):
+    """A snapshot must not survive the interpreter being swapped underneath it.
+
+    The launch path is deliberately the symlink, so the fingerprint cannot get
+    identity from it: repointing the link would otherwise leave the fingerprint
+    unchanged and a restored tool snapshot would be trusted against a different
+    binary. Identity comes from the resolved target instead.
+    """
+    other = tmp_path / "other-python"
+    other.write_text("#!/bin/sh\nexit 0\n")
+    other.chmod(0o755)
+    link = tmp_path / "python-link"
+    link.symlink_to(sys.executable)
+
+    definition = {"command": str(link), "args": [], "cwd": str(tmp_path)}
+    before = parse_server_allowlist({"probe": dict(definition)})["probe"]
+
+    link.unlink()
+    link.symlink_to(other)
+    after = parse_server_allowlist({"probe": dict(definition)})["probe"]
+
+    assert before.command == after.command == str(link)  # same launch path
+    assert before.fingerprint != after.fingerprint  # different identity
+
+
+def test_parsing_makes_a_relative_path_entry_absolute(tmp_path, monkeypatch):
+    """A relative `env.PATH` entry must not leave a relative command.
+
+    `which` returns a relative path for a relative PATH entry (verified), and
+    the child is spawned with the definition's `cwd` — so a relative command
+    would resolve against a different directory than the parser validated,
+    running another binary with this server's credential environment.
+    """
+    bin_dir = Path(sys.executable).parent
+    monkeypatch.chdir(bin_dir.parent)
+    relative_path_entry = bin_dir.name  # e.g. "bin", relative to the new cwd
+
+    parsed = parse_server_allowlist(
+        {
+            "probe": {
+                "command": Path(sys.executable).name,
+                "args": [],
+                "cwd": str(tmp_path),
+                "env": {"PATH": relative_path_entry},
+            }
+        }
+    )
+
+    stored = parsed["probe"].command
+    assert Path(stored).is_absolute(), f"relative command would launch under cwd: {stored}"
+    # And it is the file the parser actually validated, not a same-named binary
+    # that happens to sit under the definition's cwd.
+    assert Path(stored).parent == bin_dir
+
+
 def test_parsing_keeps_the_interpreter_it_was_given():
     # The narrower unit assertion behind the launch test above, so a regression
     # names the cause instead of only the symptom.

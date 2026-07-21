@@ -88,6 +88,9 @@ class McpServerDefinition:
     auth_env: str = _DEFAULT_AUTH_ENV
     authenticate_discovery: bool = False
     read_only_tools: tuple[str, ...] = ()
+    # realpath of `command` at parse time — identity only, NEVER launched. The
+    # launch path stays the symlink so a venv interpreter keeps its sys.prefix.
+    command_target: str = ""
 
     def __post_init__(self) -> None:
         if not os.path.isabs(self.cwd) or not os.path.isdir(self.cwd):
@@ -111,6 +114,13 @@ class McpServerDefinition:
         payload = {
             "name": self.name,
             "command": self.command,
+            # Launch path AND the target it pointed at when parsed. The launch
+            # path is deliberately the symlink (a venv interpreter is one), so
+            # identity has to come from somewhere else: without this, repointing
+            # the symlink at another interpreter leaves the fingerprint
+            # unchanged and a restored tool snapshot would be trusted against a
+            # different binary.
+            "command_target": self.command_target,
             "cwd": self.working_directory,
             "args": self.args,
             "env": self.env,
@@ -186,21 +196,29 @@ def parse_server_allowlist(raw: Any) -> dict[str, McpServerDefinition] | None:
                 f"MCP server definition '{name}' command {command!r} was not found on PATH",
                 kind=ToolFailureKind.FATAL,
             )
-        # `which` gives an absolute path, which is the part that matters: the
-        # child is spawned by that path, so a later `PATH` change cannot
-        # redirect it. Deliberately NOT `realpath`d beyond that.
+        # Absolute, but NOT symlink-resolved. Two separate reasons:
         #
-        # Resolving the final symlink breaks the ordinary case. A virtualenv
-        # interpreter IS a symlink to a base interpreter, and following it
-        # discards `sys.prefix` — `.venv/bin/python3` becomes the bare CPython,
-        # which cannot import the server's dependencies, so an admin who
-        # allow-lists their venv gets a server that never starts (reproduced).
-        # It buys little in exchange: the process is spawned later, so pinning
-        # the target at parse time does not close a swap between parse and
-        # spawn either.
+        # `abspath` (not merely whatever `which` returned): a relative entry in
+        # `env.PATH` makes `which` return a relative path — verified, `.venv/bin`
+        # yields `.venv/bin/python3`. The child is spawned with the definition's
+        # `cwd`, so a relative command would resolve against a DIFFERENT
+        # directory than the one the parser just validated, launching another
+        # binary with this server's credential environment. `abspath` pins it to
+        # exactly the file `which` checked.
+        #
+        # No `realpath`: a virtualenv interpreter IS a symlink to a base
+        # interpreter, and following it discards `sys.prefix` —
+        # `.venv/bin/python3` becomes the bare CPython, which cannot import the
+        # server's dependencies, so an admin who allow-lists their venv gets a
+        # server that never starts (reproduced). It buys little in exchange: the
+        # process is spawned later, so pinning the target at parse time does not
+        # close a swap between parse and spawn either. `abspath` normalises
+        # without following links, which is exactly the needed half.
+        launch_command = os.path.abspath(resolved)
         parsed[name] = McpServerDefinition(
             name=name,
-            command=resolved,
+            command=launch_command,
+            command_target=os.path.realpath(launch_command),
             cwd=os.path.realpath(cwd),
             args=tuple(args),
             env=tuple(sorted(env.items())),
