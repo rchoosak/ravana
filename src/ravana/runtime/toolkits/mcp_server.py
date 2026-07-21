@@ -98,6 +98,12 @@ class McpServerDefinition:
                 f"MCP server definition '{self.name}' cwd must be an existing absolute directory",
                 kind=ToolFailureKind.FATAL,
             )
+        # Derive identity here rather than only in the parser, so it is a
+        # property of the type. Left to the caller, a construction site that
+        # simply omitted it would get an empty target and silently lose the
+        # symlink-swap protection, with nothing failing to say so.
+        if not self.command_target:
+            object.__setattr__(self, "command_target", os.path.realpath(self.command))
 
     @property
     def environment(self) -> dict[str, str]:
@@ -190,7 +196,24 @@ def parse_server_allowlist(raw: Any) -> dict[str, McpServerDefinition] | None:
                 f"MCP server definition '{name}' must provide env.PATH for command {command!r}",
                 kind=ToolFailureKind.FATAL,
             )
-        resolved = shutil.which(command, path=env.get("PATH", ""))
+        # A relative `PATH` entry makes the whole definition depend on the cwd
+        # `ravana` happened to be invoked from: the same admin config resolves
+        # from one directory and is rejected from another, and where it does
+        # resolve it could name a different same-named binary. That is the
+        # relative-command problem moved from spawn time to parse time rather
+        # than removed, so refuse it outright — an admin allow-list has no
+        # legitimate use for a cwd-relative search path.
+        search_path = env.get("PATH", "")
+        relative_entries = [
+            entry for entry in search_path.split(os.pathsep) if entry and not os.path.isabs(entry)
+        ]
+        if relative_entries:
+            raise ToolkitError(
+                f"MCP server definition '{name}' env.PATH must contain absolute directories; "
+                f"got relative {', '.join(repr(e) for e in relative_entries)}",
+                kind=ToolFailureKind.FATAL,
+            )
+        resolved = shutil.which(command, path=search_path)
         if resolved is None:
             raise ToolkitError(
                 f"MCP server definition '{name}' command {command!r} was not found on PATH",

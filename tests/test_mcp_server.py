@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1265,34 +1266,64 @@ def test_repointing_a_command_symlink_changes_the_definition_fingerprint(tmp_pat
     assert before.fingerprint != after.fingerprint  # different identity
 
 
-def test_parsing_makes_a_relative_path_entry_absolute(tmp_path, monkeypatch):
-    """A relative `env.PATH` entry must not leave a relative command.
+def test_a_directly_built_definition_still_carries_target_identity(tmp_path):
+    """Identity is a property of the type, not of the parser path.
 
-    `which` returns a relative path for a relative PATH entry (verified), and
-    the child is spawned with the definition's `cwd` — so a relative command
-    would resolve against a different directory than the parser validated,
-    running another binary with this server's credential environment.
+    Every test helper builds McpServerDefinition directly. If the target were
+    only filled in by the parser, those definitions — and any future
+    construction site — would silently lose the symlink-swap protection with
+    nothing failing to say so.
     """
-    bin_dir = Path(sys.executable).parent
-    monkeypatch.chdir(bin_dir.parent)
-    relative_path_entry = bin_dir.name  # e.g. "bin", relative to the new cwd
+    link = tmp_path / "python-link"
+    link.symlink_to(sys.executable)
 
-    parsed = parse_server_allowlist(
-        {
-            "probe": {
-                "command": Path(sys.executable).name,
-                "args": [],
-                "cwd": str(tmp_path),
-                "env": {"PATH": relative_path_entry},
-            }
-        }
+    definition = McpServerDefinition(
+        name="probe", command=str(link), cwd=str(tmp_path), args=()
     )
 
-    stored = parsed["probe"].command
-    assert Path(stored).is_absolute(), f"relative command would launch under cwd: {stored}"
-    # And it is the file the parser actually validated, not a same-named binary
-    # that happens to sit under the definition's cwd.
-    assert Path(stored).parent == bin_dir
+    assert definition.command == str(link)  # still launched via the symlink
+    assert definition.command_target == os.path.realpath(sys.executable)
+
+
+def test_relative_path_entries_are_refused(tmp_path):
+    """A relative `env.PATH` entry is rejected, not normalised.
+
+    `which` returns a relative path for one, and the child is spawned with the
+    definition's `cwd`, so a relative command would resolve against a different
+    directory than the parser validated. Normalising it merely moved that
+    ambiguity to parse time: the same admin config then resolved from one
+    invocation directory and was rejected from another, and where it resolved
+    it could name a different same-named binary. An admin allow-list has no
+    legitimate use for a cwd-relative search path.
+    """
+    with pytest.raises(ToolkitError, match="env.PATH must contain absolute directories"):
+        parse_server_allowlist(
+            {
+                "probe": {
+                    "command": Path(sys.executable).name,
+                    "args": [],
+                    "cwd": str(tmp_path),
+                    "env": {"PATH": Path(sys.executable).parent.name},
+                }
+            }
+        )
+
+
+def test_a_relative_entry_among_absolute_ones_is_still_refused(tmp_path):
+    # Fails closed on the whole PATH rather than quietly using the absolute
+    # entries and ignoring the relative one.
+    bin_dir = str(Path(sys.executable).parent)
+    with pytest.raises(ToolkitError, match="env.PATH must contain absolute directories"):
+        parse_server_allowlist(
+            {
+                "probe": {
+                    "command": Path(sys.executable).name,
+                    "args": [],
+                    "cwd": str(tmp_path),
+                    "env": {"PATH": os.pathsep.join([bin_dir, "relative/bin"])},
+                }
+            }
+        )
 
 
 def test_parsing_keeps_the_interpreter_it_was_given():
