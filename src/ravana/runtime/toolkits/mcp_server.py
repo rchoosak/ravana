@@ -88,6 +88,9 @@ class McpServerDefinition:
     auth_env: str = _DEFAULT_AUTH_ENV
     authenticate_discovery: bool = False
     read_only_tools: tuple[str, ...] = ()
+    # realpath of `command` at parse time — identity only, NEVER launched. The
+    # launch path stays the symlink so a venv interpreter keeps its sys.prefix.
+    command_target: str = ""
 
     def __post_init__(self) -> None:
         if not os.path.isabs(self.cwd) or not os.path.isdir(self.cwd):
@@ -95,6 +98,12 @@ class McpServerDefinition:
                 f"MCP server definition '{self.name}' cwd must be an existing absolute directory",
                 kind=ToolFailureKind.FATAL,
             )
+        # Derive identity here rather than only in the parser, so it is a
+        # property of the type. Left to the caller, a construction site that
+        # simply omitted it would get an empty target and silently lose the
+        # symlink-swap protection, with nothing failing to say so.
+        if not self.command_target:
+            object.__setattr__(self, "command_target", os.path.realpath(self.command))
 
     @property
     def environment(self) -> dict[str, str]:
@@ -111,6 +120,13 @@ class McpServerDefinition:
         payload = {
             "name": self.name,
             "command": self.command,
+            # Launch path AND the target it pointed at when parsed. The launch
+            # path is deliberately the symlink (a venv interpreter is one), so
+            # identity has to come from somewhere else: without this, repointing
+            # the symlink at another interpreter leaves the fingerprint
+            # unchanged and a restored tool snapshot would be trusted against a
+            # different binary.
+            "command_target": self.command_target,
             "cwd": self.working_directory,
             "args": self.args,
             "env": self.env,
@@ -180,16 +196,52 @@ def parse_server_allowlist(raw: Any) -> dict[str, McpServerDefinition] | None:
                 f"MCP server definition '{name}' must provide env.PATH for command {command!r}",
                 kind=ToolFailureKind.FATAL,
             )
-        resolved = shutil.which(command, path=env.get("PATH", ""))
+        # A relative `PATH` entry makes the whole definition depend on the cwd
+        # `ravana` happened to be invoked from: the same admin config resolves
+        # from one directory and is rejected from another, and where it does
+        # resolve it could name a different same-named binary. That is the
+        # relative-command problem moved from spawn time to parse time rather
+        # than removed, so refuse it outright — an admin allow-list has no
+        # legitimate use for a cwd-relative search path.
+        search_path = env.get("PATH", "")
+        relative_entries = [
+            entry for entry in search_path.split(os.pathsep) if entry and not os.path.isabs(entry)
+        ]
+        if relative_entries:
+            raise ToolkitError(
+                f"MCP server definition '{name}' env.PATH must contain absolute directories; "
+                f"got relative {', '.join(repr(e) for e in relative_entries)}",
+                kind=ToolFailureKind.FATAL,
+            )
+        resolved = shutil.which(command, path=search_path)
         if resolved is None:
             raise ToolkitError(
                 f"MCP server definition '{name}' command {command!r} was not found on PATH",
                 kind=ToolFailureKind.FATAL,
             )
-        resolved_command = os.path.realpath(resolved)
+        # Absolute, but NOT symlink-resolved. Two separate reasons:
+        #
+        # `abspath` (not merely whatever `which` returned): a relative entry in
+        # `env.PATH` makes `which` return a relative path — verified, `.venv/bin`
+        # yields `.venv/bin/python3`. The child is spawned with the definition's
+        # `cwd`, so a relative command would resolve against a DIFFERENT
+        # directory than the one the parser just validated, launching another
+        # binary with this server's credential environment. `abspath` pins it to
+        # exactly the file `which` checked.
+        #
+        # No `realpath`: a virtualenv interpreter IS a symlink to a base
+        # interpreter, and following it discards `sys.prefix` —
+        # `.venv/bin/python3` becomes the bare CPython, which cannot import the
+        # server's dependencies, so an admin who allow-lists their venv gets a
+        # server that never starts (reproduced). It buys little in exchange: the
+        # process is spawned later, so pinning the target at parse time does not
+        # close a swap between parse and spawn either. `abspath` normalises
+        # without following links, which is exactly the needed half.
+        launch_command = os.path.abspath(resolved)
         parsed[name] = McpServerDefinition(
             name=name,
-            command=resolved_command,
+            command=launch_command,
+            command_target=os.path.realpath(launch_command),
             cwd=os.path.realpath(cwd),
             args=tuple(args),
             env=tuple(sorted(env.items())),

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -444,7 +445,11 @@ def test_server_allowlist_requires_complete_definitions():
         }
     )
     assert parsed is not None
-    assert parsed["probe"].command == str(Path(sys.executable).resolve())
+    # NOT `Path(...).resolve()`: the command must keep the interpreter it was
+    # given. Resolving the final symlink turns a virtualenv interpreter into its
+    # base one, which cannot import the server's dependencies — see
+    # test_parsed_definition_from_a_venv_interpreter_actually_starts.
+    assert parsed["probe"].command == sys.executable
     assert parsed["probe"].working_directory == str(Path(PROBE).parent.resolve())
     assert parsed["probe"].auth_env == "GITHUB_PERSONAL_ACCESS_TOKEN"
     assert parsed["probe"].authenticate_discovery is True
@@ -1181,3 +1186,170 @@ async def test_executor_rejects_a_collision_from_an_ungranted_mcp_handler(con):
             executor.tools_for(["a"], run_id="run-1")
     finally:
         await executor.aclose()
+
+
+# --- parser -> launch seam ---------------------------------------------------
+# Every other launch test builds an McpServerDefinition directly, and every
+# other parser test stops at the parsed value. Nothing joined the two, which is
+# how a command rewrite that made the parsed definition unlaunchable passed a
+# green suite. These tests run what the parser actually stores.
+async def test_parsed_definition_from_a_venv_interpreter_actually_starts():
+    # sys.executable under a virtualenv IS a symlink to a base interpreter.
+    # Resolving it discards sys.prefix, so the server loses its dependencies and
+    # never starts — the ordinary configuration for a Python MCP server.
+    parsed = parse_server_allowlist(
+        {
+            "probe": {
+                "command": sys.executable,
+                "args": [PROBE],
+                "cwd": str(Path(PROBE).parent),
+            }
+        }
+    )
+    definition = parsed["probe"]
+
+    handler = McpServerHandler("probe_mcp", _config(), server=definition)
+    await handler.prepare_run("run-1")
+    try:
+        assert [t.name for t in handler.sub_tools_for("run-1")], "server offered no tools"
+        assert await handler.call(
+            arguments={"a": 2, "b": 3},
+            idempotency_key="k1",
+            run_id="run-1",
+            tool=qualified_tool_name("probe_mcp", "add"),
+        ) == "5"
+    finally:
+        await handler.aclose()
+
+
+def test_parsing_keeps_a_symlink_command_rather_than_its_target(tmp_path):
+    """Controlled symlink, so the assertion does not depend on this machine.
+
+    The venv launch test above proves the real-world consequence, but on a
+    runner where `sys.executable` happens not to be a symlink it would pass
+    even with `realpath` restored. Here the symlink is created by the test, so
+    the distinction is always exercised.
+    """
+    link = tmp_path / "python-link"
+    link.symlink_to(sys.executable)
+
+    parsed = parse_server_allowlist(
+        {"probe": {"command": str(link), "args": [], "cwd": str(tmp_path)}}
+    )
+
+    assert parsed["probe"].command == str(link)  # the link, not its target
+    assert Path(parsed["probe"].command).is_symlink()
+
+
+def test_repointing_a_command_symlink_changes_the_definition_fingerprint(tmp_path):
+    """A snapshot must not survive the interpreter being swapped underneath it.
+
+    The launch path is deliberately the symlink, so the fingerprint cannot get
+    identity from it: repointing the link would otherwise leave the fingerprint
+    unchanged and a restored tool snapshot would be trusted against a different
+    binary. Identity comes from the resolved target instead.
+    """
+    other = tmp_path / "other-python"
+    other.write_text("#!/bin/sh\nexit 0\n")
+    other.chmod(0o755)
+    link = tmp_path / "python-link"
+    link.symlink_to(sys.executable)
+
+    definition = {"command": str(link), "args": [], "cwd": str(tmp_path)}
+    before = parse_server_allowlist({"probe": dict(definition)})["probe"]
+
+    link.unlink()
+    link.symlink_to(other)
+    after = parse_server_allowlist({"probe": dict(definition)})["probe"]
+
+    assert before.command == after.command == str(link)  # same launch path
+    assert before.fingerprint != after.fingerprint  # different identity
+
+
+def test_a_directly_built_definition_still_carries_target_identity(tmp_path):
+    """Identity is a property of the type, not of the parser path.
+
+    Every test helper builds McpServerDefinition directly. If the target were
+    only filled in by the parser, those definitions — and any future
+    construction site — would silently lose the symlink-swap protection with
+    nothing failing to say so.
+    """
+    link = tmp_path / "python-link"
+    link.symlink_to(sys.executable)
+
+    definition = McpServerDefinition(
+        name="probe", command=str(link), cwd=str(tmp_path), args=()
+    )
+
+    assert definition.command == str(link)  # still launched via the symlink
+    assert definition.command_target == os.path.realpath(sys.executable)
+
+
+def test_relative_path_entries_are_refused(tmp_path):
+    """A relative `env.PATH` entry is rejected, not normalised.
+
+    `which` returns a relative path for one, and the child is spawned with the
+    definition's `cwd`, so a relative command would resolve against a different
+    directory than the parser validated. Normalising it merely moved that
+    ambiguity to parse time: the same admin config then resolved from one
+    invocation directory and was rejected from another, and where it resolved
+    it could name a different same-named binary. An admin allow-list has no
+    legitimate use for a cwd-relative search path.
+    """
+    with pytest.raises(ToolkitError, match="env.PATH must contain absolute directories"):
+        parse_server_allowlist(
+            {
+                "probe": {
+                    "command": Path(sys.executable).name,
+                    "args": [],
+                    "cwd": str(tmp_path),
+                    "env": {"PATH": Path(sys.executable).parent.name},
+                }
+            }
+        )
+
+
+def test_a_relative_entry_among_absolute_ones_is_still_refused(tmp_path):
+    # Fails closed on the whole PATH rather than quietly using the absolute
+    # entries and ignoring the relative one.
+    bin_dir = str(Path(sys.executable).parent)
+    with pytest.raises(ToolkitError, match="env.PATH must contain absolute directories"):
+        parse_server_allowlist(
+            {
+                "probe": {
+                    "command": Path(sys.executable).name,
+                    "args": [],
+                    "cwd": str(tmp_path),
+                    "env": {"PATH": os.pathsep.join([bin_dir, "relative/bin"])},
+                }
+            }
+        )
+
+
+def test_parsing_keeps_the_interpreter_it_was_given():
+    # The narrower unit assertion behind the launch test above, so a regression
+    # names the cause instead of only the symptom.
+    parsed = parse_server_allowlist(
+        {"probe": {"command": sys.executable, "args": [], "cwd": str(Path(PROBE).parent)}}
+    )
+    assert parsed["probe"].command == sys.executable
+
+
+def test_parsing_still_resolves_a_bare_name_to_an_absolute_path():
+    # `which` resolution is the part that defeats a later PATH change, and it
+    # must survive the fix above: the child is spawned by absolute path.
+    bin_dir = str(Path(sys.executable).parent)
+    name = Path(sys.executable).name
+    parsed = parse_server_allowlist(
+        {
+            "probe": {
+                "command": name,
+                "args": [],
+                "cwd": str(Path(PROBE).parent),
+                "env": {"PATH": bin_dir},
+            }
+        }
+    )
+    stored = parsed["probe"].command
+    assert Path(stored).is_absolute()
+    assert Path(stored).parent == Path(bin_dir)
