@@ -41,7 +41,7 @@ class _SurfacingExec:
     mirroring RavanaToolExecutor.tools_for so the gateway can offer them. Fakes
     add their own execute()."""
 
-    def tools_for(self, toolkit_ids):
+    def tools_for(self, toolkit_ids, *, run_id=None):
         return [Tool(name=t, description=f"fake {t}", input_schema={"type": "object"}) for t in toolkit_ids]
 
 
@@ -307,6 +307,72 @@ def test_agent_toolkits_offered_alongside_submit_result(graph):
     assert offered == {"web_search", SUBMIT_RESULT}
 
 
+def test_node_toolkits_are_prepared_before_they_are_advertised(graph):
+    events: list[tuple[str, object]] = []
+
+    class PreparingExec(_SurfacingExec):
+        async def prepare_tools(self, run_id, toolkit_ids):
+            events.append(("prepare", (run_id, tuple(toolkit_ids))))
+
+        def tools_for(self, toolkit_ids, *, run_id=None):
+            events.append(("advertise", (run_id, tuple(toolkit_ids))))
+            return super().tools_for(toolkit_ids, run_id=run_id)
+
+    adapter = FakeAdapter(responses=[_submit({"requirement_clarity": "HIGH"})])
+    gateway = LLMGateway(
+        graph,
+        {"anthropic": adapter},
+        tool_executor=PreparingExec(),
+    )
+
+    _run(gateway, "pm")
+
+    assert events == [
+        ("prepare", ("r1", ("web_search",))),
+        ("advertise", ("r1", ("web_search",))),
+    ]
+
+
+def test_transient_tool_preparation_error_ends_the_turn_as_transient(graph):
+    from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+
+    class FailingPreparationExec(_SurfacingExec):
+        async def prepare_tools(self, run_id, toolkit_ids):
+            raise ToolkitError(
+                "MCP discovery timed out", kind=ToolFailureKind.TRANSIENT
+            )
+
+    adapter = FakeAdapter(responses=[_submit({"requirement_clarity": "HIGH"})])
+    gateway = LLMGateway(
+        graph,
+        {"anthropic": adapter},
+        tool_executor=FailingPreparationExec(),
+    )
+
+    with pytest.raises(TransientAgentError, match="preparation failed transiently"):
+        _run(gateway, "pm")
+    assert adapter.requests == []
+
+
+def test_fatal_tool_preparation_error_remains_a_hard_failure(graph):
+    from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+
+    class FailingPreparationExec(_SurfacingExec):
+        async def prepare_tools(self, run_id, toolkit_ids):
+            raise ToolkitError("invalid MCP schema", kind=ToolFailureKind.FATAL)
+
+    adapter = FakeAdapter(responses=[_submit({"requirement_clarity": "HIGH"})])
+    gateway = LLMGateway(
+        graph,
+        {"anthropic": adapter},
+        tool_executor=FailingPreparationExec(),
+    )
+
+    with pytest.raises(RuntimeError, match="preparation failed fatally"):
+        _run(gateway, "pm")
+    assert adapter.requests == []
+
+
 def test_no_tool_executor_offers_only_submit_result(graph):
     # Without a real executor, _NoToolExecutor surfaces no tools — the turn is
     # submit_result-only even for an agent that declares toolkits.
@@ -318,7 +384,7 @@ def test_no_tool_executor_offers_only_submit_result(graph):
 
 def test_toolkit_id_colliding_with_submit_result_is_rejected(graph):
     class Collide(_SurfacingExec):
-        def tools_for(self, toolkit_ids):
+        def tools_for(self, toolkit_ids, *, run_id=None):
             return [Tool(name=SUBMIT_RESULT, description="x", input_schema={"type": "object"})]
 
         async def execute(self, *, run_id, node_id, tool, arguments, idempotency_key):

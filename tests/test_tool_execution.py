@@ -553,8 +553,8 @@ def test_executor_rejects_args_violating_input_schema(con, graph):
 def test_registry_defers_mcp_and_web_search(graph):
     resolver = EnvSecretResolver({})
     handlers = build_registry(graph, resolver)
-    # code_interpreter is now executable (its own slice); mcp_server/web_search
-    # remain deferred and refuse to run.
+    # code_interpreter is executable; an MCP server without an admin definition
+    # and web_search remain unavailable and refuse to run.
     for tid in ("github_mcp", "web_search"):
         with pytest.raises(ToolkitError, match="not executable in this slice"):
             asyncio.run(handlers[tid].call(arguments={}, idempotency_key="k"))

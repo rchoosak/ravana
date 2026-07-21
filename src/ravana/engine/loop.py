@@ -36,9 +36,10 @@ from ravana.runtime.base import (
     AgentTurnResult,
     LLMUsage,
     ProseJudgementError,
-    RunPreparer,
-    TransientAgentError,
     RunHandoff,
+    RunPreparer,
+    RunReleaser,
+    TransientAgentError,
 )
 from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.secrets import ensure_secret_free, redact_secrets
@@ -59,6 +60,12 @@ _TERMINAL_STATUS_PLACEHOLDERS = ", ".join("?" for _ in TERMINAL_STATUSES)
 
 class TerminalPersistenceError(RuntimeError):
     """The run outcome could not be persisted, including the status fallback."""
+
+
+async def _release_run(runtime: AgentRuntime, run_id: str) -> None:
+    """Release optional run-scoped resources through an explicit capability."""
+    if isinstance(runtime, RunReleaser):
+        await runtime.release_run(run_id)
 
 
 @dataclass
@@ -212,57 +219,60 @@ async def start_run(
     # (§10.1's git workspace clone) under the same id before the run starts;
     # otherwise we mint one here.
     run_id = run_id or new_id()
-    if isinstance(runtime, RunPreparer):
-        await runtime.prepare_run(run_id)
-    concurrency = graph.doc.spec.concurrency
-    concurrency_group = _resolve_group(concurrency.group, input_payload) if concurrency else None
+    try:
+        if isinstance(runtime, RunPreparer):
+            await runtime.prepare_run(run_id)
+        concurrency = graph.doc.spec.concurrency
+        concurrency_group = _resolve_group(concurrency.group, input_payload) if concurrency else None
 
-    status = "RUNNING"
-    if concurrency and concurrency_group:
-        active = con.execute(
-            """SELECT id FROM run WHERE workflow_id = ? AND concurrency_group = ?
-               AND status IN ('PENDING','RUNNING','WAITING_HUMAN')""",
-            (workflow_id, concurrency_group),
-        ).fetchall()
-        if active:
-            if concurrency.strategy == "queue":
-                status = "PENDING"  # §3.7: held until the active run finishes; 0a has no scheduler to unblock it later
-            elif concurrency.strategy == "cancel_previous":
-                for row in active:
-                    con.execute("UPDATE run SET status = 'CANCELLED', ended_at = ? WHERE id = ?", (now_iso(), row["id"]))
-            # "allow": no restriction
+        status = "RUNNING"
+        if concurrency and concurrency_group:
+            active = con.execute(
+                """SELECT id FROM run WHERE workflow_id = ? AND concurrency_group = ?
+                   AND status IN ('PENDING','RUNNING','WAITING_HUMAN')""",
+                (workflow_id, concurrency_group),
+            ).fetchall()
+            if active:
+                if concurrency.strategy == "queue":
+                    status = "PENDING"  # §3.7: held until the active run finishes; 0a has no scheduler to unblock it later
+                elif concurrency.strategy == "cancel_previous":
+                    for row in active:
+                        con.execute("UPDATE run SET status = 'CANCELLED', ended_at = ? WHERE id = ?", (now_iso(), row["id"]))
+                # "allow": no restriction
 
-    shared_state = dict(graph.doc.spec.state.initial)
-    con.execute(
-        """INSERT INTO run (id, org_id, workflow_id, workflow_version, status, current_nodes, shared_state,
-                             state_version, concurrency_group, triggered_by, input_payload, started_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            run_id,
-            org_id,
-            workflow_id,
-            graph.doc.metadata.version,
-            status,
-            dumps([]),
-            dumps(shared_state),
-            0,
-            concurrency_group,
-            triggered_by,
-            dumps(input_payload),
-            now_iso(),
-        ),
-    )
-    con.commit()
-
-    if status == "RUNNING":
-        ctx = _RunCtx(
-            con=con, graph=graph, run_id=run_id, org_id=org_id, workflow_id=workflow_id,
-            runtime=runtime, queue=[graph.entry], dod_prose_verdict=dod_prose_verdict,
-            retry_sleep=retry_sleep,
+        shared_state = dict(graph.doc.spec.state.initial)
+        con.execute(
+            """INSERT INTO run (id, org_id, workflow_id, workflow_version, status, current_nodes, shared_state,
+                                 state_version, concurrency_group, triggered_by, input_payload, started_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                run_id,
+                org_id,
+                workflow_id,
+                graph.doc.metadata.version,
+                status,
+                dumps([]),
+                dumps(shared_state),
+                0,
+                concurrency_group,
+                triggered_by,
+                dumps(input_payload),
+                now_iso(),
+            ),
         )
-        await _drain_queue(ctx)
+        con.commit()
 
-    return run_id
+        if status == "RUNNING":
+            ctx = _RunCtx(
+                con=con, graph=graph, run_id=run_id, org_id=org_id, workflow_id=workflow_id,
+                runtime=runtime, queue=[graph.entry], dod_prose_verdict=dod_prose_verdict,
+                retry_sleep=retry_sleep,
+            )
+            await _drain_queue(ctx)
+
+        return run_id
+    finally:
+        await _release_run(runtime, run_id)
 
 
 def _join_arrivals(con: sqlite3.Connection, run_id: str, node_id: str) -> set[str]:
@@ -1061,22 +1071,30 @@ async def resume_hitl(
         raise ValueError(f"hitl_request '{hitl_request_id}' is not PENDING (status={hitl_row['status']})")
 
     node_id = hitl_row["node_id"]
-    con.execute(
-        "UPDATE hitl_request SET status = 'ANSWERED', response = ?, responded_at = ? WHERE id = ?",
-        (dumps(response), now_iso(), hitl_request_id),
-    )
-    con.execute(
-        """INSERT INTO message (id, run_id, node_id, role, content, structured_payload, created_at)
-           VALUES (?,?,?,?,?,?,?)""",
-        (new_id(), run_id, node_id, "user", None, dumps(response), now_iso()),
-    )
-    _log_event(con, run_id, None, "HITL_RESOLVED", from_node=node_id)
-    con.commit()
-    write_audit(con, _get_run(con, run_id)["org_id"], "cli-user", "hitl.responded", "hitl_request", hitl_request_id, after=response)
+    try:
+        # CLI/API resume creates a fresh runtime after the original runtime was
+        # closed. Restore the durable tool snapshot before marking the HITL
+        # request answered, so a preparation failure leaves the request retryable.
+        if isinstance(runtime, RunPreparer):
+            await runtime.prepare_run(run_id)
+        con.execute(
+            "UPDATE hitl_request SET status = 'ANSWERED', response = ?, responded_at = ? WHERE id = ?",
+            (dumps(response), now_iso(), hitl_request_id),
+        )
+        con.execute(
+            """INSERT INTO message (id, run_id, node_id, role, content, structured_payload, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (new_id(), run_id, node_id, "user", None, dumps(response), now_iso()),
+        )
+        _log_event(con, run_id, None, "HITL_RESOLVED", from_node=node_id)
+        con.commit()
+        write_audit(con, _get_run(con, run_id)["org_id"], "cli-user", "hitl.responded", "hitl_request", hitl_request_id, after=response)
 
-    run_row = _get_run(con, run_id)
-    ctx = _RunCtx(
-        con=con, graph=graph, run_id=run_id, org_id=run_row["org_id"], workflow_id=run_row["workflow_id"],
-        runtime=runtime, queue=[node_id], dod_prose_verdict=dod_prose_verdict, retry_sleep=retry_sleep,
-    )
-    await _drain_queue(ctx)
+        run_row = _get_run(con, run_id)
+        ctx = _RunCtx(
+            con=con, graph=graph, run_id=run_id, org_id=run_row["org_id"], workflow_id=run_row["workflow_id"],
+            runtime=runtime, queue=[node_id], dod_prose_verdict=dod_prose_verdict, retry_sleep=retry_sleep,
+        )
+        await _drain_queue(ctx)
+    finally:
+        await _release_run(runtime, run_id)

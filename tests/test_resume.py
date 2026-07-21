@@ -10,6 +10,21 @@ from ravana.engine.loop import resume_hitl, start_run
 from ravana.schema.util import loads
 
 
+class _PreparedRuntime:
+    def __init__(self, inner):
+        self.inner = inner
+        self.prepared: list[str] = []
+
+    async def prepare_run(self, run_id: str) -> None:
+        self.prepared.append(run_id)
+
+    async def run_turn(self, **kwargs):
+        return await self.inner.run_turn(**kwargs)
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
+
+
 def test_resume_creates_new_attempt_not_a_bare_reroute(con, sdlc_graph, sdlc_workflow_id, sdlc_runtime):
     run_id = asyncio.run(
         start_run(
@@ -58,6 +73,22 @@ def test_resume_appends_human_response_to_message_thread(con, sdlc_graph, sdlc_w
     roles = [m["role"] for m in messages]
     assert roles == ["agent", "user", "agent"]  # first turn, human's answer, second (resumed) turn
     assert loads(messages[1]["structured_payload"]) == {"answer": "it's clear now"}
+
+
+def test_resume_reprepares_run_scoped_resources(con, sdlc_graph, sdlc_workflow_id, sdlc_runtime):
+    runtime = _PreparedRuntime(sdlc_runtime)
+    run_id = asyncio.run(
+        start_run(
+            con, sdlc_graph, runtime, org_id="test", workflow_id=sdlc_workflow_id,
+            input_payload={"repository": "r"},
+        )
+    )
+    assert runtime.prepared == [run_id]
+
+    hitl = con.execute("SELECT * FROM hitl_request WHERE run_id = ? AND status = 'PENDING'", (run_id,)).fetchone()
+    asyncio.run(resume_hitl(con, sdlc_graph, runtime, run_id, hitl["id"], {"answer": "clear"}))
+
+    assert runtime.prepared == [run_id, run_id]
 
 
 def test_resuming_an_already_answered_hitl_request_is_rejected(con, sdlc_graph, sdlc_workflow_id, sdlc_runtime):

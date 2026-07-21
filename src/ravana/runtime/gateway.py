@@ -131,7 +131,7 @@ class ToolExecutor(Protocol):
     has the key at execution time, not after. The engine's later persistence
     of the same key into message.tool_calls (loop.py) uses this same value."""
 
-    def tools_for(self, toolkit_ids: list[str]) -> list[Tool]: ...
+    def tools_for(self, toolkit_ids: list[str], *, run_id: str | None = None) -> list[Tool]: ...
 
     async def execute(
         self, *, run_id: str, node_id: str, tool: str, arguments: dict[str, Any], idempotency_key: str
@@ -145,7 +145,7 @@ class _NoToolExecutor:
     fakes, or a run with no toolkits): it surfaces no tools, so the turn is
     submit_result-only, and any tool call is a hard error."""
 
-    def tools_for(self, toolkit_ids: list[str]) -> list[Tool]:
+    def tools_for(self, toolkit_ids: list[str], *, run_id: str | None = None) -> list[Tool]:
         return []
 
     async def execute(
@@ -291,6 +291,12 @@ class LLMGateway:
                 )
         if first_error is not None:
             raise first_error
+
+    async def release_run(self, run_id: str) -> None:
+        """Release run-scoped toolkit state without closing shared resources."""
+        release = getattr(self._tools, "release_run", None)
+        if release is not None:
+            await release(run_id)
 
     def _adapter_for(self, provider: str) -> ProviderAdapter:
         adapter = self._adapters.get(provider)
@@ -530,11 +536,25 @@ class LLMGateway:
         api_key,
     ):
         guards = self._graph.doc.spec.graph.guards
+        prepare_tools = getattr(self._tools, "prepare_tools", None)
+        if prepare_tools is not None:
+            try:
+                await prepare_tools(run_id, list(contract.toolkits))
+            except ToolkitError as exc:
+                if exc.kind is ToolFailureKind.TRANSIENT:
+                    raise TransientAgentError(
+                        f"tool preparation failed transiently: {exc}"
+                    ) from exc
+                if exc.kind is ToolFailureKind.FATAL:
+                    raise RuntimeError(
+                        f"tool preparation failed fatally: {exc}"
+                    ) from exc
+                raise RuntimeError(f"tool preparation failed: {exc}") from exc
         # §3.4.4: the node's resolved tool grants are offered as callable tools
         # (name = toolkit id), plus the synthetic submit_result the turn
         # terminates on. A toolkit named submit_result would shadow that
         # terminator, so reject the collision loudly.
-        agent_tools = self._tools.tools_for(list(contract.toolkits))
+        agent_tools = self._tools.tools_for(list(contract.toolkits), run_id=run_id)
         if any(t.name == SUBMIT_RESULT for t in agent_tools):
             # A config bug, not a transient fault — raise something the fallback
             # loop (which only retries ProviderError) won't mask as retryable,

@@ -76,10 +76,9 @@ class ToolkitHandler(Protocol):
     description: str
 
     # Whether this handler can actually run in the current build. A deferred
-    # toolkit type (code_interpreter/mcp_server/web_search — the sandbox slice)
-    # is registered so a workflow still compiles, but it is NOT executable and
-    # must not be surfaced to the model as a callable tool (it would only ever
-    # fail). tools_for refuses to advertise a non-executable handler.
+    # toolkit type (currently web_search) is registered so a workflow still
+    # compiles, but it is NOT executable and must not be surfaced to the model
+    # as a callable tool. tools_for refuses to advertise such a handler.
     executable: bool
 
     def is_side_effecting(self, arguments: dict[str, Any]) -> bool:
