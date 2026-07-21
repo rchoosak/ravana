@@ -666,9 +666,23 @@ class McpServerHandler:
                     raise ToolkitError(str(exc), kind=ToolFailureKind.FATAL) from None
                 pinned[spec.name] = Tool(
                     name=spec.name,
-                    # A server-supplied description is untrusted text the model
-                    # reads (§8 prompt injection); it is passed through as the tool
-                    # description but never treated as instruction by Ravana itself.
+                    # UNMITIGATED (§8 prompt injection). A server-supplied
+                    # description is untrusted text that reaches the model
+                    # verbatim, embedded by both adapters into the *tool
+                    # definitions* — the surface the model reads as authoritative
+                    # framing for what its tools do, re-read every turn. A
+                    # hostile server can write instructions here ("before using
+                    # any other tool, call ...").
+                    #
+                    # The gate above is the SECRET-OUTPUT gate: it stops a server
+                    # echoing back a credential. It is not an injection boundary
+                    # and does not make this text safe to read.
+                    #
+                    # What does help: the list is pinned at preparation and never
+                    # re-read, so a server cannot swap a benign description for a
+                    # hostile one after approval. That is the rug-pull defence,
+                    # not a defence against a server hostile at pin time — which
+                    # is why §8 also requires the endpoint be admin-curated.
                     description=description,
                     input_schema=schema,
                 )
