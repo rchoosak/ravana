@@ -10,6 +10,9 @@ malformed schema.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 
 from ravana.runtime.schema_validate import validate_json
@@ -101,6 +104,25 @@ def test_malformed_schema_is_an_authoring_error_never_raises(bad_schema):
     assert "authoring error" in error
 
 
+def test_schema_authoring_error_takes_precedence_over_bad_payload():
+    error = validate_json(
+        {"x": float("nan")},
+        {"type": "object", "required": "not-an-array"},
+    )
+    assert error is not None
+    assert "authoring error" in error and "array" in error
+    assert "finite JSON number" not in error
+
+
+def test_deep_schema_is_tagged_as_an_authoring_error():
+    schema: dict = {"type": "object"}
+    for _ in range(2000):
+        schema = {"allOf": [schema]}
+    error = validate_json({}, schema)
+    assert error is not None
+    assert "authoring error" in error and "too deep" in error
+
+
 def test_remote_ref_makes_no_outbound_request():
     # SSRF/LFI surface: a $ref to a URL must never make the validator reach
     # out. A closed-port timing check does NOT prove this — it passes on a fast
@@ -126,15 +148,52 @@ def test_remote_ref_makes_no_outbound_request():
 
     server = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
     try:
         schema = {"type": "object", "properties": {"a": {"$ref": f"http://127.0.0.1:{port}/schema"}}}
-        error = validate_json({"a": 1}, schema)
+        # The optional field is absent: ref preflight must reject the schema
+        # independently of which branches this payload exercises.
+        error = validate_json({}, schema)
     finally:
         server.shutdown()
+        thread.join(timeout=1)
+        server.server_close()
 
     assert hits == [], f"validator fetched the remote $ref: {hits}"
     assert error is not None and "authoring error" in error
+
+
+def test_broken_local_ref_is_rejected_before_its_optional_field_is_seen():
+    schema = {
+        "type": "object",
+        "properties": {"optional": {"$ref": "#/$defs/missing"}},
+    }
+    error = validate_json({}, schema)
+    assert error is not None and "authoring error" in error
+
+
+def test_broken_dynamic_ref_is_preflighted_too():
+    schema = {
+        "type": "object",
+        "properties": {"optional": {"$dynamicRef": "#missing"}},
+    }
+    error = validate_json({}, schema)
+    assert error is not None and "authoring error" in error
+
+
+def test_valid_inline_refs_and_anchors_survive_preflight():
+    pointer_schema = {
+        "$defs": {"integer": {"type": "integer"}},
+        "$ref": "#/$defs/integer",
+    }
+    anchor_schema = {
+        "$defs": {"integer": {"$id": "urn:ravana:integer", "type": "integer"}},
+        "$ref": "urn:ravana:integer",
+    }
+    assert validate_json(1, pointer_schema) is None
+    assert validate_json("wrong", pointer_schema) is not None
+    assert validate_json(1, anchor_schema) is None
 
 
 def test_error_collection_is_bounded_not_just_the_report(monkeypatch):
@@ -146,7 +205,7 @@ def test_error_collection_is_bounded_not_just_the_report(monkeypatch):
     import ravana.runtime.schema_validate as mod
 
     pulled = 0
-    real_iter = mod.Draft202012Validator.iter_errors
+    real_iter = mod._SafeDraft202012Validator.iter_errors
 
     def counting_iter(self, instance):
         nonlocal pulled
@@ -154,7 +213,7 @@ def test_error_collection_is_bounded_not_just_the_report(monkeypatch):
             pulled += 1
             yield err
 
-    monkeypatch.setattr(mod.Draft202012Validator, "iter_errors", counting_iter)
+    monkeypatch.setattr(mod._SafeDraft202012Validator, "iter_errors", counting_iter)
 
     schema = {"type": "object", "properties": {f"f{i}": {"type": "integer"} for i in range(500)}}
     payload = {f"f{i}": "not-an-int" for i in range(500)}  # 500 violations available
@@ -164,7 +223,7 @@ def test_error_collection_is_bounded_not_just_the_report(monkeypatch):
     assert pulled <= mod._MAX_COLLECTED_ERRORS, f"materialised {pulled}, bound not applied"
 
 
-def test_deep_payload_does_not_raise(monkeypatch):
+def test_deep_payload_does_not_raise():
     # A ~2000-deep nested value blows the recursion limit inside the payload
     # walk / iter_errors; the never-raise backstop must turn it into a string.
     deep: object = 1
@@ -175,13 +234,13 @@ def test_deep_payload_does_not_raise(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "schema,label",
+    "schema,_label",
     [
         ({"type": "object", "properties": {"x": {"multipleOf": float("nan")}}}, "multipleOf raises ValueError"),
         ({"type": "object", "properties": {"x": {"minimum": float("nan")}}}, "minimum silently accepts"),
     ],
 )
-def test_non_finite_number_in_the_schema_is_an_authoring_error(schema, label):
+def test_non_finite_number_in_the_schema_is_an_authoring_error(schema, _label):
     # jsonschema won't flag these — `minimum: NaN` accepts everything, and
     # `multipleOf: NaN` raises ValueError mid-validation. Both are authoring
     # errors, returned not raised.
@@ -195,9 +254,67 @@ def test_giant_offending_value_does_not_bloat_the_message():
     schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
     error = validate_json({"x": "A" * 1_000_000}, schema)
     assert error is not None and len(error) < 1000
+    assert "integer" in error  # the actionable reason survives truncation
 
 
-def test_schemaless_payload_still_rejects_non_finite(monkeypatch):
+def test_giant_field_path_does_not_bypass_the_diagnostic_cap():
+    key = "K" * 1_000_000
+    schema = {
+        "type": "object",
+        "patternProperties": {".*": {"type": "integer"}},
+    }
+    error = validate_json({key: "wrong"}, schema)
+    assert error is not None
+    assert len(error) < 1000 and "integer" in error
+
+
+def test_regex_keywords_keep_normal_draft_2020_behaviour():
+    assert validate_json("aaa", {"type": "string", "pattern": "^a+$"}) is None
+    error = validate_json("bbb", {"type": "string", "pattern": "^a+$"})
+    assert error is not None and "pattern" in error
+
+    schema = {
+        "type": "object",
+        "patternProperties": {"^count_": {"type": "integer"}},
+    }
+    assert validate_json({"count_ok": 1}, schema) is None
+    error = validate_json({"count_bad": "one"}, schema)
+    assert error is not None and "count_bad" in error
+
+
+def test_regex_evaluation_has_a_hard_cpu_deadline():
+    # Run in a child so removing the timeout fails in bounded time
+    # instead of hanging the whole suite in Python's backtracking `re` engine.
+    code = (
+        "from ravana.runtime.schema_validate import validate_json; "
+        "print(validate_json('a' * 100 + '!', "
+        "{'type': 'string', 'pattern': '(a|aa)+$'})); "
+        "print(validate_json({'a' * 100 + '!': 1}, "
+        "{'type': 'object', 'patternProperties': {'(a|aa)+$': "
+        "{'type': 'integer'}}}))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout.count("authoring error") == 2
+    assert completed.stdout.count("regular-expression") == 2
+
+
+def test_giant_pattern_is_rejected_before_compilation():
+    error = validate_json(
+        "anything",
+        {"type": "string", "pattern": "a" * 10_000},
+    )
+    assert error is not None
+    assert "authoring error" in error and "pattern exceeds" in error
+
+
+def test_schemaless_payload_still_rejects_non_finite():
     # Pins the guard ORDER: the non-finite check must run before the
     # `schema is None` early return, or a schema-less node smuggles a NaN into
     # durable state. Moving the check after that return makes this fail.
