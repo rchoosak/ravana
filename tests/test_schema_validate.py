@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -303,6 +304,168 @@ def test_regex_evaluation_has_a_hard_cpu_deadline():
     assert completed.returncode == 0
     assert completed.stdout.count("authoring error") == 2
     assert completed.stdout.count("regular-expression") == 2
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["additionalProperties", "unevaluatedProperties"],
+)
+def test_regex_deadline_cannot_be_bypassed_by_object_helpers(keyword):
+    # jsonschema's stock helpers call stdlib `re.search` while discovering
+    # additional/evaluated keys. Put the helper before patternProperties so a
+    # vulnerable validator hangs there before reaching our keyword override.
+    code = f"""
+from ravana.runtime.schema_validate import validate_json
+key = "a" * 100 + "!"
+schema = {{
+    "type": "object",
+    {keyword!r}: False,
+    "patternProperties": {{"(a|aa)+$": {{"type": "integer"}}}},
+}}
+print(validate_json({{key: 1}}, schema))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert completed.returncode == 0
+    assert "authoring error" in completed.stdout
+    assert "regular-expression" in completed.stdout
+
+
+def test_regex_budget_counts_only_time_spent_matching(monkeypatch):
+    import ravana.runtime.schema_validate as mod
+
+    # A non-regex keyword can legitimately consume more than the regex budget.
+    # The old absolute deadline then blamed the following harmless pattern.
+    def slow_keyword(validator, value, instance, schema):
+        time.sleep(mod._REGEX_BUDGET_SECONDS * 1.2)
+        if False:
+            yield
+
+    monkeypatch.setitem(
+        mod._SafeDraft202012Validator.VALIDATORS,
+        "x-test-slow",
+        slow_keyword,
+    )
+    assert (
+        validate_json(
+            "ok",
+            {
+                "x-test-slow": True,
+                "pattern": "^ok$",
+            },
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "payload,schema",
+    [
+        (
+            {"pattern": "a" * 2_000},
+            {"const": {"pattern": "a" * 2_000}},
+        ),
+        (
+            {"pattern": "a" * 2_000},
+            {"enum": [{"pattern": "a" * 2_000}]},
+        ),
+        (
+            None,
+            {"default": {"pattern": "a" * 2_000}},
+        ),
+    ],
+)
+def test_pattern_size_preflight_ignores_non_schema_literals(payload, schema):
+    assert validate_json(payload, schema) is None
+
+
+def test_nested_validation_work_is_bounded_before_eager_error_collection():
+    # `anyOf` materialises every branch's errors internally before yielding its
+    # own error, so the outer islice cannot stop it. Repeating a modest payload
+    # across many branches makes removal of the keyword-level budget time out.
+    code = """
+from ravana.runtime.schema_validate import validate_json
+branch = {"type": "array", "items": {"type": "integer"}}
+schema = {"anyOf": [branch for _ in range(50)]}
+print(validate_json(["wrong"] * 3_000, schema))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert completed.returncode == 0
+    assert "resource limit" in completed.stdout
+    assert "authoring error" not in completed.stdout
+
+
+def test_unique_items_cannot_fall_back_to_quadratic_work():
+    # jsonschema's generic equality fallback is O(n^2) for arrays of objects.
+    # This size leaves one validation step after the JSON walk: the bounded
+    # canonicaliser stops immediately, while the stock helper runs for seconds.
+    code = """
+from ravana.runtime.schema_validate import validate_json
+payload = [{"i": i} for i in range(4_999)]
+print(validate_json(payload, {"type": "array", "uniqueItems": True}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert completed.returncode == 0
+    assert "resource limit" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    "payload,valid",
+    [
+        ([True, 1], True),
+        ([1, 1.0], False),
+        ([{"a": 1, "b": 2}, {"b": 2, "a": 1}], False),
+    ],
+)
+def test_bounded_unique_items_preserves_json_schema_equality(payload, valid):
+    error = validate_json(payload, {"type": "array", "uniqueItems": True})
+    assert (error is None) is valid
+
+
+def test_safe_object_helpers_preserve_evaluated_property_semantics():
+    schema = {
+        "allOf": [
+            {
+                "type": "object",
+                "patternProperties": {"^count_": {"type": "integer"}},
+            }
+        ],
+        "unevaluatedProperties": False,
+    }
+    assert validate_json({"count_ok": 1}, schema) is None
+    error = validate_json({"count_ok": 1, "extra": 2}, schema)
+    assert error is not None and "extra" in error
+
+    # The empty regex matches every key. A truthiness check on the joined
+    # patterns would incorrectly classify this property as additional.
+    assert (
+        validate_json(
+            {"anything": 1},
+            {
+                "type": "object",
+                "patternProperties": {"": {"type": "integer"}},
+                "additionalProperties": False,
+            },
+        )
+        is None
+    )
 
 
 def test_giant_pattern_is_rejected_before_compilation():

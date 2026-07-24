@@ -7,16 +7,18 @@ model-addressable tool error.
 
 Schemas may come from workflow authors or an MCP server. They are therefore
 validated before payloads, cannot retrieve external references, and cannot run
-unbounded regular-expression work in the runtime process.
+unbounded validation or regular-expression work in the runtime process.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 import itertools
 import math
 import time
-from typing import Any
+from typing import Any, Iterator
 
 import regex
 from jsonschema import Draft202012Validator
@@ -35,13 +37,24 @@ _MAX_MESSAGE_CHARS = 300
 _MAX_PATH_CHARS = 120
 _MAX_DIAGNOSTIC_CHARS = 1_500
 _MAX_PATTERN_CHARS = 1_500
+_MAX_VALIDATION_STEPS = 10_000
+_VALIDATION_BUDGET_SECONDS = 0.5
 
 # Python's built-in `re` has no timeout. The alternate engine applies this
-# shared wall-clock budget to every pattern/patternProperties match in one
-# validation, so many individually cheap patterns cannot multiply the limit.
+# shared regex-execution budget to every regex match in one validation, so many
+# individually cheap patterns cannot multiply the limit.
 _REGEX_BUDGET_SECONDS = 0.1
-_REGEX_DEADLINE: ContextVar[float | None] = ContextVar(
-    "ravana_schema_regex_deadline",
+
+
+@dataclass
+class _ValidationBudget:
+    deadline: float
+    regex_seconds_remaining: float
+    steps_remaining: int
+
+
+_VALIDATION_BUDGET: ContextVar[_ValidationBudget | None] = ContextVar(
+    "ravana_schema_validation_budget",
     default=None,
 )
 
@@ -50,21 +63,63 @@ class _RegexBudgetExceeded(RuntimeError):
     pass
 
 
+class _ValidationBudgetExceeded(RuntimeError):
+    pass
+
+
 class _SchemaPolicyError(ValueError):
     pass
 
 
-def _regex_matches(pattern: str, value: str) -> bool:
-    deadline = _REGEX_DEADLINE.get()
-    if deadline is None:
-        raise RuntimeError("schema regex evaluated outside validation boundary")
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise _RegexBudgetExceeded
+@contextmanager
+def _validation_budget() -> Iterator[None]:
+    token = _VALIDATION_BUDGET.set(
+        _ValidationBudget(
+            deadline=time.monotonic() + _VALIDATION_BUDGET_SECONDS,
+            regex_seconds_remaining=_REGEX_BUDGET_SECONDS,
+            steps_remaining=_MAX_VALIDATION_STEPS,
+        )
+    )
     try:
-        return regex.search(pattern, value, timeout=remaining) is not None
+        yield
+    finally:
+        _VALIDATION_BUDGET.reset(token)
+
+
+def _consume_validation_step() -> None:
+    budget = _VALIDATION_BUDGET.get()
+    if budget is None:
+        return
+    if time.monotonic() >= budget.deadline:
+        raise _ValidationBudgetExceeded
+    budget.steps_remaining -= 1
+    if budget.steps_remaining < 0:
+        raise _ValidationBudgetExceeded
+
+
+def _regex_matches(pattern: str, value: str) -> bool:
+    budget = _VALIDATION_BUDGET.get()
+    if budget is None:
+        raise RuntimeError("schema regex evaluated outside validation boundary")
+
+    _consume_validation_step()
+    overall_remaining = budget.deadline - time.monotonic()
+    if overall_remaining <= 0:
+        raise _ValidationBudgetExceeded
+    if budget.regex_seconds_remaining <= 0:
+        raise _RegexBudgetExceeded
+
+    timeout = min(overall_remaining, budget.regex_seconds_remaining)
+    limited_by_regex = budget.regex_seconds_remaining <= overall_remaining
+    started = time.monotonic()
+    try:
+        return regex.search(pattern, value, timeout=timeout) is not None
     except TimeoutError as exc:
-        raise _RegexBudgetExceeded from exc
+        if limited_by_regex:
+            raise _RegexBudgetExceeded from exc
+        raise _ValidationBudgetExceeded from exc
+    finally:
+        budget.regex_seconds_remaining -= time.monotonic() - started
 
 
 def _safe_pattern(validator, pattern, instance, schema):
@@ -90,11 +145,219 @@ def _safe_pattern_properties(validator, pattern_properties, instance, schema):
                 )
 
 
+def _additional_property_names(instance, schema):
+    properties = schema.get("properties", {})
+    patterns = schema.get("patternProperties", {})
+    for key in instance:
+        _consume_validation_step()
+        if key in properties:
+            continue
+        if any(_regex_matches(pattern, key) for pattern in patterns):
+            continue
+        yield key
+
+
+def _safe_additional_properties(
+    validator,
+    additional_properties,
+    instance,
+    schema,
+):
+    if not validator.is_type(instance, "object"):
+        return
+
+    extras = list(_additional_property_names(instance, schema))
+    if validator.is_type(additional_properties, "object"):
+        for key in extras:
+            yield from validator.descend(
+                instance[key],
+                additional_properties,
+                path=key,
+            )
+    elif additional_properties is False and extras:
+        yield jsonschema_exceptions.ValidationError(
+            f"additional properties are not allowed ({_summarize_keys(extras)})"
+        )
+
+
+def _errors_are_empty(errors) -> bool:
+    return next(errors, None) is None
+
+
+def _evaluated_property_keys(validator, instance, schema) -> set[Any]:
+    """Draft 2020-12 evaluated-key discovery without stdlib regex calls."""
+    _consume_validation_step()
+    if validator.is_type(schema, "boolean"):
+        return set()
+
+    evaluated: set[Any] = set()
+    for keyword in ("$ref", "$dynamicRef"):
+        ref = schema.get(keyword)
+        if ref is None:
+            continue
+        resolved = validator._resolver.lookup(ref)
+        evaluated.update(
+            _evaluated_property_keys(
+                validator.evolve(
+                    schema=resolved.contents,
+                    _resolver=resolved.resolver,
+                ),
+                instance,
+                resolved.contents,
+            )
+        )
+
+    properties = schema.get("properties")
+    if validator.is_type(properties, "object"):
+        evaluated.update(properties.keys() & instance.keys())
+
+    for keyword in ("additionalProperties", "unevaluatedProperties"):
+        subschema = schema.get(keyword)
+        if subschema is None:
+            continue
+        for key, value in instance.items():
+            _consume_validation_step()
+            if _errors_are_empty(validator.descend(value, subschema)):
+                evaluated.add(key)
+
+    pattern_properties = schema.get("patternProperties", {})
+    for key in instance:
+        for pattern in pattern_properties:
+            if _regex_matches(pattern, key):
+                evaluated.add(key)
+
+    for key, subschema in schema.get("dependentSchemas", {}).items():
+        _consume_validation_step()
+        if key in instance:
+            evaluated.update(
+                _evaluated_property_keys(validator, instance, subschema)
+            )
+
+    for keyword in ("allOf", "oneOf", "anyOf"):
+        for subschema in schema.get(keyword, []):
+            _consume_validation_step()
+            if _errors_are_empty(validator.descend(instance, subschema)):
+                evaluated.update(
+                    _evaluated_property_keys(validator, instance, subschema)
+                )
+
+    if_schema = schema.get("if")
+    if if_schema is not None:
+        if validator.evolve(schema=if_schema).is_valid(instance):
+            evaluated.update(
+                _evaluated_property_keys(validator, instance, if_schema)
+            )
+            then_schema = schema.get("then")
+            if then_schema is not None:
+                evaluated.update(
+                    _evaluated_property_keys(validator, instance, then_schema)
+                )
+        else:
+            else_schema = schema.get("else")
+            if else_schema is not None:
+                evaluated.update(
+                    _evaluated_property_keys(validator, instance, else_schema)
+                )
+
+    return evaluated
+
+
+def _safe_unevaluated_properties(
+    validator,
+    unevaluated_properties,
+    instance,
+    schema,
+):
+    if not validator.is_type(instance, "object"):
+        return
+
+    evaluated = _evaluated_property_keys(validator, instance, schema)
+    invalid = []
+    for key, value in instance.items():
+        _consume_validation_step()
+        if key not in evaluated and not _errors_are_empty(
+            validator.descend(
+                value,
+                unevaluated_properties,
+                path=key,
+                schema_path=key,
+            )
+        ):
+            invalid.append(key)
+
+    if invalid:
+        if unevaluated_properties is False:
+            message = "unevaluated properties are not allowed"
+        else:
+            message = "unevaluated properties do not satisfy the schema"
+        yield jsonschema_exceptions.ValidationError(
+            f"{message} ({_summarize_keys(invalid)})"
+        )
+
+
+def _freeze_json(value: Any) -> Any:
+    """Build a hashable key with JSON Schema's equality semantics."""
+    _consume_validation_step()
+    if value is None:
+        return ("null",)
+    if type(value) is bool:
+        return ("boolean", value)
+    if isinstance(value, (int, float)):
+        return ("number", value)
+    if isinstance(value, str):
+        return ("string", value)
+    if isinstance(value, list):
+        return ("array", tuple(_freeze_json(item) for item in value))
+    if isinstance(value, dict):
+        return (
+            "object",
+            frozenset(
+                (_freeze_json(key), _freeze_json(item))
+                for key, item in value.items()
+            ),
+        )
+    return ("python-object", type(value), id(value))
+
+
+def _safe_unique_items(validator, unique_items, instance, schema):
+    if not unique_items or not validator.is_type(instance, "array"):
+        return
+
+    seen = set()
+    for item in instance:
+        frozen = _freeze_json(item)
+        if frozen in seen:
+            yield jsonschema_exceptions.ValidationError(
+                "array has non-unique elements"
+            )
+            return
+        seen.add(frozen)
+
+
+def _bounded_keyword(validate):
+    def bounded(validator, keyword_value, instance, schema):
+        _consume_validation_step()
+        yield from validate(validator, keyword_value, instance, schema)
+
+    return bounded
+
+
+_KEYWORD_VALIDATORS = dict(Draft202012Validator.VALIDATORS)
+_KEYWORD_VALIDATORS.update(
+    {
+        "additionalProperties": _safe_additional_properties,
+        "pattern": _safe_pattern,
+        "patternProperties": _safe_pattern_properties,
+        "unevaluatedProperties": _safe_unevaluated_properties,
+        "uniqueItems": _safe_unique_items,
+    }
+)
+
 _SafeDraft202012Validator = validators.extend(
     Draft202012Validator,
     validators={
-        "pattern": _safe_pattern,
-        "patternProperties": _safe_pattern_properties,
+        keyword: _bounded_keyword(validate)
+        for keyword, validate in _KEYWORD_VALIDATORS.items()
     },
 )
 
@@ -124,15 +387,24 @@ def validate_json(payload: Any, schema: dict[str, Any] | None) -> str | None:
 
 def _validate(payload: Any, schema: dict[str, Any] | None) -> str | None:
     if schema is None:
-        # A schema-less node still rejects non-JSON floats before accepting its
-        # whole object as a state delta.
-        nonfinite = _first_nonfinite_path(payload)
-        if nonfinite is not None:
-            return _field_error(
-                nonfinite,
-                "not a finite JSON number (NaN/Infinity are not valid JSON)",
-            )
-        return None if isinstance(payload, dict) else "expected a JSON object"
+        try:
+            with _validation_budget():
+                # A schema-less node still rejects non-JSON floats before
+                # accepting its whole object as a state delta.
+                nonfinite = _first_nonfinite_path(payload)
+                if nonfinite is not None:
+                    return _field_error(
+                        nonfinite,
+                        "not a finite JSON number "
+                        "(NaN/Infinity are not valid JSON)",
+                    )
+                return (
+                    None
+                    if isinstance(payload, dict)
+                    else "expected a JSON object"
+                )
+        except _ValidationBudgetExceeded:
+            return "payload exceeds the validation resource limit"
 
     # Authoring defects take precedence. Otherwise a NaN payload can mask a
     # malformed schema and make the repair loop blame the model.
@@ -140,30 +412,37 @@ def _validate(payload: Any, schema: dict[str, Any] | None) -> str | None:
     if schema_error is not None:
         return schema_error
 
-    nonfinite = _first_nonfinite_path(payload)
-    if nonfinite is not None:
-        return _field_error(
-            nonfinite,
-            "not a finite JSON number (NaN/Infinity are not valid JSON)",
-        )
-
-    token = _REGEX_DEADLINE.set(time.monotonic() + _REGEX_BUDGET_SECONDS)
     try:
-        validator = _SafeDraft202012Validator(schema, registry=_NO_FETCH_REGISTRY)
-        collected = list(
-            itertools.islice(validator.iter_errors(payload), _MAX_COLLECTED_ERRORS)
-        )
+        with _validation_budget():
+            nonfinite = _first_nonfinite_path(payload)
+            if nonfinite is not None:
+                return _field_error(
+                    nonfinite,
+                    "not a finite JSON number "
+                    "(NaN/Infinity are not valid JSON)",
+                )
+
+            validator = _SafeDraft202012Validator(
+                schema,
+                registry=_NO_FETCH_REGISTRY,
+            )
+            collected = list(
+                itertools.islice(
+                    validator.iter_errors(payload),
+                    _MAX_COLLECTED_ERRORS,
+                )
+            )
     except _RegexBudgetExceeded:
         return (
             f"{_SCHEMA_ERROR_PREFIX}regular-expression evaluation exceeded "
             f"{_REGEX_BUDGET_SECONDS:g}s limit"
         )
+    except _ValidationBudgetExceeded:
+        return "payload exceeds the validation resource limit"
     except jsonschema_exceptions.UnknownType as exc:
         return f"{_SCHEMA_ERROR_PREFIX}unknown type {exc.type!r}"
     except Unresolvable as exc:
         return f"{_SCHEMA_ERROR_PREFIX}unresolvable $ref ({_truncate(str(exc))})"
-    finally:
-        _REGEX_DEADLINE.reset(token)
 
     if not collected:
         return None
@@ -174,23 +453,35 @@ def _validate(payload: Any, schema: dict[str, Any] | None) -> str | None:
 def _validate_schema(schema: dict[str, Any]) -> str | None:
     """Validate author-controlled structure and every reference."""
     try:
-        # jsonschema accepts `minimum: NaN` and crashes on `multipleOf: NaN`.
-        schema_nonfinite = _first_nonfinite_path(schema)
-        if schema_nonfinite is not None:
-            return (
-                f"{_SCHEMA_ERROR_PREFIX}non-finite number at "
-                f"'{_truncate(schema_nonfinite, _MAX_PATH_CHARS)}'"
-            )
+        with _validation_budget():
+            # jsonschema accepts `minimum: NaN` and crashes on `multipleOf: NaN`.
+            schema_nonfinite = _first_nonfinite_path(schema)
+            if schema_nonfinite is not None:
+                return (
+                    f"{_SCHEMA_ERROR_PREFIX}non-finite number at "
+                    f"'{_truncate(schema_nonfinite, _MAX_PATH_CHARS)}'"
+                )
 
-        # Compile-sized patterns are bounded before check_schema's regex format
-        # check; matching is separately protected by the runtime deadline.
-        _preflight_pattern_sizes(schema)
-        _SafeDraft202012Validator.check_schema(schema)
-        _preflight_refs(schema)
+            root = Resource.from_contents(
+                schema,
+                default_specification=DRAFT202012,
+            )
+            # Bound compile-sized patterns before check_schema's regex format
+            # check, but inspect only actual subschema locations.
+            _preflight_pattern_sizes(root)
+            _SafeDraft202012Validator.check_schema(schema)
+            _preflight_refs(root)
     except jsonschema_exceptions.SchemaError as exc:
         return f"{_SCHEMA_ERROR_PREFIX}{_truncate(exc.message)}"
     except Unresolvable as exc:
         return f"{_SCHEMA_ERROR_PREFIX}unresolvable $ref ({_truncate(str(exc))})"
+    except _RegexBudgetExceeded:
+        return (
+            f"{_SCHEMA_ERROR_PREFIX}regular-expression evaluation exceeded "
+            f"{_REGEX_BUDGET_SECONDS:g}s limit"
+        )
+    except _ValidationBudgetExceeded:
+        return f"{_SCHEMA_ERROR_PREFIX}schema exceeds the validation resource limit"
     except _SchemaPolicyError as exc:
         return f"{_SCHEMA_ERROR_PREFIX}{exc}"
     except RecursionError:
@@ -198,17 +489,20 @@ def _validate_schema(schema: dict[str, Any]) -> str | None:
     return None
 
 
-def _preflight_pattern_sizes(value: Any) -> None:
+def _preflight_pattern_sizes(resource) -> None:
     """Reject patterns large enough to make compilation a resource risk."""
-    if isinstance(value, dict):
-        pattern = value.get("pattern")
+    _consume_validation_step()
+    contents = resource.contents
+    if isinstance(contents, dict):
+        pattern = contents.get("pattern")
         if isinstance(pattern, str) and len(pattern) > _MAX_PATTERN_CHARS:
             raise _SchemaPolicyError(
                 f"pattern exceeds {_MAX_PATTERN_CHARS} characters"
             )
-        pattern_properties = value.get("patternProperties")
+        pattern_properties = contents.get("patternProperties")
         if isinstance(pattern_properties, dict):
             for candidate in pattern_properties:
+                _consume_validation_step()
                 if (
                     isinstance(candidate, str)
                     and len(candidate) > _MAX_PATTERN_CHARS
@@ -217,21 +511,18 @@ def _preflight_pattern_sizes(value: Any) -> None:
                         "patternProperties key exceeds "
                         f"{_MAX_PATTERN_CHARS} characters"
                     )
-        for child in value.values():
-            _preflight_pattern_sizes(child)
-    elif isinstance(value, list):
-        for child in value:
-            _preflight_pattern_sizes(child)
+    for subresource in resource.subresources():
+        _preflight_pattern_sizes(subresource)
 
 
-def _preflight_refs(schema: dict[str, Any]) -> None:
+def _preflight_refs(root) -> None:
     """Resolve every schema ref through the non-retrieving registry."""
-    root = Resource.from_contents(schema, default_specification=DRAFT202012)
     resolver = _NO_FETCH_REGISTRY.resolver_with_root(root)
     _walk_refs(root, resolver)
 
 
 def _walk_refs(resource, resolver) -> None:
+    _consume_validation_step()
     contents = resource.contents
     if isinstance(contents, dict):
         for keyword in ("$ref", "$dynamicRef"):
@@ -240,6 +531,15 @@ def _walk_refs(resource, resolver) -> None:
                 resolver.lookup(ref)
     for subresource in resource.subresources():
         _walk_refs(subresource, resolver.in_subresource(subresource))
+
+
+def _summarize_keys(keys: list[Any]) -> str:
+    shown = ", ".join(
+        repr(_truncate(str(key), _MAX_PATH_CHARS))
+        for key in keys[:_MAX_REPORTED_ERRORS]
+    )
+    remaining = len(keys) - _MAX_REPORTED_ERRORS
+    return f"{shown}, and {remaining} more" if remaining > 0 else shown
 
 
 def _field_error(path: str, message: str) -> str:
@@ -259,6 +559,7 @@ def _truncate(text: str, limit: int = _MAX_MESSAGE_CHARS) -> str:
 
 def _first_nonfinite_path(value: Any, path: str = "") -> str | None:
     """Return the dotted path of the first NaN/Infinity float, if any."""
+    _consume_validation_step()
     if isinstance(value, float) and not math.isfinite(value):
         return path or "<root>"
     if isinstance(value, dict):
