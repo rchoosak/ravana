@@ -22,43 +22,100 @@ fed back verbatim in the §3.4 repair prompt.
 
 from __future__ import annotations
 
+import itertools
+import math
 from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema import exceptions as jsonschema_exceptions
+from referencing.exceptions import Unresolvable
+
+_SCHEMA_ERROR_PREFIX = "invalid output schema (workflow authoring error): "
 
 
 def validate_json(payload: Any, schema: dict[str, Any] | None) -> str | None:
-    """Returns an error string if payload violates the schema, else None."""
+    """Returns an error string if payload violates the schema, else None.
+
+    Never raises. Both callers (the §3.4 repair loop, §8a tool dispatch) treat
+    the result as a value, so a malformed *schema* is a returned authoring error
+    — not an exception, and not blamed on the payload, which would send the
+    repair loop chasing a fault it cannot fix.
+    """
     if schema is None:
         # No declared schema still means "an object" — the whole payload
         # becomes a state_delta (§3.4), which has to be a mapping.
         return None if isinstance(payload, dict) else "expected a JSON object"
 
-    # A malformed *schema* is an authoring bug, not a model mistake. Say so
-    # plainly rather than blaming the payload, which would send the repair loop
-    # chasing a fault it cannot fix.
-    #
-    # Both construction AND iteration are guarded: `jsonschema` reports some
-    # schema defects lazily. An unknown `type` passes the constructor and raises
-    # `UnknownType` mid-validation, so catching only at construction would let it
-    # escape as an exception — from a function both callers rely on to *return*
-    # its errors.
+    # Validate the schema against its meta-schema FIRST. Without this, a
+    # malformed schema is either silently misread — `required: "abc"` becomes
+    # three single-letter required fields, a payload-blaming message the model
+    # can never satisfy — or raised (`type: 123` -> TypeError, `properties: []`
+    # -> AttributeError) straight past this boundary. `check_schema` turns all
+    # of those into one honest authoring error.
+    try:
+        Draft202012Validator.check_schema(schema)
+    except jsonschema_exceptions.SchemaError as exc:
+        return f"{_SCHEMA_ERROR_PREFIX}{exc.message}"
+
+    # Non-finite floats are not JSON (Draft 2020-12) and are invisible to a
+    # numeric bound: NaN compares False to everything, so `NaN <= maximum` is
+    # False-not-raised and a NaN slips past any constraint into durable state /
+    # tool arguments. Reject before validation, since jsonschema won't.
+    nonfinite = _first_nonfinite_path(payload)
+    if nonfinite is not None:
+        return f"field '{nonfinite}': not a finite JSON number (NaN/Infinity are not valid JSON)"
+
     try:
         validator = Draft202012Validator(schema)
-        errors = sorted(validator.iter_errors(payload), key=lambda e: list(e.absolute_path))
-    except jsonschema_exceptions.SchemaError as exc:
-        return f"invalid output schema (workflow authoring error): {exc.message}"
+        # `iter_errors` is lazy; `sorted()` would materialise EVERY error for a
+        # huge/deeply-wrong payload just to report three. Cap the window first.
+        collected = list(
+            itertools.islice(validator.iter_errors(payload), _MAX_COLLECTED_ERRORS)
+        )
     except jsonschema_exceptions.UnknownType as exc:
-        return f"invalid output schema (workflow authoring error): unknown type {exc.type!r}"
-    if not errors:
+        # An unknown `type` passes check_schema but raises during validation.
+        return f"{_SCHEMA_ERROR_PREFIX}unknown type {exc.type!r}"
+    except Unresolvable as exc:
+        # A `$ref` the schema can't resolve (including any remote URL — the
+        # registry does NOT fetch it, it raises here) is an authoring error,
+        # not a model mistake. Catching it keeps the no-network, never-raise
+        # contract regardless of what a workflow/MCP schema puts in a $ref.
+        return f"{_SCHEMA_ERROR_PREFIX}unresolvable $ref ({exc})"
+
+    if not collected:
         return None
+    errors = sorted(collected, key=lambda e: list(e.absolute_path))
     return "; ".join(_describe(error) for error in errors[:_MAX_REPORTED_ERRORS])
 
 
 # Enough to fix a response in one repair round without burying the model in a
 # wall of text — the message is spent as prompt tokens on every retry.
 _MAX_REPORTED_ERRORS = 3
+
+# Upper bound on errors materialised before reporting the first few. Bounds the
+# work a pathological payload can force without changing the reported output.
+_MAX_COLLECTED_ERRORS = 64
+
+
+def _first_nonfinite_path(value: Any, path: str = "") -> str | None:
+    """Dotted path of the first NaN/Infinity float in `value`, or None.
+
+    `bool` is a subclass of `int`, not `float`, so True/False are never flagged;
+    only genuine non-finite floats (from `json.loads` of `NaN`/`Infinity`) are.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return path or "<root>"
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _first_nonfinite_path(item, f"{path}.{key}" if path else str(key))
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found = _first_nonfinite_path(item, f"{path}.{index}" if path else str(index))
+            if found is not None:
+                return found
+    return None
 
 
 def _describe(error: jsonschema_exceptions.ValidationError) -> str:

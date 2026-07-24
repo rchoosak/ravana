@@ -82,13 +82,50 @@ def test_no_schema_requires_an_object():
     [
         {"type": "object", "properties": {"a": {"type": "nonsense"}}},  # unknown type, raised lazily
         {"type": "object", "required": "should-be-a-list"},             # wrong keyword shape
+        {"type": 123},                                                  # type not a string/list
+        {"type": "object", "properties": ["a", "b"]},                   # properties not an object
+        {"type": "object", "properties": {"a": {"$ref": "#/nope"}}},    # unresolvable local $ref
     ],
 )
-def test_malformed_schema_returns_an_error_never_raises(bad_schema):
+def test_malformed_schema_is_an_authoring_error_never_raises(bad_schema):
     # Both callers treat the result as a value (a repair prompt / a tool error),
-    # so this MUST NOT raise. `jsonschema` reports some schema defects only
-    # during validation, not construction — an unknown `type` is the case that
-    # slipped past a construction-only guard when this was first written.
+    # so this MUST NOT raise. It must also be reported as an AUTHORING error,
+    # not blamed on the payload — the assertion is `authoring error` only, with
+    # no escape hatch. An earlier version allowed `or "required"`, which matched
+    # the payload-blaming message `required: "abc"` produced and so passed for
+    # the wrong reason (the exact non-discriminating-test trap this repo keeps
+    # hitting). `check_schema` up front makes every one of these an authoring
+    # error, so the escape hatch is gone.
     error = validate_json({"a": 1}, bad_schema)
     assert isinstance(error, str)
-    assert "authoring error" in error or "required" in error
+    assert "authoring error" in error
+
+
+def test_remote_ref_is_rejected_without_fetching():
+    # SSRF surface: a $ref to a URL must never make the validator reach out.
+    # The registry does not retrieve — a remote ref resolves to an authoring
+    # error, no network. Timed so a silent fetch attempt (connect/timeout)
+    # would show up as elapsed wall-clock.
+    import time
+
+    schema = {"type": "object", "properties": {"a": {"$ref": "http://127.0.0.1:9/x"}}}
+    start = time.monotonic()
+    error = validate_json({"a": 1}, schema)
+    assert error is not None and "authoring error" in error
+    assert time.monotonic() - start < 0.5, "a remote $ref must not be fetched"
+
+
+@pytest.mark.parametrize(
+    "payload,field",
+    [
+        ({"status": "PASS", "meta": {"score": float("nan")}}, "meta.score"),
+        ({"status": "PASS", "meta": {"score": float("inf")}}, "meta.score"),
+        ({"status": "PASS", "files": [float("-inf")]}, "files.0"),
+    ],
+)
+def test_non_finite_numbers_are_rejected_with_their_path(payload, field):
+    # NaN is invisible to a numeric bound (`NaN <= max` is False, not raised),
+    # so it would slip past the schema into durable state. Rejected up front.
+    error = validate_json(payload, _SCHEMA)
+    assert error is not None
+    assert field in error and "finite" in error

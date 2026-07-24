@@ -132,8 +132,11 @@ def test_judge_prose_bool_index_is_rejected_by_the_verdict_schema():
     # bool is not a JSON integer under Draft 2020-12, so index=false is a schema
     # violation — it can never be silently read as criterion 0.
     adapter = FakeAdapter(responses=[_verdict([{"index": False, "met": True}])])
-    with pytest.raises(ProseJudgementError):
+    with pytest.raises(ProseJudgementError) as exc:
         _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    # Discriminate the bool-is-not-integer schema rejection from any other route
+    # to exhaustion — the cause must name the offending `index` field.
+    assert "index" in str(exc.value.__cause__)
 
 
 def test_judge_prose_out_of_range_index_is_dropped():
