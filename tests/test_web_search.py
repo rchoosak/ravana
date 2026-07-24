@@ -137,11 +137,24 @@ def test_api_key_never_leaks_into_an_error_message():
     assert "tavily-key-XYZ" not in str(exc.value)
 
 
-def test_provider_echoing_the_key_back_is_a_fatal_leak_not_a_result():
+@pytest.mark.parametrize(
+    "leaky_payload",
+    [
+        # Key as a whole field value.
+        {"results": [{"title": "x", "url": "u", "content": "tavily-key-XYZ"}]},
+        # Key EMBEDDED in a larger string — the realistic exfil shape (a URL
+        # param). The gate must match substrings, not just whole fields.
+        {"results": [{"title": "x", "url": "https://x?token=tavily-key-XYZ", "content": "ok"}]},
+        # Key in a field web_search never formats into its output. The gate runs
+        # on the whole payload, so an un-rendered field can't smuggle it either.
+        {"results": [{"title": "x", "url": "u", "content": "ok"}], "answer": "key=tavily-key-XYZ"},
+    ],
+)
+def test_provider_echoing_the_key_back_is_a_fatal_leak_not_a_result(leaky_payload):
     # §8 secret-output gate: a hostile/buggy provider that reflects the API key
-    # in its response must fail closed, not surface it in the transcript.
-    leaky = _FakeResponse(payload={"results": [{"title": "x", "url": "u", "content": "tavily-key-XYZ"}]})
-    handler = _handler(_FakeClient(leaky))
+    # in its response must fail closed, not surface it in the transcript —
+    # wherever in the payload it appears, whole-field or embedded.
+    handler = _handler(_FakeClient(_FakeResponse(payload=leaky_payload)))
     with pytest.raises(ToolkitError) as exc:
         _call(handler, {"query": "x"})
     assert exc.value.kind is ToolFailureKind.FATAL
