@@ -60,11 +60,30 @@ _NO_FETCH_REGISTRY: Registry = Registry(retrieve=_refuse_retrieval)  # type: ign
 def validate_json(payload: Any, schema: dict[str, Any] | None) -> str | None:
     """Returns an error string if payload violates the schema, else None.
 
-    Never raises. Both callers (the §3.4 repair loop, §8a tool dispatch) treat
-    the result as a value, so a malformed *schema* is a returned authoring error
-    — not an exception, and not blamed on the payload, which would send the
-    repair loop chasing a fault it cannot fix.
+    Never raises — the contract both callers (the §3.4 repair loop, §8a tool
+    dispatch) depend on, since they treat the result as a value. Enforced
+    STRUCTURALLY: the whole body runs under one guard that converts any escaping
+    exception into a returned string. Three earlier rounds each patched one more
+    exception type (`SchemaError`, `UnknownType`, `Unresolvable`, then
+    `RecursionError` on one call) and the next round found another leak — a deep
+    payload's `RecursionError`, a `multipleOf: NaN`'s `ValueError`. Enumerating
+    raisers was the wrong shape for a never-raise contract; this backstop is the
+    right one, with the specific handlers below kept for actionable messages.
     """
+    try:
+        return _validate(payload, schema)
+    except RecursionError:
+        # A pathologically deep schema OR payload blows the stack anywhere in
+        # here (the payload walk, check_schema, or iter_errors). Too deep to
+        # validate is a rejection, not a crash.
+        return "schema or payload nesting is too deep to validate"
+    except Exception as exc:  # noqa: BLE001 - the never-raise backstop is the point
+        # Anything jsonschema throws that the specific handlers didn't name
+        # (e.g. `multipleOf: NaN` -> ValueError). Class only, no payload text.
+        return f"{_SCHEMA_ERROR_PREFIX}could not be validated ({type(exc).__name__})"
+
+
+def _validate(payload: Any, schema: dict[str, Any] | None) -> str | None:
     # Non-finite floats are not JSON (Draft 2020-12) and are invisible to a
     # numeric bound: NaN compares False to everything, so `NaN <= maximum` is
     # False-not-raised and a NaN slips past any constraint into durable state /
@@ -79,22 +98,22 @@ def validate_json(payload: Any, schema: dict[str, Any] | None) -> str | None:
         # becomes a state_delta (§3.4), which has to be a mapping.
         return None if isinstance(payload, dict) else "expected a JSON object"
 
+    # A non-finite number in the SCHEMA is an authoring error jsonschema won't
+    # flag: `minimum: NaN` silently accepts everything (all comparisons False),
+    # `multipleOf: NaN` raises ValueError mid-validation. Reject before either.
+    schema_nonfinite = _first_nonfinite_path(schema)
+    if schema_nonfinite is not None:
+        return f"{_SCHEMA_ERROR_PREFIX}non-finite number at '{schema_nonfinite}'"
+
     # Validate the schema against its meta-schema FIRST. Without this, a
     # malformed schema is either silently misread — `required: "abc"` becomes
     # three single-letter required fields, a payload-blaming message the model
     # can never satisfy — or raised (`type: 123` -> TypeError, `properties: []`
-    # -> AttributeError) straight past this boundary. `check_schema` turns all
-    # of those into one honest authoring error.
-    #
-    # `RecursionError` is caught too: a pathologically nested schema blows the
-    # stack here, and this function must never raise (both callers treat the
-    # result as a value). A schema that deep is an authoring error regardless.
+    # -> AttributeError). `check_schema` turns those into one authoring error.
     try:
         Draft202012Validator.check_schema(schema)
     except jsonschema_exceptions.SchemaError as exc:
-        return f"{_SCHEMA_ERROR_PREFIX}{exc.message}"
-    except RecursionError:
-        return f"{_SCHEMA_ERROR_PREFIX}schema nesting is too deep to validate"
+        return f"{_SCHEMA_ERROR_PREFIX}{_truncate(exc.message)}"
 
     try:
         validator = Draft202012Validator(schema, registry=_NO_FETCH_REGISTRY)
@@ -111,7 +130,7 @@ def validate_json(payload: Any, schema: dict[str, Any] | None) -> str | None:
         # registry does NOT fetch it, it raises here) is an authoring error,
         # not a model mistake. Catching it keeps the no-network, never-raise
         # contract regardless of what a workflow/MCP schema puts in a $ref.
-        return f"{_SCHEMA_ERROR_PREFIX}unresolvable $ref ({exc})"
+        return f"{_SCHEMA_ERROR_PREFIX}unresolvable $ref ({_truncate(str(exc))})"
 
     if not collected:
         return None
@@ -126,6 +145,18 @@ _MAX_REPORTED_ERRORS = 3
 # Upper bound on errors materialised before reporting the first few. Bounds the
 # work a pathological payload can force without changing the reported output.
 _MAX_COLLECTED_ERRORS = 64
+
+# Per-message cap. `jsonschema` embeds the offending instance in its message
+# ("<1MB blob> is not of type 'integer'"), and the whole result is spent as
+# repair-prompt tokens on every retry — so a 1MB wrong value would otherwise
+# become a 1MB error string. Generous enough to keep a normal message intact.
+_MAX_MESSAGE_CHARS = 300
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_MESSAGE_CHARS:
+        return text
+    return text[:_MAX_MESSAGE_CHARS] + f"… (+{len(text) - _MAX_MESSAGE_CHARS} chars)"
 
 
 def _first_nonfinite_path(value: Any, path: str = "") -> str | None:
@@ -157,4 +188,5 @@ def _describe(error: jsonschema_exceptions.ValidationError) -> str:
     model otherwise cannot tell which one to fix.
     """
     location = ".".join(str(part) for part in error.absolute_path)
-    return f"field '{location}': {error.message}" if location else error.message
+    message = _truncate(error.message)
+    return f"field '{location}': {message}" if location else message

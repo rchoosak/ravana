@@ -137,18 +137,73 @@ def test_remote_ref_makes_no_outbound_request():
     assert error is not None and "authoring error" in error
 
 
-def test_error_collection_is_bounded_for_a_massively_wrong_payload():
-    # `_MAX_COLLECTED_ERRORS` caps materialisation and `_MAX_REPORTED_ERRORS`
-    # caps the message. A payload with far more than 64 wrong fields must still
-    # report at most three, without the docstring's bound being unverified.
-    schema = {
-        "type": "object",
-        "properties": {f"f{i}": {"type": "integer"} for i in range(500)},
-    }
-    payload = {f"f{i}": "not-an-int" for i in range(500)}  # 500 violations
+def test_error_collection_is_bounded_not_just_the_report(monkeypatch):
+    # `_MAX_REPORTED_ERRORS` caps the message either way, so asserting "<=3
+    # reported" does NOT prove the *materialisation* bound — remove the islice
+    # and it still passes. Spy on how many errors are actually pulled: the
+    # island cap means the pull stops at _MAX_COLLECTED_ERRORS, not the full
+    # (here effectively unbounded) error stream.
+    import ravana.runtime.schema_validate as mod
+
+    pulled = 0
+    real_iter = mod.Draft202012Validator.iter_errors
+
+    def counting_iter(self, instance):
+        nonlocal pulled
+        for err in real_iter(self, instance):
+            pulled += 1
+            yield err
+
+    monkeypatch.setattr(mod.Draft202012Validator, "iter_errors", counting_iter)
+
+    schema = {"type": "object", "properties": {f"f{i}": {"type": "integer"} for i in range(500)}}
+    payload = {f"f{i}": "not-an-int" for i in range(500)}  # 500 violations available
     error = validate_json(payload, schema)
-    assert error is not None
-    assert error.count("field '") <= 3  # capped report, not 500 lines
+
+    assert error is not None and error.count("field '") <= 3  # report still capped
+    assert pulled <= mod._MAX_COLLECTED_ERRORS, f"materialised {pulled}, bound not applied"
+
+
+def test_deep_payload_does_not_raise(monkeypatch):
+    # A ~2000-deep nested value blows the recursion limit inside the payload
+    # walk / iter_errors; the never-raise backstop must turn it into a string.
+    deep: object = 1
+    for _ in range(2000):
+        deep = [deep]
+    result = validate_json(deep, {"type": "object"})
+    assert isinstance(result, str) and "too deep" in result
+
+
+@pytest.mark.parametrize(
+    "schema,label",
+    [
+        ({"type": "object", "properties": {"x": {"multipleOf": float("nan")}}}, "multipleOf raises ValueError"),
+        ({"type": "object", "properties": {"x": {"minimum": float("nan")}}}, "minimum silently accepts"),
+    ],
+)
+def test_non_finite_number_in_the_schema_is_an_authoring_error(schema, label):
+    # jsonschema won't flag these — `minimum: NaN` accepts everything, and
+    # `multipleOf: NaN` raises ValueError mid-validation. Both are authoring
+    # errors, returned not raised.
+    error = validate_json({"x": 1}, schema)
+    assert error is not None and "authoring error" in error
+
+
+def test_giant_offending_value_does_not_bloat_the_message():
+    # jsonschema embeds the instance in its message; a 1MB wrong value would
+    # otherwise become a 1MB repair prompt spent on every retry.
+    schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
+    error = validate_json({"x": "A" * 1_000_000}, schema)
+    assert error is not None and len(error) < 1000
+
+
+def test_schemaless_payload_still_rejects_non_finite(monkeypatch):
+    # Pins the guard ORDER: the non-finite check must run before the
+    # `schema is None` early return, or a schema-less node smuggles a NaN into
+    # durable state. Moving the check after that return makes this fail.
+    assert validate_json({"score": float("nan")}, None) is not None
+    assert validate_json({"score": float("inf")}, None) is not None
+    assert validate_json({"ok": 1}, None) is None
 
 
 @pytest.mark.parametrize(
