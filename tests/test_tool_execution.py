@@ -265,13 +265,24 @@ def test_tools_for_surfaces_specs_for_executable_toolkits(graph):
     assert by_name["git_connector"].description  # non-empty, model-facing
 
 
-def test_tools_for_refuses_to_advertise_a_deferred_toolkit(graph):
-    # web_search is a deferred (non-executable) type — surfacing it would only
+def test_web_search_is_advertised_as_a_callable_tool(graph):
+    # web_search ships now (was deferred). It is executable, so tools_for
+    # surfaces it to the model rather than refusing it.
+    resolver = EnvSecretResolver({})
+    executor = RavanaToolExecutor(None, build_registry(graph, resolver))
+    specs = executor.tools_for(["web_search"])
+    assert [t.name for t in specs] == ["web_search"]
+    assert specs[0].input_schema["required"] == ["query"]
+
+
+def test_tools_for_refuses_to_advertise_a_non_executable_toolkit(graph):
+    # The refusal mechanism still holds for a genuinely-unavailable toolkit —
+    # here an MCP server with no admin allow-list configured. Surfacing it would
     # invite the model to call a tool guaranteed to fail, so tools_for raises.
     resolver = EnvSecretResolver({})
     executor = RavanaToolExecutor(None, build_registry(graph, resolver))
     with pytest.raises(ToolkitError, match="not executable in this build"):
-        executor.tools_for(["web_search"])
+        executor.tools_for(["github_mcp"])
 
 
 def test_tools_for_raises_on_unregistered_toolkit(graph):
@@ -550,14 +561,17 @@ def test_executor_rejects_args_violating_input_schema(con, graph):
     assert con.execute("SELECT COUNT(*) c FROM tool_invocation").fetchone()["c"] == 0
 
 
-def test_registry_defers_mcp_and_web_search(graph):
+def test_registry_wires_web_search_and_defers_unconfigured_mcp(graph):
     resolver = EnvSecretResolver({})
     handlers = build_registry(graph, resolver)
-    # code_interpreter is executable; an MCP server without an admin definition
-    # and web_search remain unavailable and refuse to run.
-    for tid in ("github_mcp", "web_search"):
-        with pytest.raises(ToolkitError, match="not executable in this slice"):
-            asyncio.run(handlers[tid].call(arguments={}, idempotency_key="k"))
+    # web_search now ships: a real executable handler, not a deferral stub.
+    from ravana.runtime.toolkits.web_search import WebSearchHandler
+
+    assert isinstance(handlers["web_search"], WebSearchHandler)
+    assert handlers["web_search"].executable is True
+    # An MCP server with no admin allow-list stays unavailable and refuses to run.
+    with pytest.raises(ToolkitError, match="not executable in this slice|allow-list"):
+        asyncio.run(handlers["github_mcp"].call(arguments={}, idempotency_key="k"))
 
 
 def test_toolkit_token_is_reresolved_every_dispatch(graph):
