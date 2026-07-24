@@ -27,6 +27,7 @@ from ravana.runtime.secrets import (
     redact_secrets,
 )
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+from ravana.runtime.toolkits.http_errors import classify_exception, classify_status
 
 # §8(a): the connector's declared input schema. Result is a plain string
 # (the response body), so there is no separate output schema to declare.
@@ -139,7 +140,7 @@ class ApiConnectorHandler:
             # from a programming/config bug, say) propagates raw: the engine's
             # terminal boundary fails the run hard instead of a wrong-type
             # transient retry re-running broken code.
-            kind = _classify_exception(exc)
+            kind = classify_exception(exc)
             safe_error = redact_secrets(str(exc), values=secret_values)
             if kind is None:
                 if safe_error == str(exc):
@@ -161,51 +162,12 @@ class ApiConnectorHandler:
         except SecretLeakError as exc:
             raise ToolkitError(str(exc), kind=ToolFailureKind.FATAL) from None
         if status is not None and status >= 400:
-            raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}", kind=_classify_status(status))
+            raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}", kind=classify_status(status))
         return body
 
 
 def _method_of(arguments: dict[str, Any]) -> str:
     return str(arguments.get("method", "POST")).upper()
-
-
-def _classify_exception(exc: Exception) -> ToolFailureKind | None:
-    """Classify a client-raised exception per §3.6, or None for "not ours —
-    propagate raw" (a programming/config bug the engine should fail hard on).
-
-    httpx.HTTPStatusError is checked FIRST and routed by its response status:
-    an injected/configured client that calls raise_for_status() surfaces a 401
-    as an exception, and blanket-treating the httpx hierarchy as transient
-    would turn that auth failure (§3.6 FATAL) into a backed-off retry. Only
-    httpx.TransportError (timeouts, connection failures) and the builtin
-    OS-level types count as transient."""
-    try:
-        import httpx
-    except ImportError:  # pragma: no cover - httpx is a direct dependency
-        return (
-            ToolFailureKind.TRANSIENT
-            if isinstance(exc, (OSError, TimeoutError))
-            else None
-        )
-    if isinstance(exc, httpx.HTTPStatusError):
-        return _classify_status(exc.response.status_code)
-    if isinstance(exc, (OSError, TimeoutError)):
-        return ToolFailureKind.TRANSIENT
-    if isinstance(exc, httpx.TransportError):
-        return ToolFailureKind.TRANSIENT
-    return None
-
-
-def _classify_status(status: int) -> ToolFailureKind:
-    """§3.6's tool-failure taxonomy by HTTP status: 401/403 is the "tool auth
-    failure" (fatal, fails the run); 5xx/429/408 may recover (transient —
-    engine retries the attempt with backoff); any other 4xx is something the
-    model can adjust to (bad path, validation) — fed back."""
-    if status in (401, 403):
-        return ToolFailureKind.FATAL
-    if status in (408, 429) or status >= 500:
-        return ToolFailureKind.TRANSIENT
-    return ToolFailureKind.MODEL_ADDRESSABLE
 
 
 def _reject_offbase_path(path: str) -> None:

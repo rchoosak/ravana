@@ -16,6 +16,7 @@ from ravana.compiler.graph import CompiledGraph
 from ravana.runtime.git_workspace import DEFAULT_BASE_REF
 from ravana.runtime.secrets import ResolvedSecret, SecretResolver
 from ravana.runtime.toolkits.api_connector import ApiConnectorHandler
+from ravana.runtime.toolkits.web_search import WebSearchHandler
 from ravana.runtime.toolkits.base import ToolkitError, ToolkitHandler
 from ravana.runtime.toolkits.code_interpreter import CodeInterpreterHandler
 from ravana.runtime.toolkits.mcp_server import (
@@ -27,9 +28,7 @@ from ravana.runtime.toolkits.mcp_snapshot import McpToolSnapshotStore
 from ravana.runtime.toolkits.sandbox import SandboxRunner
 
 # Toolkit types still deferred to a later slice, with the reason each needs it.
-_DEFERRED = {
-    "web_search": "provider HTTP call (e.g. Tavily) — lands with the connector-providers slice",
-}
+_DEFERRED: dict[str, str] = {}
 
 
 def build_registry(
@@ -83,6 +82,15 @@ def build_registry(
                 project_dir=workspace_project,
                 base_ref=workspace_base_ref,
                 runner=sandbox_runner,
+            )
+        elif toolkit.type == "web_search":
+            # §1.7: read-only search against a provider. Same dispatch-time
+            # credential injection as api_connector (§8c) — the handler gets a
+            # provider that resolves the key lazily, never the auth_ref/resolver.
+            handlers[toolkit_id] = WebSearchHandler(
+                config=toolkit.config,
+                get_auth_token=_auth_provider(resolver, toolkit.auth_ref),
+                client=clients.get(toolkit_id),
             )
         elif toolkit.type == "mcp_server":
             # §8: the endpoint must be admin-curated BEFORE anything is
