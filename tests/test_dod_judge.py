@@ -103,24 +103,40 @@ def test_judge_prose_omitted_criterion_is_fail_closed():
     assert out.verdicts == [True, False]  # c1 omitted -> not met
 
 
-def test_judge_prose_non_true_met_is_fail_closed():
-    # Only an explicit boolean True passes — a "true" STRING or 1 must not.
-    adapter = FakeAdapter(responses=[_verdict([{"index": 0, "met": True}, {"index": 1, "met": "true"}, {"index": 2, "met": 1}])])
-    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0", "c1", "c2"])
-    assert out.verdicts == [True, False, False]
+# Type-garbage in a verdict is now caught by real JSON-Schema validation of the
+# submit_verdict payload (`_VERDICT_SCHEMA`), which the shallow validator did not
+# enforce on properties. So these no longer reach the fail-closed *mapping* — the
+# schema rejects them, the repair budget exhausts, and the judgement fails. The
+# invariant these protect is unchanged: type-garbage must never read as met=True.
+# It now holds by failing the judgement (-> evaluator_error at the DoD gate)
+# rather than mapping to not-met. The fail-closed mapping still guards the
+# schema-VALID-but-wrong cases (out-of-range / omitted / duplicate index), whose
+# tests above and below still pass.
+def test_judge_prose_non_true_met_is_rejected_by_the_verdict_schema():
+    # A "true" STRING or 1 is not boolean `met`; the schema rejects it rather
+    # than the mapping quietly reading it as not-met.
+    adapter = FakeAdapter(responses=[_verdict([{"index": 0, "met": "true"}])])
+    with pytest.raises(ProseJudgementError) as exc:
+        _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert "met" in str(exc.value.__cause__)  # names the offending field, not just "invalid"
 
 
-def test_judge_prose_garbage_verdicts_value_fails_closed():
+def test_judge_prose_garbage_verdicts_value_is_rejected_by_the_verdict_schema():
     adapter = FakeAdapter(responses=[_verdict("not-a-list")])
-    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
-    assert out.verdicts == [False]
+    with pytest.raises(ProseJudgementError) as exc:
+        _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    assert "verdicts" in str(exc.value.__cause__) and "array" in str(exc.value.__cause__)
 
 
-def test_judge_prose_bool_index_is_rejected_not_read_as_zero():
-    # bool is a subclass of int; index=false must NOT be read as criterion 0.
+def test_judge_prose_bool_index_is_rejected_by_the_verdict_schema():
+    # bool is not a JSON integer under Draft 2020-12, so index=false is a schema
+    # violation — it can never be silently read as criterion 0.
     adapter = FakeAdapter(responses=[_verdict([{"index": False, "met": True}])])
-    out = _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
-    assert out.verdicts == [False]  # the false-indexed ruling does not land on c0
+    with pytest.raises(ProseJudgementError) as exc:
+        _judge(LLMGateway(_judge_graph(), {"anthropic": adapter}), ["c0"])
+    # Discriminate the bool-is-not-integer schema rejection from any other route
+    # to exhaustion — the cause must name the offending `index` field.
+    assert "index" in str(exc.value.__cause__)
 
 
 def test_judge_prose_out_of_range_index_is_dropped():

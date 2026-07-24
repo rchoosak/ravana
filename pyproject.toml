@@ -21,6 +21,8 @@ dependencies = [
     "openai>=1.40",
     "httpx>=0.27",
     "mcp>=1.28.1",
+    "jsonschema>=4.26.0,<4.27",
+    "regex>=2024.11.6",
 ]
 
 [project.scripts]
@@ -40,6 +42,8 @@ dev = [
     "mypy>=1.13",
     "types-PyYAML>=6.0",
     "ruff>=0.12",
+    "types-jsonschema>=4.26.0.20260518",
+    "types-regex>=2024.11.6",
 ]
 
 [tool.pytest.ini_options]
