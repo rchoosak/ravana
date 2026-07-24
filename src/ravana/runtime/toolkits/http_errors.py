@@ -44,3 +44,20 @@ def classify_exception(exc: Exception) -> ToolFailureKind | None:
     if isinstance(exc, httpx.TransportError):
         return ToolFailureKind.TRANSIENT
     return None
+
+
+def redacted_exception_for_rethrow(
+    exc: Exception, *, safe_message: str, context: str
+) -> Exception | None:
+    """Return a secret-safe replacement, or None when the original is safe.
+
+    Callers can use a bare ``raise`` for None, preserving the original type and
+    traceback. If redaction changed the message, reconstruct the same exception
+    type where possible and fall back to a context-only RuntimeError.
+    """
+    if safe_message == str(exc):
+        return None
+    try:
+        return type(exc)(safe_message)
+    except Exception:  # noqa: BLE001 - third-party exception constructors vary
+        return RuntimeError(f"{context} ({type(exc).__name__}): {safe_message}")

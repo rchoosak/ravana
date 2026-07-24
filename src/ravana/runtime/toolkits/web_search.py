@@ -7,13 +7,10 @@ tool into an arbitrary HTTP client. The provider endpoint and auth style are
 fixed by the handler, not chosen by the model.
 
 **Untrusted output.** Search results are arbitrary internet text — the most
-attacker-influenceable input in the system, read by a model that also holds
-tool credentials and a code sandbox. This handler does NOT wrap results in an
-injection boundary: that boundary is a cross-cutting §8 concern for EVERY tool
-result (api_connector bodies, code_interpreter stdout, MCP output), tracked
-separately, and wrapping only web_search would be an inconsistent half-measure.
-What it does do is run the response through the same secret-output gate as
-api_connector, so the provider can't echo the API key back into the transcript.
+attacker-influenceable input in the system. The provider-neutral
+`ToolResultMessage` boundary wraps every tool result before either LLM adapter
+reads it, while this handler also runs the complete response through the
+secret-output gate so the provider cannot echo its API key into the transcript.
 """
 
 from __future__ import annotations
@@ -29,7 +26,11 @@ from ravana.runtime.secrets import (
     redact_secrets,
 )
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
-from ravana.runtime.toolkits.http_errors import classify_exception, classify_status
+from ravana.runtime.toolkits.http_errors import (
+    classify_exception,
+    classify_status,
+    redacted_exception_for_rethrow,
+)
 
 INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -47,6 +48,13 @@ _TAVILY_ENDPOINT = "https://api.tavily.com/search"
 _SUPPORTED_PROVIDERS = frozenset({"tavily"})
 
 _DEFAULT_MAX_RESULTS = 5
+_MAX_RESPONSE_BYTES = 1024 * 1024
+_MAX_ERROR_BYTES = 4096
+_MAX_RENDERED_CHARS = 24_000
+_MAX_TITLE_CHARS = 300
+_MAX_URL_CHARS = 2048
+_MAX_CONTENT_CHARS = 4000
+_TRUNCATION_MARKER = "... [truncated]"
 
 
 class WebSearchHandler:
@@ -105,6 +113,12 @@ class WebSearchHandler:
         if not isinstance(query, str) or not query.strip():
             raise ToolkitError("web_search: 'query' must be a non-empty string")
         max_results = arguments.get("max_results", _DEFAULT_MAX_RESULTS)
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or not 1 <= max_results <= 20
+        ):
+            raise ToolkitError("web_search: 'max_results' must be an integer from 1 to 20")
 
         # §8c: resolved at dispatch, opened to plaintext only here. A search
         # provider needs its key to answer at all, so a missing key is FATAL,
@@ -124,39 +138,91 @@ class WebSearchHandler:
             )
         secret_values = (api_key,)
 
-        # Tavily takes the key in the JSON body, not a bearer header.
-        body = {"api_key": api_key, "query": query, "max_results": max_results}
+        headers = {"Authorization": f"Bearer {api_key}"}
+        body = {"query": query, "max_results": max_results}
         client = self._resolve_client()
         try:
-            response = await client.post(_TAVILY_ENDPOINT, json=body)
+            async with client.stream(
+                "POST",
+                _TAVILY_ENDPOINT,
+                headers=headers,
+                json=body,
+            ) as response:
+                status = getattr(response, "status_code", None)
+                body_limit = (
+                    _MAX_ERROR_BYTES
+                    if isinstance(status, int) and status >= 400
+                    else _MAX_RESPONSE_BYTES
+                )
+                raw_body, truncated = await _read_limited(response, body_limit)
         except Exception as exc:
             kind = classify_exception(exc)
             safe_error = redact_secrets(str(exc), values=secret_values)
             if kind is None:
-                # Not a recognised transport/status failure — a programming or
-                # config bug. Fail the run hard rather than retry broken code;
-                # re-raise redacted so the key can't ride out in the message.
-                raise ToolkitError(
-                    f"web_search request failed ({type(exc).__name__}): {safe_error}",
-                    kind=ToolFailureKind.FATAL,
-                ) from None
+                replacement = redacted_exception_for_rethrow(
+                    exc,
+                    safe_message=safe_error,
+                    context="web_search request failed",
+                )
+                if replacement is None:
+                    raise
+                raise replacement from None
             raise ToolkitError(f"web_search request failed: {safe_error}", kind=kind) from None
 
-        status = getattr(response, "status_code", None)
-        if status is not None and status >= 400:
-            detail = redact_secrets(_safe_text(response), values=secret_values)[:500]
+        if not isinstance(status, int):
+            raise ToolkitError(
+                "web_search: provider response had no integer HTTP status",
+                kind=ToolFailureKind.FATAL,
+            )
+        if status >= 400:
+            detail = redact_secrets(
+                raw_body.decode("utf-8", errors="replace"), values=secret_values
+            )[:500]
+            if truncated:
+                detail += f" {_TRUNCATION_MARKER}"
             raise ToolkitError(
                 f"web_search got HTTP {status} from {self._provider}: {detail}",
-                kind=classify_status(status),
+                kind=_classify_tavily_status(status),
             )
-        return _format_results(response, secret_values=secret_values)
+        if truncated:
+            raise ToolkitError(
+                f"web_search: provider response exceeded {_MAX_RESPONSE_BYTES} bytes",
+                kind=ToolFailureKind.FATAL,
+            )
+        return _format_results(
+            raw_body,
+            secret_values=secret_values,
+            max_results=max_results,
+        )
 
 
-def _safe_text(response: Any) -> str:
-    return str(getattr(response, "text", ""))
+async def _read_limited(response: Any, limit: int) -> tuple[bytes, bool]:
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        remaining = limit + 1 - len(body)
+        if remaining <= 0:
+            return bytes(body[:limit]), True
+        body.extend(chunk[:remaining])
+        if len(body) > limit:
+            return bytes(body[:limit]), True
+    return bytes(body), False
 
 
-def _format_results(response: Any, *, secret_values: tuple[str, ...]) -> str:
+def _classify_tavily_status(status: int) -> ToolFailureKind:
+    # The model can adjust a rejected query, but not Tavily's fixed endpoint,
+    # method, authentication, account state, or usage-plan limits (432/433).
+    if status in (400, 422):
+        return ToolFailureKind.MODEL_ADDRESSABLE
+    kind = classify_status(status)
+    return ToolFailureKind.FATAL if kind is ToolFailureKind.MODEL_ADDRESSABLE else kind
+
+
+def _format_results(
+    raw_body: bytes,
+    *,
+    secret_values: tuple[str, ...],
+    max_results: int,
+) -> str:
     """Render the provider's JSON into a compact, model-readable list.
 
     Runs through the secret-output gate first (§8): the request carried the API
@@ -164,10 +230,10 @@ def _format_results(response: Any, *, secret_values: tuple[str, ...]) -> str:
     transcript. A gate hit is FATAL — a leak, not a search result.
     """
     try:
-        payload = response.json()
+        payload = json.loads(raw_body)
     except Exception:  # noqa: BLE001 - a non-JSON 2xx is a provider contract break
         raise ToolkitError(
-            f"web_search: {getattr(response, 'status_code', '?')} response was not JSON",
+            "web_search: successful provider response was not JSON",
             kind=ToolFailureKind.TRANSIENT,
         ) from None
 
@@ -176,15 +242,35 @@ def _format_results(response: Any, *, secret_values: tuple[str, ...]) -> str:
     except SecretLeakError as exc:
         raise ToolkitError(str(exc), kind=ToolFailureKind.FATAL) from None
 
-    results = payload.get("results") if isinstance(payload, dict) else None
-    if not isinstance(results, list) or not results:
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        raise ToolkitError(
+            "web_search: successful provider response had an invalid 'results' field",
+            kind=ToolFailureKind.TRANSIENT,
+        )
+    results = payload["results"]
+    if not results:
         return "No results."
     lines: list[str] = []
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title", "")).strip() or "(untitled)"
-        url = str(item.get("url", "")).strip()
-        content = str(item.get("content", "")).strip()
+    for item in results[:max_results]:
+        if not isinstance(item, dict) or any(
+            not isinstance(item.get(field), str) for field in ("title", "url", "content")
+        ):
+            raise ToolkitError(
+                "web_search: successful provider response contained an invalid result",
+                kind=ToolFailureKind.TRANSIENT,
+            )
+        title = _truncate(item["title"].strip() or "(untitled)", _MAX_TITLE_CHARS)
+        url = _truncate(item["url"].strip(), _MAX_URL_CHARS)
+        content = _truncate(item["content"].strip(), _MAX_CONTENT_CHARS)
         lines.append(f"- {title}\n  {url}\n  {content}")
-    return "\n".join(lines) if lines else json.dumps(payload)[:2000]
+    if len(results) > max_results:
+        lines.append(f"[truncated to requested max_results={max_results}]")
+    rendered = "\n".join(lines)
+    return _truncate(rendered, _MAX_RENDERED_CHARS)
+
+
+def _truncate(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    keep = max(0, limit - len(_TRUNCATION_MARKER))
+    return value[:keep] + _TRUNCATION_MARKER

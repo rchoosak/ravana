@@ -27,7 +27,11 @@ from ravana.runtime.secrets import (
     redact_secrets,
 )
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
-from ravana.runtime.toolkits.http_errors import classify_exception, classify_status
+from ravana.runtime.toolkits.http_errors import (
+    classify_exception,
+    classify_status,
+    redacted_exception_for_rethrow,
+)
 
 # §8(a): the connector's declared input schema. Result is a plain string
 # (the response body), so there is no separate output schema to declare.
@@ -143,15 +147,14 @@ class ApiConnectorHandler:
             kind = classify_exception(exc)
             safe_error = redact_secrets(str(exc), values=secret_values)
             if kind is None:
-                if safe_error == str(exc):
+                replacement = redacted_exception_for_rethrow(
+                    exc,
+                    safe_message=safe_error,
+                    context="api_connector request failed",
+                )
+                if replacement is None:
                     raise
-                try:
-                    safe_exception = type(exc)(safe_error)
-                except Exception:  # noqa: BLE001
-                    safe_exception = RuntimeError(
-                        f"api_connector request failed ({type(exc).__name__}): {safe_error}"
-                    )
-                raise safe_exception from None
+                raise replacement from None
             raise ToolkitError(
                 f"api_connector request to {path} failed: {safe_error}", kind=kind
             ) from None

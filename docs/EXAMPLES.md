@@ -76,6 +76,7 @@ spec:
     - id: web_search
       type: web_search
       config: { provider: tavily }
+      auth_ref: secrets://tavily_api_key
 
     - id: social_mcp
       type: mcp_server
