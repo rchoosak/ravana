@@ -39,6 +39,7 @@ _MAX_DIAGNOSTIC_CHARS = 1_500
 _MAX_PATTERN_CHARS = 1_500
 _MAX_VALIDATION_STEPS = 10_000
 _VALIDATION_BUDGET_SECONDS = 0.5
+_SUPPORTED_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 # Python's built-in `re` has no timeout. The alternate engine applies this
 # shared regex-execution budget to every regex match in one validation, so many
@@ -184,8 +185,23 @@ def _errors_are_empty(errors) -> bool:
     return next(errors, None) is None
 
 
+def _lookup_evaluated_reference(validator, ref):
+    """Isolate the jsonschema 4.26 resolver API used by its own helper."""
+    resolver = getattr(validator, "_resolver", None)
+    lookup = getattr(resolver, "lookup", None)
+    if not callable(lookup):
+        raise RuntimeError("unsupported jsonschema resolver API")
+    return lookup(ref)
+
+
 def _evaluated_property_keys(validator, instance, schema) -> set[Any]:
-    """Draft 2020-12 evaluated-key discovery without stdlib regex calls."""
+    """Draft 2020-12 evaluated-key discovery without stdlib regex calls.
+
+    This mirrors jsonschema 4.26's helper because its implementation calls
+    unbounded stdlib regex. Keep the dependency constrained in pyproject.toml
+    and the reference/combinator conformance cases in test_schema_validate.py
+    in sync with this compatibility copy.
+    """
     _consume_validation_step()
     if validator.is_type(schema, "boolean"):
         return set()
@@ -195,7 +211,7 @@ def _evaluated_property_keys(validator, instance, schema) -> set[Any]:
         ref = schema.get(keyword)
         if ref is None:
             continue
-        resolved = validator._resolver.lookup(ref)
+        resolved = _lookup_evaluated_reference(validator, ref)
         evaluated.update(
             _evaluated_property_keys(
                 validator.evolve(
@@ -362,6 +378,26 @@ _SafeDraft202012Validator = validators.extend(
 )
 
 
+def _evolve_safe_validator(self, **changes):
+    """Preserve bounded handlers while descending into embedded resources."""
+    evolved = {
+        "schema": self.schema,
+        "resolver": self._ref_resolver,
+        "format_checker": self.format_checker,
+        "registry": self._registry,
+        "_resolver": self._resolver,
+    }
+    evolved.update(changes)
+    return self.__class__(**evolved)
+
+
+# jsonschema's generated evolve() dispatches on an embedded `$schema` and would
+# silently switch this class back to an unbounded stock validator. Subclassing
+# generated validator classes is unsupported, so install the compatibility
+# hook directly and keep jsonschema constrained to the verified minor release.
+setattr(_SafeDraft202012Validator, "evolve", _evolve_safe_validator)
+
+
 def _refuse_retrieval(uri: str) -> Any:
     """Registry retrieval hook which rejects every network or file lookup."""
     raise NoSuchResource(ref=uri)  # type: ignore[call-arg]
@@ -468,7 +504,7 @@ def _validate_schema(schema: dict[str, Any]) -> str | None:
             )
             # Bound compile-sized patterns before check_schema's regex format
             # check, but inspect only actual subschema locations.
-            _preflight_pattern_sizes(root)
+            _preflight_schema_resources(root)
             _SafeDraft202012Validator.check_schema(schema)
             _preflight_refs(root)
     except jsonschema_exceptions.SchemaError as exc:
@@ -489,11 +525,20 @@ def _validate_schema(schema: dict[str, Any]) -> str | None:
     return None
 
 
-def _preflight_pattern_sizes(resource) -> None:
-    """Reject patterns large enough to make compilation a resource risk."""
+def _preflight_schema_resources(resource) -> None:
+    """Enforce dialect and compile-size policy on real schema resources."""
     _consume_validation_step()
     contents = resource.contents
     if isinstance(contents, dict):
+        dialect = contents.get("$schema")
+        if (
+            isinstance(dialect, str)
+            and dialect.removesuffix("#") != _SUPPORTED_DIALECT
+        ):
+            raise _SchemaPolicyError(
+                f"unsupported $schema dialect {_truncate(dialect)!r}"
+            )
+
         pattern = contents.get("pattern")
         if isinstance(pattern, str) and len(pattern) > _MAX_PATTERN_CHARS:
             raise _SchemaPolicyError(
@@ -512,7 +557,7 @@ def _preflight_pattern_sizes(resource) -> None:
                         f"{_MAX_PATTERN_CHARS} characters"
                     )
     for subresource in resource.subresources():
-        _preflight_pattern_sizes(subresource)
+        _preflight_schema_resources(subresource)
 
 
 def _preflight_refs(root) -> None:

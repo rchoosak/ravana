@@ -18,6 +18,8 @@ import pytest
 
 from ravana.runtime.schema_validate import validate_json
 
+_DRAFT202012_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+
 _SCHEMA = {
     "type": "object",
     "properties": {
@@ -336,6 +338,67 @@ print(validate_json({{key: 1}}, schema))
     assert "regular-expression" in completed.stdout
 
 
+def test_embedded_resource_cannot_evolve_back_to_unbounded_validator():
+    # jsonschema's generated evolve() dispatches from an embedded `$schema`.
+    # Without our override, even the same dialect silently selects the stock
+    # validator and bypasses both regex and keyword-work budgets.
+    code = f"""
+from ravana.runtime.schema_validate import validate_json
+dialect = {_DRAFT202012_DIALECT!r}
+regex_schema = {{
+    "$defs": {{
+        "embedded": {{
+            "$id": "urn:ravana:embedded-regex",
+            "$schema": dialect,
+            "type": "string",
+            "pattern": "(a|aa)+$",
+        }},
+    }},
+    "$ref": "urn:ravana:embedded-regex",
+}}
+print(validate_json("a" * 100 + "!", regex_schema))
+
+branch = {{"type": "array", "items": {{"type": "integer"}}}}
+work_schema = {{
+    "$defs": {{
+        "embedded": {{
+            "$id": "urn:ravana:embedded-work",
+            "$schema": dialect,
+            "anyOf": [branch for _ in range(50)],
+        }},
+    }},
+    "$ref": "urn:ravana:embedded-work",
+}}
+print(validate_json(["wrong"] * 3_000, work_schema))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert completed.returncode == 0
+    assert "regular-expression" in completed.stdout
+    assert "resource limit" in completed.stdout
+
+
+def test_non_draft_202012_embedded_resource_is_rejected():
+    schema = {
+        "$defs": {
+            "embedded": {
+                "$id": "urn:ravana:draft7",
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "string",
+            }
+        },
+        "$ref": "urn:ravana:draft7",
+    }
+    error = validate_json("ok", schema)
+    assert error is not None
+    assert "authoring error" in error and "unsupported $schema dialect" in error
+
+
 def test_regex_budget_counts_only_time_spent_matching(monkeypatch):
     import ravana.runtime.schema_validate as mod
 
@@ -408,11 +471,11 @@ print(validate_json(["wrong"] * 3_000, schema))
 
 def test_unique_items_cannot_fall_back_to_quadratic_work():
     # jsonschema's generic equality fallback is O(n^2) for arrays of objects.
-    # This size leaves one validation step after the JSON walk: the bounded
-    # canonicaliser stops immediately, while the stock helper runs for seconds.
+    # This size leaves enough steps to enter the implementation: the bounded
+    # canonicaliser then stops, while the stock helper runs for seconds.
     code = """
 from ravana.runtime.schema_validate import validate_json
-payload = [{"i": i} for i in range(4_999)]
+payload = [{"i": i} for i in range(4_998)]
 print(validate_json(payload, {"type": "array", "uniqueItems": True}))
 """
     completed = subprocess.run(
@@ -466,6 +529,32 @@ def test_safe_object_helpers_preserve_evaluated_property_semantics():
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "ref_keyword,anchor_keyword",
+    [
+        ("$ref", "$anchor"),
+        ("$dynamicRef", "$dynamicAnchor"),
+    ],
+)
+def test_evaluated_property_compatibility_handles_local_references(
+    ref_keyword,
+    anchor_keyword,
+):
+    schema = {
+        "$defs": {
+            "base": {
+                anchor_keyword: "base",
+                "properties": {"count": {"type": "integer"}},
+            }
+        },
+        ref_keyword: "#base",
+        "unevaluatedProperties": False,
+    }
+    assert validate_json({"count": 1}, schema) is None
+    error = validate_json({"count": 1, "extra": 2}, schema)
+    assert error is not None and "extra" in error
 
 
 def test_giant_pattern_is_rejected_before_compilation():
