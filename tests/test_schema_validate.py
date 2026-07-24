@@ -101,18 +101,54 @@ def test_malformed_schema_is_an_authoring_error_never_raises(bad_schema):
     assert "authoring error" in error
 
 
-def test_remote_ref_is_rejected_without_fetching():
-    # SSRF surface: a $ref to a URL must never make the validator reach out.
-    # The registry does not retrieve — a remote ref resolves to an authoring
-    # error, no network. Timed so a silent fetch attempt (connect/timeout)
-    # would show up as elapsed wall-clock.
-    import time
+def test_remote_ref_makes_no_outbound_request():
+    # SSRF/LFI surface: a $ref to a URL must never make the validator reach
+    # out. A closed-port timing check does NOT prove this — it passes on a fast
+    # connection refusal even if a fetch was attempted (that mistake shipped
+    # once). Stand up a real listener and assert it receives ZERO requests.
+    import http.server
+    import socketserver
+    import threading
 
-    schema = {"type": "object", "properties": {"a": {"$ref": "http://127.0.0.1:9/x"}}}
-    start = time.monotonic()
-    error = validate_json({"a": 1}, schema)
+    hits: list[str] = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            hits.append(self.path)
+            body = b'{"type": "object"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):  # silence
+            return
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        schema = {"type": "object", "properties": {"a": {"$ref": f"http://127.0.0.1:{port}/schema"}}}
+        error = validate_json({"a": 1}, schema)
+    finally:
+        server.shutdown()
+
+    assert hits == [], f"validator fetched the remote $ref: {hits}"
     assert error is not None and "authoring error" in error
-    assert time.monotonic() - start < 0.5, "a remote $ref must not be fetched"
+
+
+def test_error_collection_is_bounded_for_a_massively_wrong_payload():
+    # `_MAX_COLLECTED_ERRORS` caps materialisation and `_MAX_REPORTED_ERRORS`
+    # caps the message. A payload with far more than 64 wrong fields must still
+    # report at most three, without the docstring's bound being unverified.
+    schema = {
+        "type": "object",
+        "properties": {f"f{i}": {"type": "integer"} for i in range(500)},
+    }
+    payload = {f"f{i}": "not-an-int" for i in range(500)}  # 500 violations
+    error = validate_json(payload, schema)
+    assert error is not None
+    assert error.count("field '") <= 3  # capped report, not 500 lines
 
 
 @pytest.mark.parametrize(

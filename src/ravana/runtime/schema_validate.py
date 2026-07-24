@@ -28,9 +28,33 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema import exceptions as jsonschema_exceptions
-from referencing.exceptions import Unresolvable
+from referencing import Registry
+from referencing.exceptions import NoSuchResource, Unresolvable
 
-_SCHEMA_ERROR_PREFIX = "invalid output schema (workflow authoring error): "
+# Context-neutral: this validator serves BOTH §3.4 agent output and §8a tool
+# input, so the message must not claim "output schema" on the tool-input path.
+_SCHEMA_ERROR_PREFIX = "invalid schema (workflow authoring error): "
+
+
+def _refuse_retrieval(uri: str) -> Any:
+    """A registry `retrieve` that fetches nothing.
+
+    jsonschema 4.x keeps legacy HTTP/file retrieval for a `$ref` to a URL — a
+    live listener confirmed a `$ref: "http://.../schema"` triggers a real GET.
+    An `output_schema` / toolkit input schema is workflow- or MCP-authored, so
+    that is an SSRF/LFI surface: a `$ref` could pull an internal URL or a local
+    file. This registry raises instead of retrieving, so ANY ref the schema
+    doesn't define inline is an unresolved-ref authoring error, never a fetch.
+    """
+    # `ref=` is the real attrs field and `retrieve=` a real Registry param
+    # (both runtime-verified: the no-fetch listener test depends on them).
+    # `referencing`'s attrs-generated __init__ signatures confuse mypy here.
+    raise NoSuchResource(ref=uri)  # type: ignore[call-arg]
+
+
+# Shared, immutable, and empty-but-non-retrieving. Reused across calls so every
+# validation resolves refs the same way: inline only, no network, no disk.
+_NO_FETCH_REGISTRY: Registry = Registry(retrieve=_refuse_retrieval)  # type: ignore[call-arg]
 
 
 def validate_json(payload: Any, schema: dict[str, Any] | None) -> str | None:
@@ -41,6 +65,15 @@ def validate_json(payload: Any, schema: dict[str, Any] | None) -> str | None:
     — not an exception, and not blamed on the payload, which would send the
     repair loop chasing a fault it cannot fix.
     """
+    # Non-finite floats are not JSON (Draft 2020-12) and are invisible to a
+    # numeric bound: NaN compares False to everything, so `NaN <= maximum` is
+    # False-not-raised and a NaN slips past any constraint into durable state /
+    # tool arguments. Checked FIRST, before the schema-less early return, so a
+    # schema-less node's payload can't smuggle a NaN into state either.
+    nonfinite = _first_nonfinite_path(payload)
+    if nonfinite is not None:
+        return f"field '{nonfinite}': not a finite JSON number (NaN/Infinity are not valid JSON)"
+
     if schema is None:
         # No declared schema still means "an object" — the whole payload
         # becomes a state_delta (§3.4), which has to be a mapping.
@@ -52,21 +85,19 @@ def validate_json(payload: Any, schema: dict[str, Any] | None) -> str | None:
     # can never satisfy — or raised (`type: 123` -> TypeError, `properties: []`
     # -> AttributeError) straight past this boundary. `check_schema` turns all
     # of those into one honest authoring error.
+    #
+    # `RecursionError` is caught too: a pathologically nested schema blows the
+    # stack here, and this function must never raise (both callers treat the
+    # result as a value). A schema that deep is an authoring error regardless.
     try:
         Draft202012Validator.check_schema(schema)
     except jsonschema_exceptions.SchemaError as exc:
         return f"{_SCHEMA_ERROR_PREFIX}{exc.message}"
-
-    # Non-finite floats are not JSON (Draft 2020-12) and are invisible to a
-    # numeric bound: NaN compares False to everything, so `NaN <= maximum` is
-    # False-not-raised and a NaN slips past any constraint into durable state /
-    # tool arguments. Reject before validation, since jsonschema won't.
-    nonfinite = _first_nonfinite_path(payload)
-    if nonfinite is not None:
-        return f"field '{nonfinite}': not a finite JSON number (NaN/Infinity are not valid JSON)"
+    except RecursionError:
+        return f"{_SCHEMA_ERROR_PREFIX}schema nesting is too deep to validate"
 
     try:
-        validator = Draft202012Validator(schema)
+        validator = Draft202012Validator(schema, registry=_NO_FETCH_REGISTRY)
         # `iter_errors` is lazy; `sorted()` would materialise EVERY error for a
         # huge/deeply-wrong payload just to report three. Cap the window first.
         collected = list(
