@@ -350,11 +350,12 @@ regex_schema = {{
         "embedded": {{
             "$id": "urn:ravana:embedded-regex",
             "$schema": dialect,
+            "$dynamicAnchor": "bounded",
             "type": "string",
             "pattern": "(a|aa)+$",
         }},
     }},
-    "$ref": "urn:ravana:embedded-regex",
+    "$dynamicRef": "urn:ravana:embedded-regex#bounded",
 }}
 print(validate_json("a" * 100 + "!", regex_schema))
 
@@ -381,6 +382,17 @@ print(validate_json(["wrong"] * 3_000, work_schema))
     assert completed.returncode == 0
     assert "regular-expression" in completed.stdout
     assert "resource limit" in completed.stdout
+
+
+def test_jsonschema_compatibility_matches_generated_constructor_contract():
+    import ravana.runtime.schema_validate as mod
+
+    actual_fields = tuple(
+        (attribute.name, attribute.alias)
+        for attribute in mod._SafeDraft202012Validator.__attrs_attrs__
+        if attribute.init
+    )
+    assert actual_fields == mod._Jsonschema426Compatibility.EVOLVE_FIELDS
 
 
 def test_non_draft_202012_embedded_resource_is_rejected():

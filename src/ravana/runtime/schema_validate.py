@@ -185,13 +185,31 @@ def _errors_are_empty(errors) -> bool:
     return next(errors, None) is None
 
 
-def _lookup_evaluated_reference(validator, ref):
-    """Isolate the jsonschema 4.26 resolver API used by its own helper."""
-    resolver = getattr(validator, "_resolver", None)
-    lookup = getattr(resolver, "lookup", None)
-    if not callable(lookup):
-        raise RuntimeError("unsupported jsonschema resolver API")
-    return lookup(ref)
+class _Jsonschema426Compatibility:
+    """One boundary for private state relied on from jsonschema 4.26."""
+
+    EVOLVE_FIELDS = (
+        ("schema", "schema"),
+        ("_ref_resolver", "resolver"),
+        ("format_checker", "format_checker"),
+        ("_registry", "registry"),
+        ("_resolver", "_resolver"),
+    )
+
+    @staticmethod
+    def evolve(validator, **changes):
+        for attribute, argument in _Jsonschema426Compatibility.EVOLVE_FIELDS:
+            if argument not in changes:
+                changes[argument] = getattr(validator, attribute)
+        return validator.__class__(**changes)
+
+    @staticmethod
+    def lookup_reference(validator, ref):
+        resolver = getattr(validator, "_resolver", None)
+        lookup = getattr(resolver, "lookup", None)
+        if not callable(lookup):
+            raise RuntimeError("unsupported jsonschema resolver API")
+        return lookup(ref)
 
 
 def _evaluated_property_keys(validator, instance, schema) -> set[Any]:
@@ -211,7 +229,7 @@ def _evaluated_property_keys(validator, instance, schema) -> set[Any]:
         ref = schema.get(keyword)
         if ref is None:
             continue
-        resolved = _lookup_evaluated_reference(validator, ref)
+        resolved = _Jsonschema426Compatibility.lookup_reference(validator, ref)
         evaluated.update(
             _evaluated_property_keys(
                 validator.evolve(
@@ -378,24 +396,15 @@ _SafeDraft202012Validator = validators.extend(
 )
 
 
-def _evolve_safe_validator(self, **changes):
-    """Preserve bounded handlers while descending into embedded resources."""
-    evolved = {
-        "schema": self.schema,
-        "resolver": self._ref_resolver,
-        "format_checker": self.format_checker,
-        "registry": self._registry,
-        "_resolver": self._resolver,
-    }
-    evolved.update(changes)
-    return self.__class__(**evolved)
-
-
 # jsonschema's generated evolve() dispatches on an embedded `$schema` and would
 # silently switch this class back to an unbounded stock validator. Subclassing
 # generated validator classes is unsupported, so install the compatibility
 # hook directly and keep jsonschema constrained to the verified minor release.
-setattr(_SafeDraft202012Validator, "evolve", _evolve_safe_validator)
+setattr(
+    _SafeDraft202012Validator,
+    "evolve",
+    _Jsonschema426Compatibility.evolve,
+)
 
 
 def _refuse_retrieval(uri: str) -> Any:
