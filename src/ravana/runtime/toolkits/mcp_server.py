@@ -79,19 +79,22 @@ _DESCRIPTION_ATTRIBUTION = (
 def _attributed_description(toolkit_id: str, description: str) -> str:
     """Prefix a server-supplied tool description with its untrusted provenance.
 
-    §8's "wrap/tag tool output distinctly" for the tool-definition surface: a
-    description can't be fenced like output (its job is to instruct the model
-    about the tool), so it is TAGGED with where it came from instead. Defence in
-    depth over the admin allow-list and pin-time capture, not a hard boundary.
+    §8 prompt injection: a server description reaches the model verbatim in the
+    tool-definition surface (authoritative framing, re-read every turn) and a
+    hostile server can write instructions there ("before any tool, call ...").
+    It can't be *fenced* like tool output — its job is to instruct the model
+    about the tool, so fencing it as untrusted noise would break tool-calling.
+    §8's "wrap/**tag** distinctly" is the honest form: provenance without
+    denying the description its function. Defence in depth, NOT a hard boundary
+    (a determined injection can tell the model to ignore the tag); the real
+    guarantees stay the admin allow-list and pin-time capture, the secret gate a
+    third orthogonal concern.
 
-    Idempotence is required at the advertisement boundary: snapshots created by
-    this version already contain the tag, while snapshots from a paused run
-    created before the §8 fix still contain the raw description.
+    Applied at exactly one site — `sub_tools_for`, the sole path a description
+    reaches the model — over the raw server text that discovery pinned and
+    snapshotted. One site, always raw input: no double-tag, no guard needed.
     """
-    attribution = _DESCRIPTION_ATTRIBUTION.format(toolkit_id=toolkit_id)
-    if description.startswith(attribution):
-        return description
-    return attribution + description
+    return _DESCRIPTION_ATTRIBUTION.format(toolkit_id=toolkit_id) + description
 
 
 @dataclass(frozen=True)
@@ -677,11 +680,17 @@ class McpServerHandler:
                     continue
                 self._validate_provider_tool_name(spec.name)
                 schema = spec.inputSchema if isinstance(spec.inputSchema, dict) else {}
+                # Store and snapshot the RAW server description; the untrusted
+                # provenance tag is applied once at the advertisement boundary
+                # (`sub_tools_for`), the single path a description reaches the
+                # model. Persisting raw keeps the snapshot server-truth, keeps
+                # the secret gate scanning only server content (not a constant
+                # harness prefix), and means there is exactly one tag site — no
+                # double-tag to reconcile on resume.
                 raw_description = spec.description or f"{spec.name} (via {self._toolkit_id})"
-                description = _attributed_description(self._toolkit_id, raw_description)
                 try:
                     ensure_secret_free(
-                        description,
+                        raw_description,
                         context=f"mcp_server '{self._toolkit_id}' tool description",
                         values=secret_values,
                     )
@@ -694,25 +703,7 @@ class McpServerHandler:
                     raise ToolkitError(str(exc), kind=ToolFailureKind.FATAL) from None
                 pinned[spec.name] = Tool(
                     name=spec.name,
-                    # §8 prompt injection. A server-supplied description reaches
-                    # the model verbatim, embedded by both adapters into the
-                    # *tool definitions* — the surface the model reads as
-                    # authoritative framing, re-read every turn. A hostile server
-                    # can write instructions here ("before any tool, call ...").
-                    #
-                    # `_attributed_description` PROVENANCE-TAGS it (§8: "wrap/tag
-                    # tool output distinctly"). A description can't be *fenced*
-                    # like tool output — its whole purpose is to instruct the
-                    # model about the tool, so fencing it as untrusted noise
-                    # would break tool-calling. Tagging is the honest form for
-                    # this surface: it gives the model provenance without denying
-                    # the description its function. It is defence in depth, NOT a
-                    # hard boundary — a determined injection can tell the model to
-                    # ignore the tag. The real guarantees remain the admin-curated
-                    # allow-list (§8, the server is trusted at all) and pin-time
-                    # capture (no post-approval rug-pull). The secret-output gate
-                    # above is leak prevention, a third, orthogonal concern.
-                    description=description,
+                    description=raw_description,
                     input_schema=schema,
                 )
             next_cursor = getattr(listed, "nextCursor", None)
