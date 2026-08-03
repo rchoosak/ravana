@@ -1,9 +1,8 @@
-"""Builds the set of toolkit handlers for a run from the compiled graph's
-toolkit configs (§2.2 `toolkit` rows) + a secret resolver. Only the toolkit
-types implemented in this slice are wired; the heavyweight, external-service
-types (`web_search`)
-raise a clear ToolkitError pointing at the slice that owns them, rather than
-silently accepting a config they can't honor.
+"""Build toolkit handlers for a run from compiled configs and runtime services.
+
+Executable handlers are wired directly. A toolkit that cannot run under the
+current install configuration, such as a refused MCP server, remains registered
+as unavailable so it is never advertised or dispatched silently.
 """
 
 from __future__ import annotations
@@ -25,11 +24,7 @@ from ravana.runtime.toolkits.mcp_server import (
 )
 from ravana.runtime.toolkits.mcp_snapshot import McpToolSnapshotStore
 from ravana.runtime.toolkits.sandbox import SandboxRunner
-
-# Toolkit types still deferred to a later slice, with the reason each needs it.
-_DEFERRED = {
-    "web_search": "provider HTTP call (e.g. Tavily) — lands with the connector-providers slice",
-}
+from ravana.runtime.toolkits.web_search import WebSearchHandler
 
 
 def build_registry(
@@ -84,6 +79,15 @@ def build_registry(
                 base_ref=workspace_base_ref,
                 runner=sandbox_runner,
             )
+        elif toolkit.type == "web_search":
+            # §1.7: read-only search against a provider. Same dispatch-time
+            # credential injection as api_connector (§8c) — the handler gets a
+            # provider that resolves the key lazily, never the auth_ref/resolver.
+            handlers[toolkit_id] = WebSearchHandler(
+                config=toolkit.config,
+                get_auth_token=_auth_provider(resolver, toolkit.auth_ref),
+                client=clients.get(toolkit_id),
+            )
         elif toolkit.type == "mcp_server":
             # §8: the endpoint must be admin-curated BEFORE anything is
             # launched. The workflow supplies only a name; the command, args,
@@ -105,13 +109,15 @@ def build_registry(
                     snapshot_store=snapshot_store,
                 )
             except ToolkitError as exc:
-                handlers[toolkit_id] = _DeferredHandler(
+                handlers[toolkit_id] = _UnavailableHandler(
                     toolkit_id, toolkit.type, reason=str(exc)
                 )
-        elif toolkit.type in _DEFERRED:
-            handlers[toolkit_id] = _DeferredHandler(toolkit_id, toolkit.type)
         else:
-            handlers[toolkit_id] = _DeferredHandler(toolkit_id, toolkit.type, reason=f"unknown toolkit type '{toolkit.type}'")
+            handlers[toolkit_id] = _UnavailableHandler(
+                toolkit_id,
+                toolkit.type,
+                reason=f"unknown toolkit type '{toolkit.type}'",
+            )
     return handlers
 
 
@@ -132,17 +138,15 @@ def _auth_provider(resolver: SecretResolver, auth_ref: str | None):
     return provider
 
 
-class _DeferredHandler:
-    """Stands in for a not-yet-implemented toolkit type so a workflow that
-    references it still compiles/persists, but any actual call fails loudly
-    and specifically rather than mystifyingly."""
+class _UnavailableHandler:
+    """Keep an unusable toolkit fail-closed without breaking registry setup."""
 
     input_schema: dict = {"type": "object", "additionalProperties": True}
     executable = False  # registered so a workflow compiles, but never surfaced/run
 
-    def __init__(self, toolkit_id: str, toolkit_type: str, reason: str | None = None):
+    def __init__(self, toolkit_id: str, toolkit_type: str, reason: str):
         self._toolkit_id = toolkit_id
-        self._reason = reason or _DEFERRED.get(toolkit_type, "unimplemented")
+        self._reason = reason
         self.description = f"[{toolkit_type}] not executable in this slice: {self._reason}"
 
     def is_side_effecting(self, arguments) -> bool:  # never reached — call() always raises

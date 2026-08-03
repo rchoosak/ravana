@@ -164,6 +164,15 @@ def _to_anthropic_messages(messages: list[Any]) -> list[dict[str, Any]]:
             out.append({"role": "assistant", "content": content})
         elif m.role == "tool_result":
             out.append(
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": m.tool_call_id, "content": m.content}]}
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": m.tool_call_id,
+                            "content": m.content_for_model(),
+                        }
+                    ],
+                }
             )
     return out

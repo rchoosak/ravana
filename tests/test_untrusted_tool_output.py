@@ -1,15 +1,9 @@
-"""§8's untrusted tool-output boundary — the requirement, before the fix.
+"""§8's untrusted tool-output boundary.
 
 §8: "The Prompt Assembler must wrap/tag tool output distinctly from
-system/developer instructions." Nothing does, so these are `xfail(strict=True)`:
-they fail today, and the moment a boundary lands they XPASS, which strict mode
-turns into a hard failure. That forces whoever implements it to delete the
-marker rather than leaving a green test that proves nothing.
-
-They deliberately assert the *requirement*, never the current behaviour. A test
-pinning today's unprotected shape would have to be deleted by the fix, and this
-session has already produced two tests that encoded a defect as expected
-behaviour — that pattern is what these are written to avoid.
+system/developer instructions." The provider-neutral ToolResultMessage boundary
+adds a deterministic, payload-derived fence before either adapter serializes a
+tool result, so every provider gets the same protection.
 
 Scope: the tool-RESULT surface, which one envelope at `ToolResultMessage` covers
 for both `api_connector`/`web_search` and `code_interpreter`. Both adapters
@@ -70,9 +64,8 @@ def _assert_enveloped(emitted: str) -> None:
     It DOES insist on framing at both ends. An earlier version asserted only
     `emitted != INJECTION`, i.e. "something changed", which a bare `[web_search]`
     label satisfied — no terminator, forgeable by the payload, zero protection.
-    Under `strict` that XPASSed into a hard failure announcing a boundary that
-    did not exist, which is worse than no test: it would have walked the
-    implementer into deleting the marker.
+    That weak assertion once announced a boundary that did not exist, which is
+    worse than no test because it hides an unframed result behind a green check.
 
     Framing on both sides is the property that actually separates an envelope
     from a label: without a terminator the model cannot tell where untrusted
@@ -93,13 +86,11 @@ def _assert_enveloped(emitted: str) -> None:
     )
 
 
-@pytest.mark.xfail(strict=True, reason="§8 tool-output boundary not implemented — TASKS.md:99")
 def test_anthropic_tool_result_is_marked_as_untrusted():
     payload = _to_anthropic_messages([_tool_result()])
     _assert_enveloped(_anthropic_tool_result_text(payload))
 
 
-@pytest.mark.xfail(strict=True, reason="§8 tool-output boundary not implemented — TASKS.md:99")
 def test_openai_tool_result_is_marked_as_untrusted():
     payload = _to_openai_messages([_tool_result()])
     _assert_enveloped(_openai_tool_result_text(payload))
@@ -108,9 +99,9 @@ def test_openai_tool_result_is_marked_as_untrusted():
 def test_both_adapters_emit_tool_results_on_a_separate_channel():
     """The half that IS already true, pinned so the fix doesn't regress it.
 
-    Not an xfail: both adapters route tool output through a dedicated role
-    rather than folding it into the user/system turn. The envelope above is
-    additive to this, not a replacement for it.
+    Both adapters route tool output through a dedicated role rather than
+    folding it into the user/system turn. The envelope above is additive to
+    this, not a replacement for it.
     """
     anthropic = _to_anthropic_messages([_tool_result()])
     assert any(
@@ -123,9 +114,21 @@ def test_both_adapters_emit_tool_results_on_a_separate_channel():
     assert any(m.get("role") == "tool" for m in openai)
 
 
+def test_boundary_is_deterministic_and_payload_derived():
+    first = _tool_result().content_for_model()
+    assert first == _tool_result().content_for_model()
+
+    changed = ToolResultMessage(
+        tool_call_id="tc1",
+        tool="web_search",
+        content=INJECTION + " changed",
+    ).content_for_model()
+    assert first.splitlines()[0] != changed.splitlines()[0]
+
+
 # --- what must NOT count as a boundary ---------------------------------------
-# `_assert_enveloped` is the contract the strict-xfails above are measured
-# against, so its discrimination has to be tested directly rather than assumed.
+# `_assert_enveloped` is the boundary contract above, so its discrimination has
+# to be tested directly rather than assumed.
 # Its first version accepted the bare-label case below, which under `strict`
 # XPASSed into a hard failure claiming a boundary had landed.
 @pytest.mark.parametrize(

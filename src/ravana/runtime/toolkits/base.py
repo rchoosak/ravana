@@ -75,10 +75,10 @@ class ToolkitHandler(Protocol):
     # later enhancement; for now each handler supplies a sensible default.
     description: str
 
-    # Whether this handler can actually run in the current build. A deferred
-    # toolkit type (currently web_search) is registered so a workflow still
-    # compiles, but it is NOT executable and must not be surfaced to the model
-    # as a callable tool. tools_for refuses to advertise such a handler.
+    # Whether this handler can run under the current install configuration.
+    # Unavailable handlers remain registered so a workflow can compile, but
+    # they must not be surfaced to the model. tools_for refuses to advertise
+    # them as callable tools.
     executable: bool
 
     def is_side_effecting(self, arguments: dict[str, Any]) -> bool:

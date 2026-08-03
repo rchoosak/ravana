@@ -16,7 +16,6 @@ injection without a network round-trip.
 
 from __future__ import annotations
 
-import inspect
 import json
 from typing import Any, Callable
 
@@ -24,9 +23,14 @@ from ravana.runtime.secrets import (
     ResolvedSecret,
     SecretLeakError,
     ensure_secret_free,
-    redact_secrets,
 )
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+from ravana.runtime.toolkits.http_client import LazyAsyncHttpClient
+from ravana.runtime.toolkits.http_errors import (
+    classify_status,
+    raise_for_request_exception,
+    resolve_dispatch_token,
+)
 
 # §8(a): the connector's declared input schema. Result is a plain string
 # (the response body), so there is no separate output schema to declare.
@@ -69,29 +73,13 @@ class ApiConnectorHandler:
         # A provider the runtime injects (§8c): returns an already-resolved
         # token at dispatch. The connector never holds the auth_ref or resolver.
         self._get_auth_token = get_auth_token
-        self._client = client  # injected in tests; real client built lazily
-        self._owns_client = client is None
+        self._http_client = LazyAsyncHttpClient(client, base_url=self._base_url)
 
     def is_side_effecting(self, arguments: dict[str, Any]) -> bool:
         return _method_of(arguments) not in _READ_ONLY_METHODS
 
-    def _resolve_client(self) -> Any:
-        if self._client is None:
-            import httpx
-
-            self._client = httpx.AsyncClient(base_url=self._base_url)
-        return self._client
-
     async def aclose(self) -> None:
-        if not self._owns_client or self._client is None:
-            return
-        client, self._client = self._client, None
-        close = getattr(client, "aclose", None) or getattr(client, "close", None)
-        if close is None:
-            return
-        result = close()
-        if inspect.isawaitable(result):
-            await result
+        await self._http_client.aclose()
 
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str | None = None) -> str:
         # Validate BEFORE resolving the token or building headers, so a
@@ -105,55 +93,27 @@ class ApiConnectorHandler:
         _reject_offbase_path(path)  # §8-security: never let a model-supplied path escape base_url with the token
 
         headers: dict[str, str] = {"Idempotency-Key": idempotency_key}
-        # Re-resolved by the provider at EVERY dispatch (§8c) — no
-        # handler-lifetime cache, so token rotation is picked up per call. The
-        # provider returns a ResolvedSecret (or None); it opens to plaintext
-        # only here, at the HTTP boundary.
-        token: ResolvedSecret | None = None
-        token_value: str | None = None
-        token_error: ToolkitError | None = None
-        try:
-            token = self._get_auth_token()
-            token_value = token.value() if token is not None else None
-        except Exception as exc:  # noqa: BLE001 - credential failure is fatal
-            token_error = ToolkitError(
-                f"api_connector credential resolution failed ({type(exc).__name__})",
-                kind=ToolFailureKind.FATAL,
-            )
-        if token_error is not None:
-            raise token_error
+        # §8c: re-resolved at EVERY dispatch (no handler-lifetime cache, so a
+        # rotated token is picked up per call), opened to plaintext only here at
+        # the HTTP boundary. api_connector allows no-auth — a None token simply
+        # means no Authorization header.
+        token_value = resolve_dispatch_token(self._get_auth_token, context="api_connector")
         if token_value is not None:
             headers["Authorization"] = f"Bearer {token_value}"
         secret_values = (token_value,) if token_value is not None else ()
 
-        client = self._resolve_client()
+        client = self._http_client.get()
         try:
             response = await client.request(
                 method, path, headers=headers, json=arguments.get("json"), params=arguments.get("params")
             )
         except Exception as exc:
-            # Classify what the client raised: an HTTP status error routes by
-            # its status (a 401 via raise_for_status is FATAL, not transient),
-            # a genuine transport failure (connection reset, timeout, DNS) is
-            # §3.6's "tool timeout" — transient. Anything else (a TypeError
-            # from a programming/config bug, say) propagates raw: the engine's
-            # terminal boundary fails the run hard instead of a wrong-type
-            # transient retry re-running broken code.
-            kind = _classify_exception(exc)
-            safe_error = redact_secrets(str(exc), values=secret_values)
-            if kind is None:
-                if safe_error == str(exc):
-                    raise
-                try:
-                    safe_exception = type(exc)(safe_error)
-                except Exception:  # noqa: BLE001
-                    safe_exception = RuntimeError(
-                        f"api_connector request failed ({type(exc).__name__}): {safe_error}"
-                    )
-                raise safe_exception from None
-            raise ToolkitError(
-                f"api_connector request to {path} failed: {safe_error}", kind=kind
-            ) from None
+            # §3.6 classification + secret-safe rethrow, shared with web_search.
+            raise_for_request_exception(
+                exc,
+                secret_values=secret_values,
+                context=f"api_connector request to {path} failed",
+            )
 
         status = getattr(response, "status_code", None)
         try:
@@ -161,51 +121,12 @@ class ApiConnectorHandler:
         except SecretLeakError as exc:
             raise ToolkitError(str(exc), kind=ToolFailureKind.FATAL) from None
         if status is not None and status >= 400:
-            raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}", kind=_classify_status(status))
+            raise ToolkitError(f"api_connector got HTTP {status} from {path}: {body[:500]}", kind=classify_status(status))
         return body
 
 
 def _method_of(arguments: dict[str, Any]) -> str:
     return str(arguments.get("method", "POST")).upper()
-
-
-def _classify_exception(exc: Exception) -> ToolFailureKind | None:
-    """Classify a client-raised exception per §3.6, or None for "not ours —
-    propagate raw" (a programming/config bug the engine should fail hard on).
-
-    httpx.HTTPStatusError is checked FIRST and routed by its response status:
-    an injected/configured client that calls raise_for_status() surfaces a 401
-    as an exception, and blanket-treating the httpx hierarchy as transient
-    would turn that auth failure (§3.6 FATAL) into a backed-off retry. Only
-    httpx.TransportError (timeouts, connection failures) and the builtin
-    OS-level types count as transient."""
-    try:
-        import httpx
-    except ImportError:  # pragma: no cover - httpx is a direct dependency
-        return (
-            ToolFailureKind.TRANSIENT
-            if isinstance(exc, (OSError, TimeoutError))
-            else None
-        )
-    if isinstance(exc, httpx.HTTPStatusError):
-        return _classify_status(exc.response.status_code)
-    if isinstance(exc, (OSError, TimeoutError)):
-        return ToolFailureKind.TRANSIENT
-    if isinstance(exc, httpx.TransportError):
-        return ToolFailureKind.TRANSIENT
-    return None
-
-
-def _classify_status(status: int) -> ToolFailureKind:
-    """§3.6's tool-failure taxonomy by HTTP status: 401/403 is the "tool auth
-    failure" (fatal, fails the run); 5xx/429/408 may recover (transient —
-    engine retries the attempt with backoff); any other 4xx is something the
-    model can adjust to (bad path, validation) — fed back."""
-    if status in (401, 403):
-        return ToolFailureKind.FATAL
-    if status in (408, 429) or status >= 500:
-        return ToolFailureKind.TRANSIENT
-    return ToolFailureKind.MODEL_ADDRESSABLE
 
 
 def _reject_offbase_path(path: str) -> None:

@@ -177,5 +177,11 @@ def _to_openai_messages(messages: list[Any]) -> list[dict[str, Any]]:
                 ]
             out.append(entry)
         elif m.role == "tool_result":
-            out.append({"role": "tool", "tool_call_id": m.tool_call_id, "content": m.content})
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": m.tool_call_id,
+                    "content": m.content_for_model(),
+                }
+            )
     return out
