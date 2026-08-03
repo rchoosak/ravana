@@ -29,6 +29,17 @@ _TAVILY_RESULTS = {
     ]
 }
 
+_STATUS_CASES = [
+    (401, ToolFailureKind.FATAL),        # bad/absent provider key
+    (429, ToolFailureKind.TRANSIENT),    # rate limited — retry with backoff
+    (500, ToolFailureKind.TRANSIENT),
+    (404, ToolFailureKind.FATAL),        # endpoint is fixed, not model-owned
+    (432, ToolFailureKind.FATAL),        # Tavily plan usage limit
+    (433, ToolFailureKind.FATAL),        # Tavily pay-as-you-go limit
+    (400, ToolFailureKind.MODEL_ADDRESSABLE),
+    (422, ToolFailureKind.MODEL_ADDRESSABLE),  # the model can adjust the query
+]
+
 
 class _FakeResponse:
     def __init__(self, status_code=200, payload=None, text=""):
@@ -157,19 +168,25 @@ def test_empty_query_is_refused_before_any_request():
 
 @pytest.mark.parametrize(
     "status,kind",
-    [
-        (401, ToolFailureKind.FATAL),        # bad/absent provider key
-        (429, ToolFailureKind.TRANSIENT),    # rate limited — retry with backoff
-        (500, ToolFailureKind.TRANSIENT),
-        (404, ToolFailureKind.FATAL),        # endpoint is fixed, not model-owned
-        (432, ToolFailureKind.FATAL),        # Tavily plan usage limit
-        (433, ToolFailureKind.FATAL),        # Tavily pay-as-you-go limit
-        (400, ToolFailureKind.MODEL_ADDRESSABLE),
-        (422, ToolFailureKind.MODEL_ADDRESSABLE),  # the model can adjust the query
-    ],
+    _STATUS_CASES,
 )
 def test_http_error_status_routes_per_taxonomy(status, kind):
     handler = _handler(_FakeClient(_FakeResponse(status_code=status, payload={"detail": "x"})))
+    with pytest.raises(ToolkitError) as exc:
+        _call(handler, {"query": "x"})
+    assert exc.value.kind is kind
+
+
+@pytest.mark.parametrize("status,kind", _STATUS_CASES)
+def test_raised_http_status_uses_the_same_tavily_taxonomy(status, kind):
+    import httpx
+
+    request = httpx.Request("POST", "https://api.tavily.com/search")
+    response = httpx.Response(status, request=request)
+    error = httpx.HTTPStatusError(
+        f"HTTP {status}", request=request, response=response
+    )
+    handler = _handler(_FakeClient(raises=error))
     with pytest.raises(ToolkitError) as exc:
         _call(handler, {"query": "x"})
     assert exc.value.kind is kind
@@ -213,6 +230,21 @@ def test_provider_echoing_the_key_back_is_a_fatal_leak_not_a_result(leaky_payloa
     # in its response must fail closed, not surface it in the transcript —
     # wherever in the payload it appears, whole-field or embedded.
     handler = _handler(_FakeClient(_FakeResponse(payload=leaky_payload)))
+    with pytest.raises(ToolkitError) as exc:
+        _call(handler, {"query": "x"})
+    assert exc.value.kind is ToolFailureKind.FATAL
+    assert "tavily-key-XYZ" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "status,text",
+    [
+        (400, "bad request echoed tavily-key-XYZ"),
+        (200, "not json but echoed tavily-key-XYZ"),
+    ],
+)
+def test_every_raw_provider_body_crosses_the_secret_gate(status, text):
+    handler = _handler(_FakeClient(_FakeResponse(status_code=status, text=text)))
     with pytest.raises(ToolkitError) as exc:
         _call(handler, {"query": "x"})
     assert exc.value.kind is ToolFailureKind.FATAL

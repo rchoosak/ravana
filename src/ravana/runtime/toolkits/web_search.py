@@ -15,7 +15,6 @@ secret-output gate so the provider cannot echo its API key into the transcript.
 
 from __future__ import annotations
 
-import inspect
 import json
 from typing import Any, Callable
 
@@ -23,9 +22,9 @@ from ravana.runtime.secrets import (
     ResolvedSecret,
     SecretLeakError,
     ensure_secret_free,
-    redact_secrets,
 )
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+from ravana.runtime.toolkits.http_client import LazyAsyncHttpClient
 from ravana.runtime.toolkits.http_errors import (
     classify_status,
     raise_for_request_exception,
@@ -76,8 +75,7 @@ class WebSearchHandler:
             )
         self._provider = provider
         self._get_auth_token = get_auth_token
-        self._client = client
-        self._owns_client = client is None
+        self._http_client = LazyAsyncHttpClient(client)
         self.description = (
             f"Search the web via {provider}. Provide a 'query' string and an optional "
             "'max_results' (1-20). Returns a list of result titles, URLs, and snippets."
@@ -88,23 +86,8 @@ class WebSearchHandler:
         # rather than replaying a cached response (§3.6 scopes dedup to effects).
         return False
 
-    def _resolve_client(self) -> Any:
-        if self._client is None:
-            import httpx
-
-            self._client = httpx.AsyncClient()
-        return self._client
-
     async def aclose(self) -> None:
-        if not self._owns_client or self._client is None:
-            return
-        client, self._client = self._client, None
-        close = getattr(client, "aclose", None) or getattr(client, "close", None)
-        if close is None:
-            return
-        result = close()
-        if inspect.isawaitable(result):
-            await result
+        await self._http_client.aclose()
 
     async def call(
         self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str | None = None
@@ -133,7 +116,7 @@ class WebSearchHandler:
 
         headers = {"Authorization": f"Bearer {api_key}"}
         body = {"query": query, "max_results": max_results}
-        client = self._resolve_client()
+        client = self._http_client.get()
         try:
             async with client.stream(
                 "POST",
@@ -151,18 +134,23 @@ class WebSearchHandler:
         except Exception as exc:
             # §3.6 classification + secret-safe rethrow, shared with api_connector.
             raise_for_request_exception(
-                exc, secret_values=secret_values, context="web_search request failed"
+                exc,
+                secret_values=secret_values,
+                context="web_search request failed",
+                status_classifier=_classify_tavily_status,
             )
 
+        response_text = _checked_response_text(
+            raw_body,
+            secret_values=secret_values,
+        )
         if not isinstance(status, int):
             raise ToolkitError(
                 "web_search: provider response had no integer HTTP status",
                 kind=ToolFailureKind.FATAL,
             )
         if status >= 400:
-            detail = redact_secrets(
-                raw_body.decode("utf-8", errors="replace"), values=secret_values
-            )[:500]
+            detail = response_text[:500]
             if truncated:
                 detail += f" {_TRUNCATION_MARKER}"
             raise ToolkitError(
@@ -191,6 +179,21 @@ async def _read_limited(response: Any, limit: int) -> tuple[bytes, bool]:
         if len(body) > limit:
             return bytes(body[:limit]), True
     return bytes(body), False
+
+
+def _checked_response_text(
+    raw_body: bytes, *, secret_values: tuple[str, ...]
+) -> str:
+    text = raw_body.decode("utf-8", errors="replace")
+    try:
+        ensure_secret_free(
+            text,
+            context="web_search response",
+            values=secret_values,
+        )
+    except SecretLeakError as exc:
+        raise ToolkitError(str(exc), kind=ToolFailureKind.FATAL) from None
+    return text
 
 
 def _classify_tavily_status(status: int) -> ToolFailureKind:

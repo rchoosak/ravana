@@ -30,7 +30,11 @@ def classify_status(status: int) -> ToolFailureKind:
     return ToolFailureKind.MODEL_ADDRESSABLE
 
 
-def classify_exception(exc: Exception) -> ToolFailureKind | None:
+def classify_exception(
+    exc: Exception,
+    *,
+    status_classifier: Callable[[int], ToolFailureKind] = classify_status,
+) -> ToolFailureKind | None:
     """Classify a client-raised exception per §3.6, or None for "not ours —
     propagate raw" (a programming/config bug the engine should fail hard on).
 
@@ -45,7 +49,7 @@ def classify_exception(exc: Exception) -> ToolFailureKind | None:
     except ImportError:  # pragma: no cover - httpx is a direct dependency
         return ToolFailureKind.TRANSIENT if isinstance(exc, (OSError, TimeoutError)) else None
     if isinstance(exc, httpx.HTTPStatusError):
-        return classify_status(exc.response.status_code)
+        return status_classifier(exc.response.status_code)
     if isinstance(exc, (OSError, TimeoutError)):
         return ToolFailureKind.TRANSIENT
     if isinstance(exc, httpx.TransportError):
@@ -71,7 +75,11 @@ def redacted_exception_for_rethrow(
 
 
 def raise_for_request_exception(
-    exc: Exception, *, secret_values: tuple[str, ...], context: str
+    exc: Exception,
+    *,
+    secret_values: tuple[str, ...],
+    context: str,
+    status_classifier: Callable[[int], ToolFailureKind] = classify_status,
 ) -> NoReturn:
     """Classify a client-raised request exception per §3.6 and raise.
 
@@ -84,14 +92,14 @@ def raise_for_request_exception(
     Extracted because `api_connector` and `web_search` ran this exact block; a
     second copy is a second place the classify/redact decision could drift.
     """
-    kind = classify_exception(exc)
+    kind = classify_exception(exc, status_classifier=status_classifier)
     safe_error = redact_secrets(str(exc), values=secret_values)
     if kind is None:
         replacement = redacted_exception_for_rethrow(
             exc, safe_message=safe_error, context=context
         )
         if replacement is None:
-            raise exc
+            raise
         raise replacement from None
     raise ToolkitError(f"{context}: {safe_error}", kind=kind) from None
 

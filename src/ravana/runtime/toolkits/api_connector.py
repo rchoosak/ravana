@@ -16,7 +16,6 @@ injection without a network round-trip.
 
 from __future__ import annotations
 
-import inspect
 import json
 from typing import Any, Callable
 
@@ -26,6 +25,7 @@ from ravana.runtime.secrets import (
     ensure_secret_free,
 )
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
+from ravana.runtime.toolkits.http_client import LazyAsyncHttpClient
 from ravana.runtime.toolkits.http_errors import (
     classify_status,
     raise_for_request_exception,
@@ -73,29 +73,13 @@ class ApiConnectorHandler:
         # A provider the runtime injects (§8c): returns an already-resolved
         # token at dispatch. The connector never holds the auth_ref or resolver.
         self._get_auth_token = get_auth_token
-        self._client = client  # injected in tests; real client built lazily
-        self._owns_client = client is None
+        self._http_client = LazyAsyncHttpClient(client, base_url=self._base_url)
 
     def is_side_effecting(self, arguments: dict[str, Any]) -> bool:
         return _method_of(arguments) not in _READ_ONLY_METHODS
 
-    def _resolve_client(self) -> Any:
-        if self._client is None:
-            import httpx
-
-            self._client = httpx.AsyncClient(base_url=self._base_url)
-        return self._client
-
     async def aclose(self) -> None:
-        if not self._owns_client or self._client is None:
-            return
-        client, self._client = self._client, None
-        close = getattr(client, "aclose", None) or getattr(client, "close", None)
-        if close is None:
-            return
-        result = close()
-        if inspect.isawaitable(result):
-            await result
+        await self._http_client.aclose()
 
     async def call(self, *, arguments: dict[str, Any], idempotency_key: str, run_id: str | None = None) -> str:
         # Validate BEFORE resolving the token or building headers, so a
@@ -118,7 +102,7 @@ class ApiConnectorHandler:
             headers["Authorization"] = f"Bearer {token_value}"
         secret_values = (token_value,) if token_value is not None else ()
 
-        client = self._resolve_client()
+        client = self._http_client.get()
         try:
             response = await client.request(
                 method, path, headers=headers, json=arguments.get("json"), params=arguments.get("params")

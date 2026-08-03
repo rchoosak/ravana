@@ -7,6 +7,7 @@ and secret resolution.
 from __future__ import annotations
 
 import asyncio
+import traceback
 
 import pytest
 
@@ -318,9 +319,25 @@ def test_api_connector_closes_the_client_it_constructs(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", Client)
     handler = ApiConnectorHandler({"base_url": "https://api.test"})
-    handler._resolve_client()
+    handler._http_client.get()
     asyncio.run(handler.aclose())
     assert made and made[0].closed
+
+
+def test_api_connector_does_not_close_an_injected_client():
+    from ravana.runtime.toolkits.api_connector import ApiConnectorHandler
+
+    class Client:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    client = Client()
+    handler = ApiConnectorHandler({"base_url": "https://api.test"}, client=client)
+    asyncio.run(handler.aclose())
+    assert client.closed is False
 
 
 def test_api_connector_shapes_request_with_auth_and_idempotency_header(graph):
@@ -475,10 +492,14 @@ def test_api_connector_programming_bug_propagates_raw_not_transient(graph):
         async def request(self, *args, **kwargs):
             raise TypeError("request() got an unexpected keyword argument")
 
-    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    resolver = EnvSecretResolver(
+        {"RAVANA_SECRET_GITHUB_PAT": "api-credential-12345"}
+    )
     handlers = build_registry(graph, resolver, clients={"git_connector": BuggyClient()})
-    with pytest.raises(TypeError):  # NOT ToolkitError — no wrong-type transient retry
+    with pytest.raises(TypeError) as exc_info:  # NOT ToolkitError — no transient retry
         asyncio.run(handlers["git_connector"].call(arguments={"path": "/x"}, idempotency_key="k"))
+    frames = [frame.name for frame in traceback.extract_tb(exc_info.value.__traceback__)]
+    assert "raise_for_request_exception" not in frames
 
 
 @pytest.mark.parametrize(
