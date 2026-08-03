@@ -1,60 +1,82 @@
-"""Live-API smoke tests (§3.4) — OPT-IN, real network, real credentials.
+"""Opt-in live-provider smoke tests for the structured-output contract (§3.4).
 
-Everything else in this suite runs offline against fake adapters. Nothing here
-has ever hit a real provider, which is the single largest untested assumption
-in Phase 0b: the adapters are wired to the real Anthropic/OpenAI SDKs but the
-round-trip — does the provider actually honour a forced `submit_result` tool
-and return parseable structured output — is unverified.
-
-These fill that gap, but they are **skipped unless you opt in**, so the normal
-`uv run pytest` stays offline, free, and fast:
+The offline tests in this module always run. They prove that the real adapter
+capabilities drive the gateway to the expected request shape without touching
+the network. The live tests additionally execute a minimal compiled workflow
+through the engine and LLMGateway, and are skipped unless explicitly enabled:
 
     RAVANA_LIVE_SMOKE=1 ANTHROPIC_API_KEY=sk-... uv run pytest tests/test_live_smoke.py
+    RAVANA_LIVE_SMOKE=1 OPENAI_API_KEY=sk-... uv run pytest tests/test_live_smoke.py
 
-Each provider is independently gated on its own key, so you can run just the
-one you have. Models default to the cheapest tier and are env-overridable
-(RAVANA_LIVE_ANTHROPIC_MODEL, RAVANA_LIVE_OPENAI_MODEL). For an
-OpenAI-compatible LOCAL endpoint (Ollama/vLLM), set RAVANA_LIVE_OPENAI_ENDPOINT.
+For a guided-decoding smoke test against a local Ollama/vLLM endpoint, both
+the endpoint and its model name are required:
 
-They cost a few tokens per run and send a trivial prompt ("reply with the word
-ping") to the provider — no repo content leaves the machine.
+    RAVANA_LIVE_SMOKE=1 \
+      RAVANA_LIVE_OPENAI_ENDPOINT=http://localhost:11434/v1 \
+      RAVANA_LIVE_OPENAI_MODEL=qwen2.5-coder:7b \
+      uv run pytest tests/test_live_smoke.py
+
+Each live run sends only an instruction to return {"answer": "ping"}; no
+repository content leaves the machine. Adapters are closed even when a live
+assertion fails.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 
 import pytest
 
+from ravana.compiler.graph import CompiledGraph, compile_workflow
+from ravana.compiler.persist import get_or_create_workflow
+from ravana.engine.loop import start_run
+from ravana.runtime.gateway import SUBMIT_RESULT, LLMGateway
 from ravana.runtime.providers.anthropic_adapter import AnthropicAdapter
 from ravana.runtime.providers.base import (
     Capability,
+    NormalizedToolCall,
+    ProviderAdapter,
     ProviderRequest,
+    ProviderResponse,
     ProviderTarget,
-    Tool,
-    UserMessage,
 )
 from ravana.runtime.providers.openai_adapter import OpenAICompatibleAdapter
+from ravana.schema.models import WorkflowDoc
+from ravana.schema.util import loads
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("RAVANA_LIVE_SMOKE") != "1",
-    reason="live-API smoke test; set RAVANA_LIVE_SMOKE=1 (+ a provider key) to run",
-)
-
-# The minimal structured-output contract: one required string field, submitted
-# through the forced `submit_result` tool — the same shape the gateway forces.
 _SUBMIT_SCHEMA = {
     "type": "object",
-    "properties": {"answer": {"type": "string"}},
+    "properties": {"answer": {"type": "string", "enum": ["ping"]}},
     "required": ["answer"],
     "additionalProperties": False,
 }
-_SUBMIT_TOOL = Tool(
-    name="submit_result",
-    description="Submit your final answer.",
-    input_schema=_SUBMIT_SCHEMA,
+
+_LIVE = pytest.mark.skipif(
+    os.environ.get("RAVANA_LIVE_SMOKE") != "1",
+    reason="live-API smoke test; set RAVANA_LIVE_SMOKE=1 to run",
 )
-_PROMPT = "Reply by calling submit_result with answer set to the single word: ping"
+
+
+class _RecordingAdapter:
+    """Use a real adapter's capabilities while returning an offline response."""
+
+    def __init__(self, delegate: ProviderAdapter, response: ProviderResponse):
+        self.name = delegate.name
+        self._delegate = delegate
+        self._response = response
+        self.requests: list[ProviderRequest] = []
+
+    def capabilities(self, target: ProviderTarget) -> set[Capability]:
+        return self._delegate.capabilities(target)
+
+    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+        self.requests.append(request)
+        return self._response
+
+    async def aclose(self) -> None:
+        await self._delegate.aclose()
 
 
 def _require(env: str) -> str:
@@ -64,55 +86,187 @@ def _require(env: str) -> str:
     return value
 
 
-async def test_anthropic_native_structured_output_round_trip():
-    """Anthropic's expected mechanism is native forced tool-calling (§3.4). Prove
-    the live model actually returns a submit_result call with the schema's field
-    — not that our fake said it would."""
+def _smoke_graph(*, provider: str, model: str, endpoint: str | None = None) -> CompiledGraph:
+    llm: dict[str, object] = {
+        "provider": provider,
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 64,
+    }
+    if endpoint is not None:
+        llm["endpoint"] = endpoint
+
+    return compile_workflow(
+        WorkflowDoc.model_validate(
+            {
+                "apiVersion": "ravana/v1",
+                "kind": "Workflow",
+                "metadata": {"name": f"live-smoke-{provider}", "version": 1},
+                "spec": {
+                    "agents": [
+                        {
+                            "id": "smoke",
+                            "name": "Live smoke",
+                            "llm": llm,
+                            "system_prompt": (
+                                "Return exactly one object whose answer field is the single word ping. "
+                                "Do not add any other fields."
+                            ),
+                            "output_schema": _SUBMIT_SCHEMA,
+                        }
+                    ],
+                    "graph": {
+                        "entry": "only",
+                        "nodes": [{"id": "only", "agent": "smoke"}],
+                        "edges": [],
+                        # Force native providers to submit on their first and only
+                        # turn, and fail a malformed live response without billing
+                        # a repair call. Guided providers remain one-shot too.
+                        "guards": {"max_tool_calls_per_turn": 0, "max_output_repairs": 0},
+                    },
+                },
+            }
+        )
+    )
+
+
+async def _run_gateway_turn(graph: CompiledGraph, adapter: ProviderAdapter):
+    gateway = LLMGateway(graph, {adapter.name: adapter})
+    try:
+        result = await gateway.run_turn(
+            run_id="offline-smoke",
+            node_id="only",
+            attempt=1,
+            logical_visit_id="visit-1",
+            agent_id="smoke",
+            shared_state={},
+        )
+        return result
+    finally:
+        await gateway.aclose()
+
+
+async def _run_live_workflow(
+    con: sqlite3.Connection,
+    graph: CompiledGraph,
+    adapter: ProviderAdapter,
+) -> None:
+    workflow_id = get_or_create_workflow(con, graph, org_id="live-smoke", created_by="pytest")
+    gateway = LLMGateway(graph, {adapter.name: adapter})
+    try:
+        run_id = await start_run(
+            con,
+            graph,
+            gateway,
+            org_id="live-smoke",
+            workflow_id=workflow_id,
+            triggered_by="pytest-live-smoke",
+            input_payload={},
+        )
+    finally:
+        await gateway.aclose()
+
+    run = con.execute("SELECT status, shared_state FROM run WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "COMPLETED"
+    assert loads(run["shared_state"]) == {"answer": "ping"}
+
+    execution = con.execute(
+        "SELECT input_tokens, output_tokens FROM node_execution WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    assert execution["input_tokens"] > 0
+    assert execution["output_tokens"] > 0
+
+
+def test_adapter_capabilities_are_asserted_offline():
+    anthropic = AnthropicAdapter()
+    hosted_openai = OpenAICompatibleAdapter(name="openai")
+    local_openai = OpenAICompatibleAdapter(name="local", guided_decoding=True)
+
+    assert anthropic.capabilities(
+        ProviderTarget(provider="anthropic", model="test-model")
+    ) == {Capability.NATIVE_STRUCTURED_OUTPUT}
+    assert hosted_openai.capabilities(
+        ProviderTarget(provider="openai", model="test-model")
+    ) == {Capability.NATIVE_STRUCTURED_OUTPUT}
+    assert local_openai.capabilities(
+        ProviderTarget(provider="local", model="test-model", endpoint="http://localhost/v1")
+    ) == {Capability.NATIVE_STRUCTURED_OUTPUT, Capability.GUIDED_DECODING}
+
+
+async def test_anthropic_native_request_shape_is_selected_offline():
+    graph = _smoke_graph(provider="anthropic", model="test-model")
+    response = ProviderResponse(
+        text=None,
+        tool_calls=[
+            NormalizedToolCall(
+                id="submit-1",
+                tool=SUBMIT_RESULT,
+                arguments={"answer": "ping"},
+            )
+        ],
+        input_tokens=1,
+        output_tokens=1,
+    )
+    adapter = _RecordingAdapter(AnthropicAdapter(), response)
+
+    result = await _run_gateway_turn(graph, adapter)
+
+    assert result.structured_payload == {"answer": "ping"}
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert request.output_schema is None
+    assert [tool.name for tool in request.tools] == [SUBMIT_RESULT]
+    assert request.force_tool == SUBMIT_RESULT
+
+
+async def test_local_guided_request_shape_is_selected_offline():
+    endpoint = "http://localhost:11434/v1"
+    graph = _smoke_graph(provider="local", model="test-model", endpoint=endpoint)
+    response = ProviderResponse(
+        text=json.dumps({"answer": "ping"}),
+        input_tokens=1,
+        output_tokens=1,
+    )
+    adapter = _RecordingAdapter(
+        OpenAICompatibleAdapter(name="local", guided_decoding=True),
+        response,
+    )
+
+    result = await _run_gateway_turn(graph, adapter)
+
+    assert result.structured_payload == {"answer": "ping"}
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert request.endpoint == endpoint
+    assert request.output_schema == _SUBMIT_SCHEMA
+    assert request.tools == []
+    assert request.force_tool is None
+
+
+@_LIVE
+async def test_anthropic_native_gateway_round_trip(con: sqlite3.Connection):
     _require("ANTHROPIC_API_KEY")
     model = os.environ.get("RAVANA_LIVE_ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-    adapter = AnthropicAdapter()
+    graph = _smoke_graph(provider="anthropic", model=model)
 
-    caps = adapter.capabilities(ProviderTarget(provider="anthropic", model=model))
-    assert Capability.NATIVE_STRUCTURED_OUTPUT in caps  # the strategy the gateway will pick
-
-    response = await adapter.complete(
-        ProviderRequest(
-            model=model,
-            system="You are a test harness. Follow the instruction exactly.",
-            messages=[UserMessage(text=_PROMPT)],
-            tools=[_SUBMIT_TOOL],
-            force_tool="submit_result",
-            max_tokens=64,
-        )
-    )
-    calls = [c for c in response.tool_calls if c.tool == "submit_result"]
-    assert calls, f"provider returned no submit_result call: {response!r}"
-    assert isinstance(calls[0].arguments.get("answer"), str)
-    assert response.input_tokens > 0 and response.output_tokens > 0  # usage is real
+    await _run_live_workflow(con, graph, AnthropicAdapter())
 
 
-async def test_openai_compatible_structured_output_round_trip():
-    """OpenAI-compatible endpoint (hosted OpenAI, or a local Ollama/vLLM via
-    RAVANA_LIVE_OPENAI_ENDPOINT). Exercises whichever mechanism its capabilities
-    advertise, through a forced submit_result."""
-    endpoint = os.environ.get("RAVANA_LIVE_OPENAI_ENDPOINT")
-    if endpoint is None:
-        _require("OPENAI_API_KEY")  # hosted OpenAI
+@_LIVE
+async def test_openai_hosted_native_gateway_round_trip(con: sqlite3.Connection):
+    _require("OPENAI_API_KEY")
     model = os.environ.get("RAVANA_LIVE_OPENAI_MODEL", "gpt-4o-mini")
-    adapter = OpenAICompatibleAdapter(name="openai")
+    graph = _smoke_graph(provider="openai", model=model)
 
-    response = await adapter.complete(
-        ProviderRequest(
-            model=model,
-            system="You are a test harness. Follow the instruction exactly.",
-            messages=[UserMessage(text=_PROMPT)],
-            tools=[_SUBMIT_TOOL],
-            force_tool="submit_result",
-            output_schema=_SUBMIT_SCHEMA,
-            endpoint=endpoint,
-            max_tokens=64,
-        )
-    )
-    calls = [c for c in response.tool_calls if c.tool == "submit_result"]
-    assert calls, f"provider returned no submit_result call: {response!r}"
-    assert isinstance(calls[0].arguments.get("answer"), str)
+    await _run_live_workflow(con, graph, OpenAICompatibleAdapter(name="openai"))
+
+
+@_LIVE
+async def test_openai_compatible_local_guided_gateway_round_trip(con: sqlite3.Connection):
+    endpoint = _require("RAVANA_LIVE_OPENAI_ENDPOINT")
+    model = _require("RAVANA_LIVE_OPENAI_MODEL")
+    graph = _smoke_graph(provider="local", model=model, endpoint=endpoint)
+    adapter = OpenAICompatibleAdapter(name="local", guided_decoding=True)
+
+    await _run_live_workflow(con, graph, adapter)
