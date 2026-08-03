@@ -83,8 +83,15 @@ def _attributed_description(toolkit_id: str, description: str) -> str:
     description can't be fenced like output (its job is to instruct the model
     about the tool), so it is TAGGED with where it came from instead. Defence in
     depth over the admin allow-list and pin-time capture, not a hard boundary.
+
+    Idempotence is required at the advertisement boundary: snapshots created by
+    this version already contain the tag, while snapshots from a paused run
+    created before the §8 fix still contain the raw description.
     """
-    return _DESCRIPTION_ATTRIBUTION.format(toolkit_id=toolkit_id) + description
+    attribution = _DESCRIPTION_ATTRIBUTION.format(toolkit_id=toolkit_id)
+    if description.startswith(attribution):
+        return description
+    return attribution + description
 
 
 @dataclass(frozen=True)
@@ -326,7 +333,10 @@ class McpServerHandler:
         return [
             Tool(
                 name=qualified_tool_name(self._toolkit_id, name),
-                description=spec.description,
+                # Apply attribution where the pinned description crosses into
+                # the model-facing tool definition. This also upgrades raw
+                # snapshots restored from runs paused before the §8 fix.
+                description=_attributed_description(self._toolkit_id, spec.description),
                 input_schema=spec.input_schema,
             )
             for name, spec in sorted(self._pinned_by_run.get(run_id, {}).items())
