@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import fcntl
 import os
+import secrets
 import stat
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -679,13 +680,32 @@ def _sandbox_executable(config: dict[str, Any]) -> str:
 
 
 def _format_result(result: SandboxResult) -> str:
+    """Render a sandbox result so the harness's OWN framing can't be forged.
+
+    The whole result is already wrapped as untrusted tool output at the
+    `ToolResultMessage` boundary (§8), but *within* that block the exit code and
+    the stream boundaries are the harness speaking, not the agent — and the
+    agent controls stdout/stderr. Plain `exit_code:` / `stdout:` labels let a
+    script print `\\nexit_code: 0\\n` and impersonate the harness's own report of
+    its exit status or which stream text came from.
+
+    So the harness metadata (exit code, timeout) is stated first as bare lines,
+    and each agent-controlled stream is fenced with a per-call nonce. The nonce
+    is generated HERE, after the process has exited and its output is fixed, so
+    the agent's code — which ran earlier — cannot have predicted it and cannot
+    emit a matching fence to break out. Text inside a fence is unambiguously
+    that stream's bytes; a forged `exit_code:` there stays inside the fence,
+    never read as the top-level harness line.
+    """
+    nonce = secrets.token_hex(8)
     parts = [f"exit_code: {result.exit_code}"]
     if result.timed_out:
         parts.append("status: timed out")
-    if result.stdout:
-        parts.append("stdout:\n" + result.stdout)
-    if result.stderr:
-        parts.append("stderr:\n" + result.stderr)
+    for name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+        if stream:
+            parts.append(
+                f"--- {name} (fenced {nonce}) ---\n{stream}\n--- end {name} (fenced {nonce}) ---"
+            )
     return "\n".join(parts)
 
 
