@@ -59,8 +59,27 @@ class ToolkitConfig(BaseModel):
     type: ToolkitType
     config: dict[str, Any] = Field(default_factory=dict)
     auth_ref: str | None = None
+    # §1.2: an optional author-written line describing what this tool does and
+    # when to use it, surfaced to the model in place of the handler's generic
+    # default (e.g. "Charge a card via Stripe" over "Make an HTTP request").
+    # Omitted (None) keeps the handler default; the compiler rejects it on a
+    # `mcp_server` toolkit, whose per-tool descriptions come from the server.
+    description: str | None = None
 
     _pointer = field_validator("auth_ref")(_require_secret_pointer)
+
+    @field_validator("description")
+    @classmethod
+    def _description_not_blank(cls, value: str | None) -> str | None:
+        # An explicit description must carry text — a blank one is an authoring
+        # mistake, not "use the default" (that is expressed by omitting it).
+        # Stored stripped so trailing YAML whitespace never reaches the model.
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("toolkit description, when set, must not be blank")
+        return stripped
 
 
 class SkillConfig(BaseModel):

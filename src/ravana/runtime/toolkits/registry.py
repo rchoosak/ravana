@@ -118,6 +118,15 @@ def build_registry(
                 toolkit.type,
                 reason=f"unknown toolkit type '{toolkit.type}'",
             )
+
+        # §1.2: a workflow author may override the toolkit's model-facing
+        # description. Applied once here, the single point where the config and
+        # the constructed handler meet, so `tools_for` surfaces it unchanged.
+        # Never reached for `mcp_server` (the compiler rejects an author
+        # description there) and skipped for a non-executable handler, whose
+        # description is a "not available" diagnostic, not a tool blurb.
+        if toolkit.description is not None and getattr(handlers[toolkit_id], "executable", True):
+            handlers[toolkit_id].description = toolkit.description
     return handlers
 
 

@@ -115,6 +115,71 @@ def test_unknown_dod_evaluated_by_is_rejected_at_compile(sdlc_graph):
         compile_workflow(WorkflowDoc.model_validate(raw))
 
 
+def test_author_description_on_mcp_server_is_rejected_at_compile():
+    # §1.2/§8: an mcp_server surfaces many tools, each carrying the SERVER's own
+    # provenance-tagged description — a single author line has no tool to land
+    # on, so it is rejected rather than silently dropped (the author would
+    # otherwise never learn their description had no effect).
+    raw = _load_raw()
+    tk = next(t for t in raw["spec"]["toolkits"] if t["id"] == "github_mcp")
+    tk["description"] = "Talk to GitHub."
+    with pytest.raises(CompileError, match="mcp_server.*may not set a description"):
+        compile_workflow(WorkflowDoc.model_validate(raw))
+
+
+def test_blank_toolkit_description_is_an_authoring_error():
+    # A description that is set but empty/whitespace is a mistake, not a request
+    # to use the default — that is expressed by omitting the field entirely.
+    from ravana.schema.models import ToolkitConfig
+
+    with pytest.raises(Exception, match="must not be blank"):
+        ToolkitConfig(id="t", type="api_connector", description="   ")
+
+
+def test_toolkit_description_is_stripped_and_omission_is_none():
+    from ravana.schema.models import ToolkitConfig
+
+    assert ToolkitConfig(id="t", type="api_connector", description="  hi  ").description == "hi"
+    assert ToolkitConfig(id="t", type="api_connector").description is None
+
+
+def test_author_toolkit_description_is_persisted(con):
+    raw = _load_raw()
+    tk = next(t for t in raw["spec"]["toolkits"] if t["id"] == "git_connector")
+    tk["description"] = "Query the GitHub REST API."
+    graph = compile_workflow(WorkflowDoc.model_validate(raw))
+
+    get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    rows = {r["name"]: r["description"] for r in con.execute("SELECT name, description FROM toolkit")}
+    assert rows["git_connector"] == "Query the GitHub REST API."
+    # A toolkit that set no description persists NULL, not "" — the audit record
+    # must not fabricate a description the author never wrote.
+    assert rows["web_search"] is None
+
+
+def test_init_db_adds_toolkit_description_column(tmp_path):
+    db_path = tmp_path / "legacy_toolkit.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE toolkit (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            config TEXT NOT NULL,
+            auth_ref TEXT
+        );
+        """
+    )
+    legacy.close()
+
+    migrated = init_db(db_path)
+    columns = {row[1] for row in migrated.execute("PRAGMA table_info(toolkit)")}
+    migrated.close()
+    assert "description" in columns
+
+
 def test_init_db_adds_execution_contract_columns_to_existing_sqlite(tmp_path):
     db_path = tmp_path / "legacy.db"
     legacy = sqlite3.connect(db_path)

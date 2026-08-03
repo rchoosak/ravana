@@ -293,6 +293,53 @@ def test_tools_for_raises_on_unregistered_toolkit(graph):
         executor.tools_for(["does_not_exist"])
 
 
+# --- Author-provided descriptions (§1.2) ------------------------------------
+_AUTHOR_DESC = "Query the GitHub REST API for repo, pull-request, and issue data."
+
+
+def _graph_with_toolkit_description(toolkit_id: str, description: str):
+    import yaml
+
+    from ravana.schema.models import WorkflowDoc
+
+    with open(SDLC_WORKFLOW) as f:
+        raw = yaml.safe_load(f)
+    for toolkit in raw["spec"]["toolkits"]:
+        if toolkit["id"] == toolkit_id:
+            toolkit["description"] = description
+    return compile_workflow(WorkflowDoc.model_validate(raw))
+
+
+def _surfaced_description(graph, toolkit_id: str) -> str:
+    resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})
+    handlers = build_registry(graph, resolver, clients={toolkit_id: FakeHttpClient()})
+    specs = RavanaToolExecutor(None, handlers).tools_for([toolkit_id])
+    return {t.name: t for t in specs}[toolkit_id].description
+
+
+def test_author_description_overrides_the_handler_default_at_the_model_surface():
+    # §1.2: an author's description replaces the handler's generic default on the
+    # tool the model actually sees. Exercised through tools_for — the seam the
+    # gateway hands the adapters — not the handler attribute in isolation.
+    graph = _graph_with_toolkit_description("git_connector", _AUTHOR_DESC)
+    surfaced = _surfaced_description(graph, "git_connector")
+    assert surfaced == _AUTHOR_DESC
+    # Attack the near-miss: the default must be GONE, not merely joined by the
+    # override. A registry that dropped the author field would still surface
+    # "Make an HTTP request ..." and would satisfy a weaker "author text is
+    # present somewhere" assertion.
+    assert "Make an HTTP request" not in surfaced
+
+
+def test_toolkit_without_author_description_keeps_the_handler_default(graph):
+    # The fallback path: omitting the field leaves the handler's own description
+    # intact, so the override is genuinely opt-in and this feature didn't
+    # silently blank out every default.
+    surfaced = _surfaced_description(graph, "git_connector")
+    assert "Make an HTTP request" in surfaced
+    assert surfaced != _AUTHOR_DESC
+
+
 def test_api_connector_declares_input_schema(graph):
     # §8(a): every connector declares an input JSON schema.
     resolver = EnvSecretResolver({"RAVANA_SECRET_GITHUB_PAT": "x"})

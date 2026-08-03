@@ -272,7 +272,8 @@ CREATE TABLE toolkit (
     name            TEXT NOT NULL,
     type            TEXT NOT NULL,               -- web_search | code_interpreter | db | api_connector | mcp_server (§1.7)
     config          JSONB NOT NULL,               -- provider-specific config
-    auth_ref        TEXT                          -- pointer into secrets manager, never raw secrets
+    auth_ref        TEXT,                         -- pointer into secrets manager, never raw secrets
+    description     TEXT                          -- optional author override of the model-facing tool description (§1.2); NULL = handler default. Not valid on mcp_server (its per-tool text comes from the server, §8)
 );
 
 -- Reusable procedural knowledge (instructions/best-practices/templates) an
@@ -672,6 +673,9 @@ spec:
       type: api_connector
       config: { base_url: https://api.github.com }
       auth_ref: secrets://github_pat   # top-level, not inside config — matches toolkit.auth_ref in §2.2
+      # Optional author override (§1.2) of the model-facing tool description.
+      # Omit it to keep the handler's generic default; not valid on mcp_server.
+      description: Query the GitHub REST API for repository, pull-request, and issue data.
 
     - id: test_runner
       type: code_interpreter

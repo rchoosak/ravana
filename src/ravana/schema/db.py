@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS toolkit (
     name            TEXT NOT NULL,
     type            TEXT NOT NULL,
     config          TEXT NOT NULL,
-    auth_ref        TEXT
+    auth_ref        TEXT,
+    description     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS skill (
@@ -271,6 +272,9 @@ _ADDITIVE_MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "mcp_tool_snapshot": {
         "created_at": "TEXT NOT NULL DEFAULT ''",
+    },
+    "toolkit": {
+        "description": "TEXT",
     },
 }
 

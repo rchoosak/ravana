@@ -53,8 +53,11 @@ def persist_workflow(con: sqlite3.Connection, graph: CompiledGraph, org_id: str,
         toolkit_db_id = new_id()
         toolkit_db_ids[toolkit.id] = toolkit_db_id
         con.execute(
-            "INSERT INTO toolkit (id, org_id, name, type, config, auth_ref) VALUES (?,?,?,?,?,?)",
-            (toolkit_db_id, org_id, toolkit.id, toolkit.type, dumps(toolkit.config), toolkit.auth_ref),
+            "INSERT INTO toolkit (id, org_id, name, type, config, auth_ref, description) VALUES (?,?,?,?,?,?,?)",
+            (
+                toolkit_db_id, org_id, toolkit.id, toolkit.type,
+                dumps(toolkit.config), toolkit.auth_ref, toolkit.description,
+            ),
         )
 
     for skill in doc.spec.skills:
