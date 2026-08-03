@@ -8,10 +8,13 @@ across the retry — or does it mint a fresh one and double-fire?
 
 This drives it end to end: a node calls a side-effecting tool, then fails
 transiently AFTER the tool ran; the engine retries the node (§3.6); the second
-dispatch recomputes the key from the engine-supplied `logical_visit_id` exactly
-as the gateway does, and the executor's ledger must recognise the duplicate.
-The assertion is on the real side effect — the handler's call count — not on a
-key looking stable in isolation.
+dispatch recomputes the key from the engine-supplied `logical_visit_id` with the
+gateway's own inputs to `compute_idempotency_key`, and the executor's ledger
+must recognise the duplicate. The engine's visit-id reuse and the ledger are the
+REAL production code exercised here; the gateway's tool-loop call site is stood
+in for by the fake runtime below (which mirrors its key inputs). The assertion
+is on the real side effect — the handler's call count — not on a key looking
+stable in isolation.
 """
 
 from __future__ import annotations
@@ -75,8 +78,13 @@ class _ToolThenTransientRuntime:
         shared_state: dict[str, Any],
     ) -> AgentTurnResult:
         self.turns += 1
+        # Ordinal 1, matching the gateway: it does `tool_call_count += 1`
+        # BEFORE computing the key (gateway.py), so a turn's first tool call is
+        # ordinal 1, not 0. The value is constant across both turns either way,
+        # so the collision is driven purely by the reused logical_visit_id — but
+        # using the gateway's real value keeps "same key as the gateway" true.
         key = compute_idempotency_key(
-            run_id, node_id, logical_visit_id, 0, "git_connector", {"x": 1}
+            run_id, node_id, logical_visit_id, 1, "git_connector", {"x": 1}
         )
         self.keys.append(key)
         await self._executor.execute(
@@ -94,6 +102,10 @@ class _ToolThenTransientRuntime:
 
     async def aclose(self) -> None:
         return None
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None
 
 
 def test_engine_retry_reuses_the_key_so_the_side_effect_fires_once(con):
@@ -120,7 +132,3 @@ def test_engine_retry_reuses_the_key_so_the_side_effect_fires_once(con):
         "SELECT idempotency_key, status FROM tool_invocation"
     ).fetchall()
     assert [(r["idempotency_key"], r["status"]) for r in rows] == [(runtime.keys[0], "SUCCEEDED")]
-
-
-async def _no_sleep(_seconds: float) -> None:
-    return None
