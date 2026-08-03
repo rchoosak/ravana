@@ -24,13 +24,12 @@ from ravana.runtime.secrets import (
     ResolvedSecret,
     SecretLeakError,
     ensure_secret_free,
-    redact_secrets,
 )
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.toolkits.http_errors import (
-    classify_exception,
     classify_status,
-    redacted_exception_for_rethrow,
+    raise_for_request_exception,
+    resolve_dispatch_token,
 )
 
 # §8(a): the connector's declared input schema. Result is a plain string
@@ -110,23 +109,11 @@ class ApiConnectorHandler:
         _reject_offbase_path(path)  # §8-security: never let a model-supplied path escape base_url with the token
 
         headers: dict[str, str] = {"Idempotency-Key": idempotency_key}
-        # Re-resolved by the provider at EVERY dispatch (§8c) — no
-        # handler-lifetime cache, so token rotation is picked up per call. The
-        # provider returns a ResolvedSecret (or None); it opens to plaintext
-        # only here, at the HTTP boundary.
-        token: ResolvedSecret | None = None
-        token_value: str | None = None
-        token_error: ToolkitError | None = None
-        try:
-            token = self._get_auth_token()
-            token_value = token.value() if token is not None else None
-        except Exception as exc:  # noqa: BLE001 - credential failure is fatal
-            token_error = ToolkitError(
-                f"api_connector credential resolution failed ({type(exc).__name__})",
-                kind=ToolFailureKind.FATAL,
-            )
-        if token_error is not None:
-            raise token_error
+        # §8c: re-resolved at EVERY dispatch (no handler-lifetime cache, so a
+        # rotated token is picked up per call), opened to plaintext only here at
+        # the HTTP boundary. api_connector allows no-auth — a None token simply
+        # means no Authorization header.
+        token_value = resolve_dispatch_token(self._get_auth_token, context="api_connector")
         if token_value is not None:
             headers["Authorization"] = f"Bearer {token_value}"
         secret_values = (token_value,) if token_value is not None else ()
@@ -137,27 +124,12 @@ class ApiConnectorHandler:
                 method, path, headers=headers, json=arguments.get("json"), params=arguments.get("params")
             )
         except Exception as exc:
-            # Classify what the client raised: an HTTP status error routes by
-            # its status (a 401 via raise_for_status is FATAL, not transient),
-            # a genuine transport failure (connection reset, timeout, DNS) is
-            # §3.6's "tool timeout" — transient. Anything else (a TypeError
-            # from a programming/config bug, say) propagates raw: the engine's
-            # terminal boundary fails the run hard instead of a wrong-type
-            # transient retry re-running broken code.
-            kind = classify_exception(exc)
-            safe_error = redact_secrets(str(exc), values=secret_values)
-            if kind is None:
-                replacement = redacted_exception_for_rethrow(
-                    exc,
-                    safe_message=safe_error,
-                    context="api_connector request failed",
-                )
-                if replacement is None:
-                    raise
-                raise replacement from None
-            raise ToolkitError(
-                f"api_connector request to {path} failed: {safe_error}", kind=kind
-            ) from None
+            # §3.6 classification + secret-safe rethrow, shared with web_search.
+            raise_for_request_exception(
+                exc,
+                secret_values=secret_values,
+                context=f"api_connector request to {path} failed",
+            )
 
         status = getattr(response, "status_code", None)
         try:

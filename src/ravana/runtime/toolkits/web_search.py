@@ -27,9 +27,9 @@ from ravana.runtime.secrets import (
 )
 from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 from ravana.runtime.toolkits.http_errors import (
-    classify_exception,
     classify_status,
-    redacted_exception_for_rethrow,
+    raise_for_request_exception,
+    resolve_dispatch_token,
 )
 
 INPUT_SCHEMA: dict[str, Any] = {
@@ -123,14 +123,7 @@ class WebSearchHandler:
         # §8c: resolved at dispatch, opened to plaintext only here. A search
         # provider needs its key to answer at all, so a missing key is FATAL,
         # not something the model can adjust.
-        try:
-            token = self._get_auth_token()
-        except Exception as exc:  # noqa: BLE001 - credential failure is fatal
-            raise ToolkitError(
-                f"web_search credential resolution failed ({type(exc).__name__})",
-                kind=ToolFailureKind.FATAL,
-            ) from None
-        api_key = token.value() if token is not None else None
+        api_key = resolve_dispatch_token(self._get_auth_token, context="web_search")
         if not api_key:
             raise ToolkitError(
                 f"web_search: no API key configured for {self._provider} (set the toolkit's auth_ref)",
@@ -156,18 +149,10 @@ class WebSearchHandler:
                 )
                 raw_body, truncated = await _read_limited(response, body_limit)
         except Exception as exc:
-            kind = classify_exception(exc)
-            safe_error = redact_secrets(str(exc), values=secret_values)
-            if kind is None:
-                replacement = redacted_exception_for_rethrow(
-                    exc,
-                    safe_message=safe_error,
-                    context="web_search request failed",
-                )
-                if replacement is None:
-                    raise
-                raise replacement from None
-            raise ToolkitError(f"web_search request failed: {safe_error}", kind=kind) from None
+            # §3.6 classification + secret-safe rethrow, shared with api_connector.
+            raise_for_request_exception(
+                exc, secret_values=secret_values, context="web_search request failed"
+            )
 
         if not isinstance(status, int):
             raise ToolkitError(

@@ -1,14 +1,21 @@
-"""§3.6 tool-failure taxonomy for HTTP-backed toolkits.
+"""Shared failure/credential handling for HTTP-backed connector toolkits.
 
-Shared by every connector that speaks HTTP (`api_connector`, `web_search`, …)
-so the transient/fatal/model-addressable classification lives in ONE place. A
-second copy of this is a second place a security-relevant routing decision — a
-401 must be FATAL, not a backed-off retry — could drift.
+Every connector that speaks HTTP (`api_connector`, `web_search`, …) shares the
+same handful of security-relevant decisions, kept here in ONE place so a copy
+can't drift from the others:
+  - the §3.6 transient/fatal/model-addressable status taxonomy (a 401 must be
+    FATAL, not a backed-off retry);
+  - raising a failed request's exception with its secrets redacted;
+  - resolving the dispatch-time credential (§8c), turning a resolver failure
+    into a FATAL error.
 """
 
 from __future__ import annotations
 
-from ravana.runtime.toolkits.base import ToolFailureKind
+from typing import Callable, NoReturn
+
+from ravana.runtime.secrets import ResolvedSecret, redact_secrets
+from ravana.runtime.toolkits.base import ToolFailureKind, ToolkitError
 
 
 def classify_status(status: int) -> ToolFailureKind:
@@ -61,3 +68,50 @@ def redacted_exception_for_rethrow(
         return type(exc)(safe_message)
     except Exception:  # noqa: BLE001 - third-party exception constructors vary
         return RuntimeError(f"{context} ({type(exc).__name__}): {safe_message}")
+
+
+def raise_for_request_exception(
+    exc: Exception, *, secret_values: tuple[str, ...], context: str
+) -> NoReturn:
+    """Classify a client-raised request exception per §3.6 and raise.
+
+    A recognised transport/status failure becomes a `ToolkitError` with the
+    classified kind. An unrecognised one (a programming/config bug) is re-raised
+    — redacted and reconstructed if its message carried a secret, else the
+    original — so the engine's terminal boundary fails the run hard rather than
+    a wrong-type transient retry re-running broken code.
+
+    Extracted because `api_connector` and `web_search` ran this exact block; a
+    second copy is a second place the classify/redact decision could drift.
+    """
+    kind = classify_exception(exc)
+    safe_error = redact_secrets(str(exc), values=secret_values)
+    if kind is None:
+        replacement = redacted_exception_for_rethrow(
+            exc, safe_message=safe_error, context=context
+        )
+        if replacement is None:
+            raise exc
+        raise replacement from None
+    raise ToolkitError(f"{context}: {safe_error}", kind=kind) from None
+
+
+def resolve_dispatch_token(
+    get_auth_token: Callable[[], ResolvedSecret | None], *, context: str
+) -> str | None:
+    """Resolve the dispatch-time credential (§8c) to plaintext, or None.
+
+    A resolver that RAISES is fatal — a rotated/absent secret is not something a
+    model or a retry can fix. Whether a *None* result (no auth configured) is
+    acceptable is the caller's decision: `api_connector` allows it, `web_search`
+    treats a missing key as FATAL. That divergence stays at the call site; only
+    the shared resolve-or-FATAL shape lives here.
+    """
+    try:
+        token = get_auth_token()
+    except Exception as exc:  # noqa: BLE001 - credential failure is fatal
+        raise ToolkitError(
+            f"{context} credential resolution failed ({type(exc).__name__})",
+            kind=ToolFailureKind.FATAL,
+        ) from None
+    return token.value() if token is not None else None
