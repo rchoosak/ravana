@@ -6,6 +6,7 @@ import sqlite3
 
 from ravana.compiler.graph import CompiledGraph
 from ravana.observability.audit import write_audit
+from ravana.schema.models import ToolkitConfig
 from ravana.schema.util import dumps, loads, new_id, now_iso
 from ravana.schema.workflow_snapshot import WorkflowSnapshot
 
@@ -14,14 +15,35 @@ class WorkflowPersistenceError(Exception):
     """A persisted workflow cannot accept the requested mutation."""
 
 
+# The toolkit columns that carry the authored definition — everything except
+# the surrogate `id`/`org_id`. SELECT, INSERT, and UPDATE all derive their
+# column list and value order from this one source, so a column added later
+# cannot be written by one statement yet silently missed by the reader that
+# rebuilds the row — the SELECT/INSERT drift a hand-copied list invites. The
+# `name` column holds the author-facing toolkit id (`toolkit.id`).
+_TOOLKIT_CONTENT_COLUMNS = ("name", "type", "config", "auth_ref", "description")
+
+
+def _toolkit_content_values(toolkit: ToolkitConfig) -> tuple[str | None, ...]:
+    """Values for `_TOOLKIT_CONTENT_COLUMNS`, in that exact column order."""
+    return (
+        toolkit.id,
+        toolkit.type,
+        dumps(toolkit.config),
+        toolkit.auth_ref,
+        toolkit.description,
+    )
+
+
 def _persisted_toolkits(
     con: sqlite3.Connection, toolkit_ids: list[str]
 ) -> tuple[dict[str, dict], dict[str, str]]:
     if not toolkit_ids:
         return {}, {}
     placeholders = ",".join("?" for _ in toolkit_ids)
+    content_columns = ", ".join(_TOOLKIT_CONTENT_COLUMNS)
     rows = con.execute(
-        f"SELECT id, name, type, config, auth_ref, description FROM toolkit WHERE id IN ({placeholders})",
+        f"SELECT id, {content_columns} FROM toolkit WHERE id IN ({placeholders})",
         toolkit_ids,
     ).fetchall()
     snapshot = {
@@ -57,9 +79,10 @@ def _claim_legacy_toolkits(
     """
     claimed = _claimed_toolkit_ids(con, workflow_id)
     selected: list[str] = []
+    content_columns = ", ".join(_TOOLKIT_CONTENT_COLUMNS)
     for toolkit in graph.doc.spec.toolkits:
         candidates = con.execute(
-            """SELECT rowid AS row_order, id, config, auth_ref, description
+            f"""SELECT rowid AS row_order, id, {content_columns}
                FROM toolkit WHERE org_id = ? AND name = ? AND type = ? ORDER BY rowid""",
             (org_id, toolkit.id, toolkit.type),
         ).fetchall()
@@ -97,31 +120,18 @@ def _sync_toolkits(
         toolkit_db_id = persisted_ids.pop(toolkit.id) if toolkit.id in persisted_ids else new_id()
         current_ids.append(toolkit_db_id)
         if toolkit_db_id in owned_ids:
+            set_clause = ", ".join(f"{column} = ?" for column in _TOOLKIT_CONTENT_COLUMNS)
             con.execute(
-                """UPDATE toolkit SET name = ?, type = ?, config = ?, auth_ref = ?, description = ?
-                   WHERE id = ?""",
-                (
-                    toolkit.id,
-                    toolkit.type,
-                    dumps(toolkit.config),
-                    toolkit.auth_ref,
-                    toolkit.description,
-                    toolkit_db_id,
-                ),
+                f"UPDATE toolkit SET {set_clause} WHERE id = ?",
+                (*_toolkit_content_values(toolkit), toolkit_db_id),
             )
         else:
+            columns = ("id", "org_id", *_TOOLKIT_CONTENT_COLUMNS)
+            column_list = ", ".join(columns)
+            placeholders = ", ".join("?" for _ in columns)
             con.execute(
-                """INSERT INTO toolkit (id, org_id, name, type, config, auth_ref, description)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (
-                    toolkit_db_id,
-                    org_id,
-                    toolkit.id,
-                    toolkit.type,
-                    dumps(toolkit.config),
-                    toolkit.auth_ref,
-                    toolkit.description,
-                ),
+                f"INSERT INTO toolkit ({column_list}) VALUES ({placeholders})",
+                (toolkit_db_id, org_id, *_toolkit_content_values(toolkit)),
             )
     for removed_id in persisted_ids.values():
         con.execute("DELETE FROM toolkit WHERE id = ?", (removed_id,))
