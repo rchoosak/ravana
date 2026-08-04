@@ -141,7 +141,7 @@ def test_pending_hitl_defers_quiescence_flush(con):
         }
     )
     graph = compile_workflow(doc)
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime(
         {
             "start": [{"structured_payload": {}}],

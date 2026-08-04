@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS workflow (
     guards          TEXT,
     concurrency     TEXT,
     toolkit_ids     TEXT NOT NULL DEFAULT '[]',
+    definition_snapshot TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'DRAFT',
     created_by      TEXT NOT NULL,
     published_by    TEXT,
@@ -123,7 +124,8 @@ CREATE TABLE IF NOT EXISTS run (
     org_id            TEXT NOT NULL,
     workflow_id       TEXT NOT NULL REFERENCES workflow(id),
     workflow_version  INTEGER NOT NULL,
-    workflow_snapshot TEXT,
+    workflow_snapshot TEXT NOT NULL,
+    agent_db_ids      TEXT NOT NULL,
     status            TEXT NOT NULL,
     current_nodes     TEXT NOT NULL DEFAULT '[]',
     shared_state      TEXT NOT NULL DEFAULT '{}',
@@ -271,9 +273,11 @@ _ADDITIVE_MIGRATIONS: dict[str, dict[str, str]] = {
     },
     "workflow": {
         "toolkit_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "definition_snapshot": "TEXT",
     },
     "run": {
         "workflow_snapshot": "TEXT",
+        "agent_db_ids": "TEXT",
     },
     "node_execution": {
         "logical_visit_id": "TEXT NOT NULL DEFAULT ''",

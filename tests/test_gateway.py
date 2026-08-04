@@ -613,7 +613,7 @@ def test_engine_retries_a_transient_tool_failure_with_backoff(con):
             return "recovered"
 
     graph = _single_node_gateway_graph(toolkits=["web_search"])
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     calls_tool = ProviderResponse(text=None, tool_calls=[NormalizedToolCall(id="t1", tool="web_search", arguments={"q": "x"})])
     # Attempt 1 consumes response[0] and dies at the tool; attempt 2 replays
     # the tool call (response[1], tool now recovers) then submits (response[2]).
@@ -641,7 +641,7 @@ def test_repair_exhaustion_fails_the_run_without_node_retries(con):
     graph = _single_node_gateway_graph(
         output_schema={"type": "object", "properties": {"verdict": {"type": "string", "enum": ["OK"]}}, "required": ["verdict"], "additionalProperties": False}
     )
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     max_repairs = graph.doc.spec.graph.guards.max_output_repairs
     adapter = FakeAdapter(name="anthropic", responses=[_submit({"verdict": "NOPE"})])  # invalid enum, forever
     sleeper = RecordingSleep()
@@ -941,7 +941,7 @@ def test_resolved_key_never_reaches_message_or_state(con):
     gateway = LLMGateway(
         graph, {"openai": adapter}, secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "sk-must-not-persist"})
     )
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     run_id = asyncio.run(start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id))
 
     assert adapter.requests[0].api_key.value() == "sk-must-not-persist"  # it DID reach the request
@@ -985,7 +985,7 @@ def test_provider_echoing_exact_key_fails_before_persistence(con):
         {"openai": adapter},
         secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": secret}),
     )
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     run_id = asyncio.run(
         start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id)
     )
@@ -1040,7 +1040,7 @@ def test_resolver_exception_text_never_reaches_db_or_stderr(con, capsys):
     graph = _keyed_agent_graph("secrets://openai_key")  # no fallback: chain ends permanent
     adapter = FakeAdapter(name="openai", responses=[_submit({"done": True})])
     gateway = LLMGateway(graph, {"openai": adapter}, secret_resolver=LeakyResolver())
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     run_id = asyncio.run(start_run(con, graph, gateway, org_id="test", workflow_id=workflow_id))
 
     run = con.execute("SELECT status FROM run WHERE id = ?", (run_id,)).fetchone()
@@ -1075,7 +1075,7 @@ def test_sdk_exception_echoing_injected_key_is_redacted_everywhere(con, capsys):
         graph, {"openai": adapter},
         secret_resolver=EnvSecretResolver({"RAVANA_SECRET_OPENAI_KEY": "sk-LEAK-ME"}),
     )
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
 
     orig = openai.AsyncOpenAI
     openai.AsyncOpenAI = EchoingClientCtor
@@ -1570,7 +1570,7 @@ def test_all_permanent_chain_fails_the_run_without_node_retries(con):
     # Engine-level consequence: a permanently-misconfigured agent fails the
     # run on the FIRST node_execution — no §3.6 node retries, no backoff.
     graph = compile_workflow(load_workflow_yaml(SDLC_WORKFLOW))
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     adapter = FakeAdapter(name="anthropic", fail=True, fail_retryable=False)
     sleeper = RecordingSleep()
     gateway = LLMGateway(graph, {p: adapter for p in ("anthropic", "local", "openai")}, retry_sleep=sleeper)

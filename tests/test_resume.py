@@ -5,14 +5,17 @@ answer in context), not a bare re-route of the stale first-turn output."""
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
+import click
 import pytest
 
 from ravana.cli import _compiled_graph_for_run
 from ravana.compiler.graph import compile_workflow
 from ravana.compiler.persist import get_or_create_workflow
 from ravana.engine.loop import resume_hitl, start_run
-from ravana.schema.util import loads
+from ravana.schema.db import init_db
+from ravana.schema.util import loads, now_iso
 
 
 class _PreparedRuntime:
@@ -113,14 +116,14 @@ def test_resuming_an_already_answered_hitl_request_is_rejected(con, sdlc_graph, 
         pass
 
 
-def test_resume_compiles_the_run_snapshot_without_reloading_mutable_yaml(
-    con, sdlc_graph, sdlc_runtime, monkeypatch
+def test_resume_snapshot_preserves_descriptions_and_inherited_node_contracts(
+    con, sdlc_graph, sdlc_runtime
 ):
     doc = sdlc_graph.doc.model_copy(deep=True)
     toolkit = next(t for t in doc.spec.toolkits if t.id == "git_connector")
     toolkit.description = "Description pinned when the run started."
     graph = compile_workflow(doc)
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
 
     run_id = asyncio.run(
         start_run(
@@ -134,13 +137,12 @@ def test_resume_compiles_the_run_snapshot_without_reloading_mutable_yaml(
     )
     run_row = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
 
-    def fail_if_yaml_is_loaded(*args, **kwargs):
-        raise AssertionError("resume must not reload mutable workflow YAML")
-
-    monkeypatch.setattr("ravana.cli._find_workflow_file_for_run", fail_if_yaml_is_loaded)
     resumed_graph = _compiled_graph_for_run(con, run_row)
     resumed = next(t for t in resumed_graph.doc.spec.toolkits if t.id == "git_connector")
     assert resumed.description == "Description pinned when the run started."
+    for node in graph.doc.spec.graph.nodes:
+        if node.agent is not None:
+            assert resumed_graph.contract_for_node(node.id) == graph.contract_for_node(node.id)
 
 
 def test_resume_rejects_a_graph_that_differs_from_the_run_snapshot(
@@ -180,3 +182,120 @@ def test_resume_rejects_a_graph_that_differs_from_the_run_snapshot(
     assert con.execute(
         "SELECT status FROM hitl_request WHERE id = ?", (hitl["id"],)
     ).fetchone()["status"] == "PENDING"
+
+
+def test_draft_edit_cannot_change_the_agent_identity_pinned_to_an_inflight_run(
+    con, sdlc_graph, sdlc_workflow_id, sdlc_runtime
+):
+    run_id = asyncio.run(
+        start_run(
+            con,
+            sdlc_graph,
+            sdlc_runtime,
+            org_id="test-org",
+            workflow_id=sdlc_workflow_id,
+            input_payload={"repository": "r"},
+        )
+    )
+    hitl = con.execute(
+        "SELECT * FROM hitl_request WHERE run_id = ? AND status = 'PENDING'", (run_id,)
+    ).fetchone()
+    run_row = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+    pinned_agent_id = loads(run_row["agent_db_ids"])["pm_intake"]
+
+    changed_doc = sdlc_graph.doc.model_copy(deep=True)
+    changed_doc.spec.agents[0].system_prompt = "Edited while the old run waits for HITL"
+    changed_graph = compile_workflow(changed_doc)
+    get_or_create_workflow(con, changed_graph, org_id="test-org", actor="editor")
+    current_agent_id = con.execute(
+        "SELECT agent_id FROM workflow_node WHERE workflow_id = ? AND id = 'pm_intake'",
+        (sdlc_workflow_id,),
+    ).fetchone()[0]
+    assert current_agent_id != pinned_agent_id
+
+    pinned_graph = _compiled_graph_for_run(con, run_row)
+    asyncio.run(
+        resume_hitl(
+            con,
+            pinned_graph,
+            sdlc_runtime,
+            run_id,
+            hitl["id"],
+            {"answer": "clear"},
+        )
+    )
+    sender_ids = [
+        row["sender_agent_id"]
+        for row in con.execute(
+            """SELECT sender_agent_id FROM message
+               WHERE run_id = ? AND node_id = 'pm_intake' AND role = 'agent'
+               ORDER BY created_at""",
+            (run_id,),
+        )
+    ]
+    assert sender_ids == [pinned_agent_id, pinned_agent_id]
+
+
+def test_legacy_run_without_snapshot_fails_closed_on_every_resume_path(
+    tmp_path, sdlc_graph, sdlc_runtime
+):
+    db_path = tmp_path / "legacy_run.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE workflow (id TEXT PRIMARY KEY);
+        CREATE TABLE run (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            workflow_id TEXT NOT NULL,
+            workflow_version INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            current_nodes TEXT NOT NULL DEFAULT '[]',
+            shared_state TEXT NOT NULL DEFAULT '{}',
+            state_version INTEGER NOT NULL DEFAULT 0,
+            concurrency_group TEXT,
+            parent_run_id TEXT,
+            parent_node_execution_id TEXT,
+            triggered_by TEXT,
+            input_payload TEXT,
+            started_at TEXT NOT NULL,
+            ended_at TEXT
+        );
+        """
+    )
+    legacy.close()
+    con = init_db(db_path)
+    run_id = "legacy-run"
+    con.execute("INSERT INTO workflow (id) VALUES ('legacy-workflow')")
+    con.execute(
+        """INSERT INTO run
+           (id, org_id, workflow_id, workflow_version, status, started_at)
+           VALUES (?,?,?,?,?,?)""",
+        (run_id, "test", "legacy-workflow", 1, "WAITING_HUMAN", now_iso()),
+    )
+    con.execute(
+        """INSERT INTO hitl_request
+           (id, run_id, node_id, question, status, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        ("legacy-hitl", run_id, "pm_intake", "Continue?", "PENDING", now_iso()),
+    )
+    con.commit()
+    run_row = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+
+    with pytest.raises(click.ClickException, match="cannot resume safely"):
+        _compiled_graph_for_run(con, run_row)
+    with pytest.raises(ValueError, match="cannot resume safely"):
+        asyncio.run(
+            resume_hitl(
+                con,
+                sdlc_graph,
+                sdlc_runtime,
+                run_id,
+                "legacy-hitl",
+                {"answer": "clear"},
+            )
+        )
+    assert con.execute(
+        "SELECT status FROM hitl_request WHERE id = 'legacy-hitl'"
+    ).fetchone()["status"] == "PENDING"
+    con.close()

@@ -34,13 +34,17 @@ def _seed_run(con, run_id="r1"):
     # tool_invocation.run_id FKs to run(id), which FKs to workflow(id) —
     # insert the workflow first, then the run.
     con.execute(
-        "INSERT INTO workflow (id, org_id, name, version, state_schema, entry_node_id, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("w1", "o1", "wf", 1, "{}", "n1", "t", now_iso()),
+        """INSERT INTO workflow
+           (id, org_id, name, version, state_schema, entry_node_id,
+            definition_snapshot, created_by, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        ("w1", "o1", "wf", 1, "{}", "n1", "{}", "t", now_iso()),
     )
     con.execute(
-        """INSERT INTO run (id, org_id, workflow_id, workflow_version, status, started_at)
-           VALUES (?,?,?,?,?,?)""",
-        (run_id, "o1", "w1", 1, "RUNNING", now_iso()),
+        """INSERT INTO run (id, org_id, workflow_id, workflow_version, workflow_snapshot,
+                            agent_db_ids, status, started_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (run_id, "o1", "w1", 1, "{}", "{}", "RUNNING", now_iso()),
     )
     con.commit()
 

@@ -23,10 +23,13 @@ def write_audit(
     before: dict[str, Any] | None = None,
     after: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
+    *,
+    commit: bool = True,
 ) -> None:
     con.execute(
         """INSERT INTO audit_log (id, org_id, actor, action, entity_type, entity_id, before, after, metadata, created_at)
            VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (new_id(), org_id, actor, action, entity_type, entity_id, dumps(before), dumps(after), dumps(metadata), now_iso()),
     )
-    con.commit()
+    if commit:
+        con.commit()

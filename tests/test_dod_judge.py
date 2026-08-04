@@ -242,7 +242,7 @@ def test_judge_prose_uses_fallback_chain_on_transient_primary():
 def _run_e2e(con, graph, node_turn: ProviderResponse, judgement: ProviderResponse) -> str:
     adapter = FakeAdapter(responses=[node_turn, judgement])
     gateway = LLMGateway(graph, {"anthropic": adapter})
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     return asyncio.run(
         start_run(
             con, graph, gateway, org_id="test", workflow_id=workflow_id,

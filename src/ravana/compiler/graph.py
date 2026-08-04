@@ -105,6 +105,10 @@ def compile_workflow(doc: WorkflowDoc) -> CompiledGraph:
 
     toolkits_by_id = {t.id: t for t in spec.toolkits}
     skills_by_id = {s.id: s for s in spec.skills}
+    if len(toolkits_by_id) != len(spec.toolkits):
+        raise CompileError("duplicate toolkit id")
+    if len(skills_by_id) != len(spec.skills):
+        raise CompileError("duplicate skill id")
 
     # §1.2/§8: an author description overrides a single-tool toolkit's default.
     # An `mcp_server` toolkit surfaces MANY tools, each carrying the server's

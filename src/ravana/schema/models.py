@@ -55,7 +55,7 @@ class ToolkitConfig(BaseModel):
     # hide_input_in_errors: a failed auth_ref validation must not echo the
     # pasted value back — it may BE the raw secret the validator exists to
     # keep out of persistence and logs (§8).
-    model_config = ConfigDict(hide_input_in_errors=True)
+    model_config = ConfigDict(hide_input_in_errors=True, validate_assignment=True)
 
     id: str
     type: ToolkitType
