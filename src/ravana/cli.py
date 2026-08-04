@@ -37,6 +37,8 @@ from ravana.runtime.toolkits.mcp_server import McpServerDefinition, parse_server
 from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.db import init_db
 from ravana.schema.loader import load_workflow_yaml
+from ravana.schema.models import WorkflowDoc
+from ravana.schema.util import loads
 
 RAVANA_DIR = ".ravana"
 
@@ -68,6 +70,9 @@ def _find_workflow_file_for_run(con: sqlite3.Connection, run_row: sqlite3.Row) -
 
 
 def _compiled_graph_for_run(con: sqlite3.Connection, run_row: sqlite3.Row) -> CompiledGraph:
+    snapshot = run_row["workflow_snapshot"]
+    if snapshot is not None:
+        return compile_workflow(WorkflowDoc.model_validate(loads(snapshot)))
     return compile_workflow(load_workflow_yaml(_find_workflow_file_for_run(con, run_row)))
 
 

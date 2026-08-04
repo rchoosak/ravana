@@ -6,6 +6,11 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+from ravana.cli import _compiled_graph_for_run
+from ravana.compiler.graph import compile_workflow
+from ravana.compiler.persist import get_or_create_workflow
 from ravana.engine.loop import resume_hitl, start_run
 from ravana.schema.util import loads
 
@@ -106,3 +111,72 @@ def test_resuming_an_already_answered_hitl_request_is_rejected(con, sdlc_graph, 
         assert False, "expected ValueError for double-answering the same hitl_request"
     except ValueError:
         pass
+
+
+def test_resume_compiles_the_run_snapshot_without_reloading_mutable_yaml(
+    con, sdlc_graph, sdlc_runtime, monkeypatch
+):
+    doc = sdlc_graph.doc.model_copy(deep=True)
+    toolkit = next(t for t in doc.spec.toolkits if t.id == "git_connector")
+    toolkit.description = "Description pinned when the run started."
+    graph = compile_workflow(doc)
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+
+    run_id = asyncio.run(
+        start_run(
+            con,
+            graph,
+            sdlc_runtime,
+            org_id="test",
+            workflow_id=workflow_id,
+            input_payload={"repository": "r"},
+        )
+    )
+    run_row = con.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+
+    def fail_if_yaml_is_loaded(*args, **kwargs):
+        raise AssertionError("resume must not reload mutable workflow YAML")
+
+    monkeypatch.setattr("ravana.cli._find_workflow_file_for_run", fail_if_yaml_is_loaded)
+    resumed_graph = _compiled_graph_for_run(con, run_row)
+    resumed = next(t for t in resumed_graph.doc.spec.toolkits if t.id == "git_connector")
+    assert resumed.description == "Description pinned when the run started."
+
+
+def test_resume_rejects_a_graph_that_differs_from_the_run_snapshot(
+    con, sdlc_graph, sdlc_workflow_id, sdlc_runtime
+):
+    run_id = asyncio.run(
+        start_run(
+            con,
+            sdlc_graph,
+            sdlc_runtime,
+            org_id="test",
+            workflow_id=sdlc_workflow_id,
+            input_payload={"repository": "r"},
+        )
+    )
+    hitl = con.execute(
+        "SELECT * FROM hitl_request WHERE run_id = ? AND status = 'PENDING'", (run_id,)
+    ).fetchone()
+
+    changed_doc = sdlc_graph.doc.model_copy(deep=True)
+    next(t for t in changed_doc.spec.toolkits if t.id == "git_connector").description = (
+        "Changed after the run started."
+    )
+    changed_graph = compile_workflow(changed_doc)
+
+    with pytest.raises(ValueError, match="must resume with its pinned workflow snapshot"):
+        asyncio.run(
+            resume_hitl(
+                con,
+                changed_graph,
+                sdlc_runtime,
+                run_id,
+                hitl["id"],
+                {"answer": "clear"},
+            )
+        )
+    assert con.execute(
+        "SELECT status FROM hitl_request WHERE id = ?", (hitl["id"],)
+    ).fetchone()["status"] == "PENDING"

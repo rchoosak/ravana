@@ -136,6 +136,15 @@ def test_blank_toolkit_description_is_an_authoring_error():
         ToolkitConfig(id="t", type="api_connector", description="   ")
 
 
+def test_toolkit_description_rejects_credential_material_without_echoing_it():
+    from ravana.schema.models import ToolkitConfig
+
+    secret = "ghp_PASTED_DESCRIPTION_SECRET"
+    with pytest.raises(Exception, match="must not contain credential material") as exc_info:
+        ToolkitConfig(id="t", type="api_connector", description=f"Use {secret}")
+    assert secret not in str(exc_info.value)
+
+
 def test_toolkit_description_is_stripped_and_omission_is_none():
     from ravana.schema.models import ToolkitConfig
 
@@ -143,18 +152,50 @@ def test_toolkit_description_is_stripped_and_omission_is_none():
     assert ToolkitConfig(id="t", type="api_connector").description is None
 
 
-def test_author_toolkit_description_is_persisted(con):
+def test_author_toolkit_description_is_persisted_and_updated_with_audit(con):
     raw = _load_raw()
     tk = next(t for t in raw["spec"]["toolkits"] if t["id"] == "git_connector")
     tk["description"] = "Query the GitHub REST API."
     graph = compile_workflow(WorkflowDoc.model_validate(raw))
 
-    get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
     rows = {r["name"]: r["description"] for r in con.execute("SELECT name, description FROM toolkit")}
     assert rows["git_connector"] == "Query the GitHub REST API."
     # A toolkit that set no description persists NULL, not "" — the audit record
     # must not fabricate a description the author never wrote.
     assert rows["web_search"] is None
+
+    tk["description"] = "Inspect GitHub repository state."
+    updated_graph = compile_workflow(WorkflowDoc.model_validate(raw))
+    assert get_or_create_workflow(con, updated_graph, org_id="test", created_by="editor") == workflow_id
+
+    updated_rows = con.execute(
+        "SELECT id, description FROM toolkit WHERE name = 'git_connector'"
+    ).fetchall()
+    assert len(updated_rows) == 1
+    assert updated_rows[0]["description"] == "Inspect GitHub repository state."
+
+    audits = con.execute(
+        """SELECT actor, before, after FROM audit_log
+           WHERE entity_id = ? AND action = 'workflow.draft_saved' ORDER BY rowid""",
+        (workflow_id,),
+    ).fetchall()
+    assert len(audits) == 2
+    assert audits[1]["actor"] == "editor"
+    assert loads(audits[1]["before"])["toolkits"]["git_connector"]["description"] == (
+        "Query the GitHub REST API."
+    )
+    assert loads(audits[1]["after"])["toolkits"]["git_connector"]["description"] == (
+        "Inspect GitHub repository state."
+    )
+
+    # Re-saving identical content remains idempotent and does not fabricate an edit.
+    get_or_create_workflow(con, updated_graph, org_id="test", created_by="editor")
+    audit_count = con.execute(
+        "SELECT count(*) FROM audit_log WHERE entity_id = ? AND action = 'workflow.draft_saved'",
+        (workflow_id,),
+    ).fetchone()[0]
+    assert audit_count == 2
 
 
 def test_init_db_adds_toolkit_description_column(tmp_path):
@@ -178,6 +219,30 @@ def test_init_db_adds_toolkit_description_column(tmp_path):
     columns = {row[1] for row in migrated.execute("PRAGMA table_info(toolkit)")}
     migrated.close()
     assert "description" in columns
+
+
+def test_init_db_adds_workflow_toolkit_ids_and_run_snapshot(tmp_path):
+    db_path = tmp_path / "legacy_snapshots.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE workflow (id TEXT PRIMARY KEY);
+        CREATE TABLE run (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT,
+            concurrency_group TEXT,
+            status TEXT NOT NULL
+        );
+        """
+    )
+    legacy.close()
+
+    migrated = init_db(db_path)
+    workflow_columns = {row[1] for row in migrated.execute("PRAGMA table_info(workflow)")}
+    run_columns = {row[1] for row in migrated.execute("PRAGMA table_info(run)")}
+    migrated.close()
+    assert "toolkit_ids" in workflow_columns
+    assert "workflow_snapshot" in run_columns
 
 
 def test_init_db_adds_execution_contract_columns_to_existing_sqlite(tmp_path):

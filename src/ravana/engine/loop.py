@@ -114,6 +114,16 @@ def _get_run(con: sqlite3.Connection, run_id: str) -> sqlite3.Row:
     return row
 
 
+def _assert_run_uses_pinned_workflow(run_row: sqlite3.Row, graph: CompiledGraph) -> None:
+    snapshot = loads(run_row["workflow_snapshot"])
+    if snapshot is None:  # Compatibility for runs created before the snapshot migration.
+        return
+    if snapshot != graph.doc.model_dump(mode="json", by_alias=True):
+        raise ValueError(
+            f"run '{run_row['id']}' must resume with its pinned workflow snapshot"
+        )
+
+
 def _next_sequence(con: sqlite3.Connection, run_id: str) -> int:
     row = con.execute(
         "SELECT COALESCE(MAX(sequence), 0) AS m FROM state_transition_log WHERE run_id = ?", (run_id,)
@@ -242,14 +252,16 @@ async def start_run(
 
         shared_state = dict(graph.doc.spec.state.initial)
         con.execute(
-            """INSERT INTO run (id, org_id, workflow_id, workflow_version, status, current_nodes, shared_state,
-                                 state_version, concurrency_group, triggered_by, input_payload, started_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO run (id, org_id, workflow_id, workflow_version, workflow_snapshot, status,
+                                 current_nodes, shared_state, state_version, concurrency_group, triggered_by,
+                                 input_payload, started_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 run_id,
                 org_id,
                 workflow_id,
                 graph.doc.metadata.version,
+                dumps(graph.doc.model_dump(mode="json", by_alias=True)),
                 status,
                 dumps([]),
                 dumps(shared_state),
@@ -1064,6 +1076,8 @@ async def resume_hitl(
     thread, then dispatch a brand-new node_execution attempt for the same
     node — NOT a bare re-route of stale output (that was the bug fixed in
     v0.14)."""
+    run_row = _get_run(con, run_id)
+    _assert_run_uses_pinned_workflow(run_row, graph)
     hitl_row = con.execute("SELECT * FROM hitl_request WHERE id = ?", (hitl_request_id,)).fetchone()
     if hitl_row is None:
         raise KeyError(f"hitl_request '{hitl_request_id}' not found")
@@ -1090,7 +1104,6 @@ async def resume_hitl(
         con.commit()
         write_audit(con, _get_run(con, run_id)["org_id"], "cli-user", "hitl.responded", "hitl_request", hitl_request_id, after=response)
 
-        run_row = _get_run(con, run_id)
         ctx = _RunCtx(
             con=con, graph=graph, run_id=run_id, org_id=run_row["org_id"], workflow_id=run_row["workflow_id"],
             runtime=runtime, queue=[node_id], dod_prose_verdict=dod_prose_verdict, retry_sleep=retry_sleep,

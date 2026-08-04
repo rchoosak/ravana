@@ -11,6 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ravana.runtime.secrets import contains_secret
+
 MergePolicy = Literal["overwrite", "merge-object", "append"]
 ConcurrencyStrategy = Literal["queue", "cancel_previous", "allow"]
 ToolkitType = Literal["web_search", "code_interpreter", "db", "api_connector", "mcp_server"]
@@ -79,6 +81,8 @@ class ToolkitConfig(BaseModel):
         stripped = value.strip()
         if not stripped:
             raise ValueError("toolkit description, when set, must not be blank")
+        if contains_secret(stripped):
+            raise ValueError("toolkit description must not contain credential material (§8)")
         return stripped
 
 
