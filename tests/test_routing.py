@@ -32,7 +32,7 @@ def test_qa_test_dead_end_is_caught_without_is_default(con):
     raw = _load_raw()
     raw["spec"]["graph"]["edges"] = [e for e in raw["spec"]["graph"]["edges"] if not e.get("is_default")]
     graph = compile_workflow(WorkflowDoc.model_validate(raw))
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
 
     fixture = {
         "pm_intake": [{"structured_payload": {"requirement_clarity": "HIGH", "milestone_plan": {}}}],

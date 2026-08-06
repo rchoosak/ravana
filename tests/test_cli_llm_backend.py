@@ -218,7 +218,7 @@ def test_engine_invokes_runtime_run_preparation(con):
 
     graph = _no_toolkit_graph()
     workflow_id = get_or_create_workflow(
-        con, graph, org_id="test", created_by="test"
+        con, graph, org_id="test", actor="test"
     )
     runtime = PreparingRuntime()
     run_id = asyncio.run(
@@ -238,7 +238,7 @@ def _run_to_completion(con, runtime):
     from ravana.engine.loop import start_run
 
     graph = _no_toolkit_graph()
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     run_id = asyncio.run(
         start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id)
     )
@@ -291,7 +291,7 @@ def test_no_handoff_when_the_run_did_not_complete(con):
 
     runtime = FailingRuntime()
     graph = _no_toolkit_graph()
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     run_id = asyncio.run(
         start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id)
     )

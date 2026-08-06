@@ -110,7 +110,7 @@ async def _no_sleep(_seconds: float) -> None:
 
 def test_engine_retry_reuses_the_key_so_the_side_effect_fires_once(con):
     graph = _single_node_graph()
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     handler = CountingHandler()
     runtime = _ToolThenTransientRuntime(con, handler)
 

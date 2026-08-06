@@ -75,7 +75,7 @@ def test_engine_delays_grow_exponentially_across_retries(con):
     # Two consecutive transient failures on one node: the recorded backoffs
     # must double (attempt 1 ~base, attempt 2 ~2*base), per §3.6.
     graph = compile_workflow(_single_node_doc("backoff-test"))
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime(
         {"only": [{"transient_error": True}, {"transient_error": True}, {"structured_payload": {}}]}
     )
@@ -130,7 +130,7 @@ def test_backoff_keys_on_consecutive_failures_not_lifetime_attempts(con):
     # not the inflated lifetime attempt number (which would jump toward the
     # cap). Regression for the review finding.
     graph = compile_workflow(_cyclic_two_node_doc())
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime(
         {
             # worker: succeeds twice (visits 1-2), transient-fails once on
@@ -170,7 +170,7 @@ def test_no_sleep_before_a_guaranteed_budget_failure(con):
     # engine must NOT spend a backoff sleep first. Regression for the review
     # finding (the final sleep bought nothing).
     graph = compile_workflow(_single_node_doc("backoff-exhaust-test", guards={"max_retries_per_node": 1}))
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"transient_error": True}] * 5})
     sleeper = RecordingSleep()
     run_id = asyncio.run(

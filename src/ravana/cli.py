@@ -37,6 +37,7 @@ from ravana.runtime.toolkits.mcp_server import McpServerDefinition, parse_server
 from ravana.runtime.toolkits.registry import build_registry
 from ravana.schema.db import init_db
 from ravana.schema.loader import load_workflow_yaml
+from ravana.schema.workflow_snapshot import WorkflowSnapshot, WorkflowSnapshotError
 
 RAVANA_DIR = ".ravana"
 
@@ -58,17 +59,13 @@ def _connect() -> sqlite3.Connection:
     return init_db(db_path)
 
 
-def _find_workflow_file_for_run(con: sqlite3.Connection, run_row: sqlite3.Row) -> Path:
-    workflow_row = con.execute("SELECT * FROM workflow WHERE id = ?", (run_row["workflow_id"],)).fetchone()
-    for candidate in (find_ravana_dir() / "workflows").glob("*.yaml"):
-        doc = load_workflow_yaml(candidate)
-        if doc.metadata.name == workflow_row["name"] and doc.metadata.version == workflow_row["version"]:
-            return candidate
-    raise click.ClickException("could not locate the workflow YAML for this run under .ravana/workflows/")
-
-
 def _compiled_graph_for_run(con: sqlite3.Connection, run_row: sqlite3.Row) -> CompiledGraph:
-    return compile_workflow(load_workflow_yaml(_find_workflow_file_for_run(con, run_row)))
+    try:
+        return WorkflowSnapshot.from_json(run_row["workflow_snapshot"]).compile()
+    except WorkflowSnapshotError as exc:
+        raise click.ClickException(
+            f"run '{run_row['id']}' predates immutable workflow snapshots and cannot resume safely"
+        ) from exc
 
 
 def _providers_in_graph(graph: CompiledGraph) -> set[str]:
@@ -302,7 +299,7 @@ def run_start(
     con = _connect()
     doc = load_workflow_yaml(file)
     graph = compile_workflow(doc)
-    workflow_id = get_or_create_workflow(con, graph, org_id=org, created_by="cli-user")
+    workflow_id = get_or_create_workflow(con, graph, org_id=org, actor="cli-user")
     input_payload = json.loads(input_json)
 
     runtime = _build_runtime(

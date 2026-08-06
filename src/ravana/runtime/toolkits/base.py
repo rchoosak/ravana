@@ -71,8 +71,10 @@ class ToolkitHandler(Protocol):
     input_schema: dict[str, Any]
 
     # A human/model-readable line telling the model what this tool does and
-    # when to reach for it. Author-provided descriptions in the manifest are a
-    # later enhancement; for now each handler supplies a sensible default.
+    # when to reach for it. Each handler supplies a sensible default; a workflow
+    # author may override it per toolkit via ToolkitConfig.description (§1.2),
+    # which build_registry applies to the constructed handler. Mutable by
+    # design — the registry is the single site that assigns the final value.
     description: str
 
     # Whether this handler can run under the current install configuration.

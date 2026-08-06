@@ -272,7 +272,8 @@ CREATE TABLE toolkit (
     name            TEXT NOT NULL,
     type            TEXT NOT NULL,               -- web_search | code_interpreter | db | api_connector | mcp_server (§1.7)
     config          JSONB NOT NULL,               -- provider-specific config
-    auth_ref        TEXT                          -- pointer into secrets manager, never raw secrets
+    auth_ref        TEXT,                         -- pointer into secrets manager, never raw secrets
+    description     TEXT                          -- optional author override of the model-facing tool description (§1.2); NULL = handler default. Not valid on mcp_server (its per-tool text comes from the server, §8)
 );
 
 -- Reusable procedural knowledge (instructions/best-practices/templates) an
@@ -302,6 +303,8 @@ CREATE TABLE workflow (
     dod_criteria    JSONB,                        -- Definition-of-Done expression(s)
     guards          JSONB,                        -- max_total_steps, per-edge loop caps, max_retries_per_node, max_tokens_total (cost cap)
     concurrency     JSONB,                        -- {group: "templated string, e.g. repo:${input.repository}", strategy: queue|cancel_previous|allow} — see §3.7
+    toolkit_ids     UUID[] NOT NULL DEFAULT '{}', -- persisted Toolkit rows owned by this manifest revision; lets a mutable DRAFT update/audit the exact rows rather than same-named toolkits from another workflow
+    definition_snapshot JSONB NOT NULL,            -- canonical validated manifest; preserves omitted-vs-explicit-null node policies and is the aggregate compared/audited on every save
     status          TEXT NOT NULL DEFAULT 'DRAFT', -- DRAFT (mutable, edited in place) | PUBLISHED (immutable, runnable) | ARCHIVED
     created_by      TEXT NOT NULL,
     published_by    TEXT,
@@ -355,6 +358,8 @@ CREATE TABLE run (
     org_id          UUID NOT NULL,
     workflow_id     UUID REFERENCES workflow(id),
     workflow_version INTEGER NOT NULL,             -- pinned at start; a running Run never migrates to a newer workflow version
+    workflow_snapshot JSONB NOT NULL,              -- immutable validated manifest captured at start; resume compiles this snapshot, never mutable YAML on disk
+    agent_db_ids    JSONB NOT NULL,                -- pinned {node_id: agent row UUID}; DRAFT edits cannot change sender identity for an in-flight Run
     status          TEXT NOT NULL,                -- PENDING|RUNNING|WAITING_HUMAN|FAILED|COMPLETED|CANCELLED
                                                     -- WAITING_HUMAN is a rollup: true if ANY node_execution for this run is WAITING_HUMAN (§3.1)
     current_nodes   TEXT[],                       -- supports concurrent active nodes. NOTE: not yet maintained by the Phase 0a engine (written as [] at insert, never updated) — the Operator view (§1.5) is what needs it, so it becomes real in Phase 1; until then treat it as reserved, derive active nodes from node_execution.status
@@ -479,8 +484,8 @@ CREATE TABLE audit_log (
 - `run.state_version` gives optimistic concurrency on `shared_state` writes so two nodes running in parallel after a broadcast (e.g. Dev and QA both writing state) can't silently clobber each other — see §3.5 for the merge protocol.
 - Tool-call idempotency is deliberately **not** a column on `node_execution` — a per-attempt key cannot dedupe across retries. `node_execution.logical_visit_id` is stable across retries/HITL resume and fresh on graph re-entry; the key combines that visit with the call ordinal and command content, then travels in `message.tool_calls` (see §3.6).
 - `node_execution`'s `repair_count`/`tool_call_count`/token/cost columns exist so the metrics in §9 are a `GROUP BY` away, not a message-table scan — one row per attempt is already the right granularity to answer "what did this node cost and how flaky was it."
-- `workflow.status` + `run.workflow_version` being pinned at creation means editing a workflow never affects `Run`s already in flight — there is no "live migration" of an executing graph, by design. A `DRAFT` row is mutable and edited in place (so the Visual Studio doesn't spawn a new version per keystroke); the moment it's `PUBLISHED` it becomes immutable and any further edit must go through `POST /v1/workflows` again to create the next version (§7) — `PUBLISHED`/`ARCHIVED` rows never change underneath a `Run` that's already pinned to them.
-- Every mutation to a `DRAFT` save, every `publish`, and every manual operator action (cancel/retry a run, respond to HITL, change a role) writes an `audit_log` row with `before`/`after` snapshots — this is what actually answers "who edited the flow and when" (the question that prompted adding this table), not just "which version is currently live."
+- `workflow.status` + `run.workflow_version`, the validated `run.workflow_snapshot`, and its pinned node→agent-row mapping mean editing a workflow never affects `Run`s already in flight — resume compiles the immutable snapshot rather than locating mutable YAML, so there is no "live migration" of an executing graph. Snapshot serialization preserves omitted fields because an omitted node policy inherits from its Agent while explicit `null` clears it. A `DRAFT` row is mutable and edited in place; the moment it's `PUBLISHED` it becomes immutable and any further edit must create the next version (§7). A legacy Run without a verifiable snapshot fails closed on resume rather than guessing from current YAML.
+- Every mutation to a `DRAFT` save, every `publish`, and every manual operator action writes an `audit_log` row with `before`/`after` snapshots. DRAFT comparison, normalized-row replacement, and audit insertion are one transaction over the canonical `workflow.definition_snapshot`; an audit failure rolls the mutation back. Identical saves are no-ops, while any changed field on `PUBLISHED`/`ARCHIVED` fails before mutation. Legacy DRAFT toolkit rows are claimed lazily into `workflow.toolkit_ids` before their first aggregate save; a legacy published definition without a canonical snapshot must be republished as a new version.
 - `workflow_edge.is_default` and `run.concurrency_group` exist to close two correctness gaps rather than add features: a node with real outgoing edges but none matching used to have no defined behavior (§3.3); two `Run`s of the same workflow racing on the same external target — e.g. both branching the same repo in §10.1 — had nothing stopping them (§3.7).
 - `run.parent_run_id`/`parent_node_execution_id` and `workflow_node.sub_workflow_id` are what let a workflow_node be backed by another whole `Run` instead of an `Agent` (§1.8) — a nested run is an ordinary row in the same `run` table, not a parallel concept, so every mechanism that already applies to a `Run` (leasing, HITL, audit, metrics) applies to a sub-workflow run for free.
 - `agent.llm_fallback` and `hitl_request.assignee` both exist for the same reason: the schema already had the *primary* path (one model, HITL fires "a" notification) but not what happens when that path fails — this is where §3.6 and §3.1 respectively define the fallback behavior these columns hold data for.
@@ -672,6 +677,9 @@ spec:
       type: api_connector
       config: { base_url: https://api.github.com }
       auth_ref: secrets://github_pat   # top-level, not inside config — matches toolkit.auth_ref in §2.2
+      # Optional author override (§1.2) of the model-facing tool description.
+      # Omit it to keep the handler's generic default; not valid on mcp_server.
+      description: Query the GitHub REST API for repository, pull-request, and issue data.
 
     - id: test_runner
       type: code_interpreter

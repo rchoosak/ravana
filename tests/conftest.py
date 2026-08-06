@@ -46,7 +46,7 @@ def sdlc_graph() -> CompiledGraph:
 
 @pytest.fixture
 def sdlc_workflow_id(con: sqlite3.Connection, sdlc_graph: CompiledGraph) -> str:
-    return get_or_create_workflow(con, sdlc_graph, org_id="test-org", created_by="test")
+    return get_or_create_workflow(con, sdlc_graph, org_id="test-org", actor="test")
 
 
 @pytest.fixture

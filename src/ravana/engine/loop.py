@@ -45,6 +45,7 @@ from ravana.runtime.idempotency import compute_idempotency_key
 from ravana.runtime.secrets import ensure_secret_free, redact_secrets
 from ravana.schema.models import DefinitionOfDone, HITLConfig
 from ravana.schema.util import dumps, loads, new_id, now_iso
+from ravana.schema.workflow_snapshot import WorkflowSnapshot, WorkflowSnapshotError
 
 _GROUP_VAR_RE = re.compile(r"\$\{input\.([A-Za-z0-9_]+)\}")
 
@@ -93,14 +94,27 @@ class _RunCtx:
         return loads(_get_run(self.con, self.run_id)["shared_state"], {})
 
 
-def _agent_db_id(con: sqlite3.Connection, workflow_id: str, node_id: str) -> str | None:
-    """workflow_node.agent_id is the *persisted* DB row id (§2.2) — the FK
-    that message.sender_agent_id must actually reference, as opposed to
-    AgentConfig.id, which is just the YAML-level string ('pm')."""
-    row = con.execute(
-        "SELECT agent_id FROM workflow_node WHERE workflow_id = ? AND id = ?", (workflow_id, node_id)
-    ).fetchone()
-    return row["agent_id"] if row else None
+def _agent_db_id(con: sqlite3.Connection, run_id: str, node_id: str) -> str | None:
+    """Return the agent row pinned when this Run started."""
+    row = con.execute("SELECT agent_db_ids FROM run WHERE id = ?", (run_id,)).fetchone()
+    if row is None or row["agent_db_ids"] is None:
+        raise ValueError(f"run '{run_id}' has no pinned agent mapping")
+    return (loads(row["agent_db_ids"]) or {}).get(node_id)
+
+
+def _workflow_agent_db_ids(
+    con: sqlite3.Connection, workflow_id: str, graph: CompiledGraph
+) -> dict[str, str]:
+    rows = con.execute(
+        "SELECT id, agent_id FROM workflow_node WHERE workflow_id = ?", (workflow_id,)
+    ).fetchall()
+    mapping = {row["id"]: row["agent_id"] for row in rows if row["agent_id"] is not None}
+    missing = sorted(
+        node.id for node in graph.doc.spec.graph.nodes if node.agent is not None and node.id not in mapping
+    )
+    if missing:
+        raise ValueError(f"workflow '{workflow_id}' has no persisted agent mapping for nodes {missing}")
+    return mapping
 
 
 def _resolve_group(template: str, input_payload: dict[str, Any]) -> str:
@@ -112,6 +126,21 @@ def _get_run(con: sqlite3.Connection, run_id: str) -> sqlite3.Row:
     if row is None:
         raise KeyError(f"run '{run_id}' not found")
     return row
+
+
+def _assert_run_uses_pinned_workflow(run_row: sqlite3.Row, graph: CompiledGraph) -> None:
+    if run_row["workflow_snapshot"] is None or run_row["agent_db_ids"] is None:
+        raise ValueError(
+            f"run '{run_row['id']}' predates immutable workflow snapshots and cannot resume safely"
+        )
+    try:
+        snapshot = WorkflowSnapshot.from_json(run_row["workflow_snapshot"])
+    except WorkflowSnapshotError as exc:
+        raise ValueError(f"run '{run_row['id']}' has an invalid workflow snapshot") from exc
+    if not snapshot.equivalent_to(graph.doc):
+        raise ValueError(
+            f"run '{run_row['id']}' must resume with its pinned workflow snapshot"
+        )
 
 
 def _next_sequence(con: sqlite3.Connection, run_id: str) -> int:
@@ -241,15 +270,20 @@ async def start_run(
                 # "allow": no restriction
 
         shared_state = dict(graph.doc.spec.state.initial)
+        workflow_snapshot = WorkflowSnapshot.from_doc(graph.doc)
+        agent_db_ids = _workflow_agent_db_ids(con, workflow_id, graph)
         con.execute(
-            """INSERT INTO run (id, org_id, workflow_id, workflow_version, status, current_nodes, shared_state,
-                                 state_version, concurrency_group, triggered_by, input_payload, started_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO run (id, org_id, workflow_id, workflow_version, workflow_snapshot,
+                                 agent_db_ids, status, current_nodes, shared_state, state_version,
+                                 concurrency_group, triggered_by, input_payload, started_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 run_id,
                 org_id,
                 workflow_id,
                 graph.doc.metadata.version,
+                workflow_snapshot.to_json(),
+                dumps(agent_db_ids),
                 status,
                 dumps([]),
                 dumps(shared_state),
@@ -797,7 +831,7 @@ def _insert_turn_message(
             new_id(),
             ctx.run_id,
             node_id,
-            _agent_db_id(ctx.con, ctx.workflow_id, node_id),
+            _agent_db_id(ctx.con, ctx.run_id, node_id),
             "agent",
             result.content,
             dumps(result.structured_payload),
@@ -1064,6 +1098,8 @@ async def resume_hitl(
     thread, then dispatch a brand-new node_execution attempt for the same
     node — NOT a bare re-route of stale output (that was the bug fixed in
     v0.14)."""
+    run_row = _get_run(con, run_id)
+    _assert_run_uses_pinned_workflow(run_row, graph)
     hitl_row = con.execute("SELECT * FROM hitl_request WHERE id = ?", (hitl_request_id,)).fetchone()
     if hitl_row is None:
         raise KeyError(f"hitl_request '{hitl_request_id}' not found")
@@ -1090,7 +1126,6 @@ async def resume_hitl(
         con.commit()
         write_audit(con, _get_run(con, run_id)["org_id"], "cli-user", "hitl.responded", "hitl_request", hitl_request_id, after=response)
 
-        run_row = _get_run(con, run_id)
         ctx = _RunCtx(
             con=con, graph=graph, run_id=run_id, org_id=run_row["org_id"], workflow_id=run_row["workflow_id"],
             runtime=runtime, queue=[node_id], dod_prose_verdict=dod_prose_verdict, retry_sleep=retry_sleep,

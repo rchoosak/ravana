@@ -35,7 +35,7 @@ def test_implicit_terminal_node_completes_the_run(con):
     explicit `to: [__terminal__]`) — the run must reach COMPLETED, not get
     stuck at whatever status it had when the queue drained."""
     graph = compile_workflow(_single_node_workflow())
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": {}}]})
 
     run_id = asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
@@ -51,7 +51,7 @@ def test_implicit_terminal_node_completes_the_run(con):
 def test_successful_turn_commit_is_atomic(con):
     """If the COMMIT event write fails, message/status/state must all roll back."""
     graph = compile_workflow(_single_node_workflow())
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     con.executescript(
         """
         CREATE TRIGGER abort_turn_commit
@@ -90,7 +90,7 @@ def test_successful_turn_commit_is_atomic(con):
 
 def test_successful_turn_merges_against_state_committed_while_agent_runs(con):
     graph = compile_workflow(_single_node_workflow())
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
 
     class ConcurrentCommitRuntime:
         async def run_turn(
@@ -140,7 +140,7 @@ def test_successful_turn_merges_against_state_committed_while_agent_runs(con):
 
 def test_engine_fails_closed_before_persisting_secret_bearing_output(con):
     graph = compile_workflow(_single_node_workflow())
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime(
         {
             "only": [
@@ -187,7 +187,7 @@ def test_non_transient_turn_error_fails_the_run_cleanly(con):
             raise ToolkitError("toolkit 'code_interpreter' is not executable in this build")
 
     graph = compile_workflow(_single_node_workflow())
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
 
     # Must NOT raise out of start_run.
     run_id = asyncio.run(start_run(con, graph, ExplodingRuntime(), org_id="test", workflow_id=workflow_id))
@@ -202,7 +202,7 @@ def test_non_transient_turn_error_fails_the_run_cleanly(con):
 def test_max_tool_calls_per_turn_guard_fails_the_run(con):
     graph = compile_workflow(_single_node_workflow())
     graph.doc.spec.graph.guards.max_tool_calls_per_turn = 2
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": {}, "tool_call_count": 5}]})
 
     run_id = asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
@@ -217,7 +217,7 @@ def test_max_tool_calls_per_turn_guard_fails_the_run(con):
 def test_max_output_repairs_guard_fails_the_run(con):
     graph = compile_workflow(_single_node_workflow())
     graph.doc.spec.graph.guards.max_output_repairs = 1
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": {}, "repair_count": 3}]})
 
     run_id = asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
@@ -230,7 +230,7 @@ def test_max_output_repairs_guard_fails_the_run(con):
 def test_max_tokens_total_guard_fails_the_run(con):
     graph = compile_workflow(_single_node_workflow())
     graph.doc.spec.graph.guards.max_tokens_total = 100
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": {}, "input_tokens": 80, "output_tokens": 80}]})
 
     run_id = asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
@@ -250,7 +250,7 @@ def test_negative_node_usage_cannot_bypass_the_cost_cap(con):
     # not COMPLETE, and the poisoned number must not be persisted.
     graph = compile_workflow(_single_node_workflow())
     graph.doc.spec.graph.guards.max_tokens_total = 10
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": {}, "input_tokens": -100, "output_tokens": 0}]})
 
     run_id = asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
@@ -294,7 +294,7 @@ def test_persistence_uses_validated_snapshot_not_reread_raw_tokens(con):
 
     graph = compile_workflow(_single_node_workflow())
     graph.doc.spec.graph.guards.max_tokens_total = 10
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     run_id = asyncio.run(start_run(con, graph, _TocTouRuntime(), org_id="test", workflow_id=workflow_id))
     total = con.execute(
         "SELECT COALESCE(SUM(input_tokens + output_tokens), 0) AS t FROM node_execution WHERE run_id = ?", (run_id,)
@@ -307,7 +307,7 @@ def test_tool_calls_get_a_stable_idempotency_key(con):
     message.tool_calls — this is the fix for the finding that
     compute_idempotency_key existed but had no runtime call site."""
     graph = compile_workflow(_single_node_workflow())
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     tool_call = {"tool": "git_push", "arguments": {"branch": "b", "message": "m"}}
     runtime = MockAgentRuntime({"only": [{"structured_payload": {}, "tool_calls": [dict(tool_call)]}]})
 
@@ -361,7 +361,7 @@ def test_concurrency_queue_holds_a_second_run_pending(con):
             }
         )
     )
-    blocking_workflow_id = get_or_create_workflow(con, blocking_graph, org_id="test", created_by="test")
+    blocking_workflow_id = get_or_create_workflow(con, blocking_graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": {}}]})
     first_run_id = asyncio.run(
         start_run(con, blocking_graph, runtime, org_id="test", workflow_id=blocking_workflow_id, input_payload={"repository": "org/repo"})
@@ -398,7 +398,7 @@ def test_concurrency_cancel_previous_cancels_the_active_run(con):
             }
         )
     )
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": {}}]})
 
     first_run_id = asyncio.run(

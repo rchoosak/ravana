@@ -151,7 +151,7 @@ async def _run_live_workflow(
     graph: CompiledGraph,
     adapter: ProviderAdapter,
 ) -> None:
-    workflow_id = get_or_create_workflow(con, graph, org_id="live-smoke", created_by="pytest")
+    workflow_id = get_or_create_workflow(con, graph, org_id="live-smoke", actor="pytest")
     gateway = LLMGateway(graph, {adapter.name: adapter})
     try:
         run_id = await start_run(

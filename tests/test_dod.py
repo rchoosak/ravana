@@ -152,7 +152,7 @@ def _dod_workflow(criteria: list[str], with_dod: bool = True, guards: dict | Non
 
 def _run_single(con, workflow, payload):
     graph = compile_workflow(workflow)
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": payload}]})
     return asyncio.run(start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id))
 
@@ -205,7 +205,7 @@ def test_run_fails_when_ordering_expression_unmet_on_unset_key(con):
 
 def _start_with_verdict(con, workflow, payload, verdict, *, raw=None):
     graph = compile_workflow(workflow)
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": payload}]})
     return asyncio.run(
         start_run(
@@ -389,7 +389,7 @@ def test_cancel_during_judgement_also_skips_the_workspace_handoff(con):
         return ProseJudgement(verdicts=[True for _ in criteria], usage=LLMUsage(1, 1))
 
     graph = compile_workflow(_dod_workflow(["All acceptance criteria are met"]))
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = _HandoffMock({"only": [{"structured_payload": {"qa_status": "PASS"}}]})
     run_id = asyncio.run(
         start_run(
@@ -455,7 +455,7 @@ def test_dod_finalization_is_idempotent_on_reentry(con):
         return ProseJudgement(verdicts=[calls["n"] == 1 for _ in criteria])
 
     graph = compile_workflow(_dod_workflow(["a prose criterion"]))
-    workflow_id = get_or_create_workflow(con, graph, org_id="test", created_by="test")
+    workflow_id = get_or_create_workflow(con, graph, org_id="test", actor="test")
     runtime = MockAgentRuntime({"only": [{"structured_payload": {"qa_status": "PASS"}}]})
     run_id = asyncio.run(
         start_run(con, graph, runtime, org_id="test", workflow_id=workflow_id, dod_prose_verdict=verdict)
